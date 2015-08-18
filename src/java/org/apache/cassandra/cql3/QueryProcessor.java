@@ -241,6 +241,19 @@ public class QueryProcessor implements QueryHandler
         return getStatement(queryStr, queryState.getClientState());
     }
 
+    public static UntypedResultSet process(String query, ConsistencyLevel cl, ConsistencyLevel serialCl) throws RequestExecutionException
+    {
+        return process(query, cl, serialCl, Collections.<ByteBuffer>emptyList());
+    }
+
+    public static UntypedResultSet process(String query, ConsistencyLevel cl, ConsistencyLevel serialCl, List<ByteBuffer> values) throws RequestExecutionException
+    {
+        ResultMessage result = instance.process(query, QueryState.forInternalCalls(), QueryOptions.forInternalCalls(cl, serialCl, values));
+        if (result instanceof ResultMessage.Rows)
+            return UntypedResultSet.create(((ResultMessage.Rows) result).result);
+        return null;
+    }
+
     public static UntypedResultSet process(String query, ConsistencyLevel cl) throws RequestExecutionException
     {
         return process(query, cl, Collections.<ByteBuffer>emptyList());

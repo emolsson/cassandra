@@ -177,6 +177,9 @@ public class Config
     @Deprecated
     public int commitlog_periodic_queue_size = -1;
 
+    public Long maintenance_scheduler_startup_delay;
+    public String[] maintenance_schedulers;
+    public String[] maintenance_schedule_policies;
     public String endpoint_snitch;
     public Boolean dynamic_snitch = true;
     public Integer dynamic_snitch_update_interval_in_ms = 100;

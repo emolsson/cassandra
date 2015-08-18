@@ -238,6 +238,12 @@ public final class CFMetaData
         return this;
     }
 
+    public CFMetaData repairScheduling(RepairSchedulingParams prop)
+    {
+        params = TableParams.builder(params).repairScheduling(prop).build();
+        return this;
+    }
+
     private CFMetaData(String keyspace,
                        String name,
                        UUID cfId,

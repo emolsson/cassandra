@@ -33,6 +33,11 @@ public class ScheduledExecutors
      public static final DebuggableScheduledThreadPoolExecutor scheduledTasks = new DebuggableScheduledThreadPoolExecutor("ScheduledTasks");
 
     /**
+     * This pool is used for periodic tasks which may run for a longer duration.
+     */
+    public static final DebuggableScheduledThreadPoolExecutor scheduledLongTasks = new DebuggableScheduledThreadPoolExecutor("ScheduledLongTasks");
+
+    /**
      * This executor is used for tasks that can have longer execution times, and usually are non periodic.
      */
     public static final DebuggableScheduledThreadPoolExecutor nonPeriodicTasks = new DebuggableScheduledThreadPoolExecutor("NonPeriodicTasks");

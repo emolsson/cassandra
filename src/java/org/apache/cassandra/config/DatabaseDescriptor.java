@@ -52,9 +52,10 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.scheduler.IRequestScheduler;
 import org.apache.cassandra.scheduler.NoScheduler;
 import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.scheduling.ISchedulePolicy;
+import org.apache.cassandra.scheduling.IScheduler;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.thrift.ThriftServer;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.memory.*;
 
@@ -68,6 +69,9 @@ public class DatabaseDescriptor
      */
     private static final int MAX_NUM_TOKENS = 1536;
 
+    private static Collection<IScheduler> maintenanceSchedulers;
+    private static Collection<ISchedulePolicy> maintenanceSchedulePolicies;
+    private static long maintenanceSchedulerStartupDelay;
     private static IEndpointSnitch snitch;
     private static InetAddress listenAddress; // leave null so we can fall through to getLocalHost
     private static InetAddress broadcastAddress;
@@ -428,6 +432,25 @@ public class DatabaseDescriptor
         if (ThriftServer.HSHA.equals(conf.rpc_server_type) && conf.rpc_max_threads > (FBUtilities.getAvailableProcessors() * 2 + 1024))
             logger.warn("rpc_max_threads setting of {} may be too high for the hsha server and cause unnecessary thread contention, reducing performance", conf.rpc_max_threads);
 
+        maintenanceSchedulerStartupDelay = conf.maintenance_scheduler_startup_delay == null ? 3600 : conf.maintenance_scheduler_startup_delay;
+
+        maintenanceSchedulers = new ArrayList<>();
+        if (conf.maintenance_schedulers != null)
+        {
+            for (String scheduler : conf.maintenance_schedulers)
+            {
+                maintenanceSchedulers.add(createMaintenanceScheduler(scheduler));
+            }
+        }
+
+        maintenanceSchedulePolicies = new ArrayList<>();
+        if (conf.maintenance_schedule_policies != null)
+        {
+            for (String policy : conf.maintenance_schedule_policies)
+            {
+                maintenanceSchedulePolicies.add(createMaintenanceSchedulePolicy(policy));
+            }
+        }
         /* end point snitch */
         if (conf.endpoint_snitch == null)
         {
@@ -724,6 +747,22 @@ public class DatabaseDescriptor
         }
     }
 
+    private static IScheduler createMaintenanceScheduler(String maintenanceSchedulerClassName) throws ConfigurationException
+    {
+        if (!maintenanceSchedulerClassName.contains("."))
+            maintenanceSchedulerClassName = "org.apache.cassandra.scheduling." + maintenanceSchedulerClassName;
+        IScheduler maintenanceScheduler = FBUtilities.construct(maintenanceSchedulerClassName, "maintenanceScheduler");
+        return maintenanceScheduler;
+    }
+
+    private static ISchedulePolicy createMaintenanceSchedulePolicy(String maintenanceSchedulePolicyClassName) throws ConfigurationException
+    {
+        if (!maintenanceSchedulePolicyClassName.contains("."))
+            maintenanceSchedulePolicyClassName = "org.apache.cassandra.scheduling." + maintenanceSchedulePolicyClassName;
+        ISchedulePolicy maintenanceSchedulePolicy = FBUtilities.construct(maintenanceSchedulePolicyClassName, "maintenanceSchedulePolicy");
+        return maintenanceSchedulePolicy;
+    }
+
     private static IEndpointSnitch createEndpointSnitch(String snitchClassName) throws ConfigurationException
     {
         if (!snitchClassName.contains("."))
@@ -857,6 +896,21 @@ public class DatabaseDescriptor
         IPartitioner old = partitioner;
         partitioner = newPartitioner;
         return old;
+    }
+
+    public static Collection<IScheduler> getMaintenanceSchedulers()
+    {
+        return maintenanceSchedulers;
+    }
+
+    public static Collection<ISchedulePolicy> getMaintenanceSchedulePolicies()
+    {
+        return maintenanceSchedulePolicies;
+    }
+
+    public static long getMaintenaneSchedulerStartupDelay()
+    {
+        return maintenanceSchedulerStartupDelay;
     }
 
     public static IEndpointSnitch getEndpointSnitch()

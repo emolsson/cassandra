@@ -113,6 +113,7 @@ public final class SchemaKeyspace
                 + "min_index_interval int,"
                 + "read_repair_chance double,"
                 + "speculative_retry text,"
+                + "repair_scheduling frozen<map<text, text>>,"
                 + "PRIMARY KEY ((keyspace_name), table_name))");
 
     private static final CFMetaData Columns =
@@ -920,7 +921,8 @@ public final class SchemaKeyspace
              .frozenMap("caching", params.caching.asMap())
              .frozenMap("compaction", params.compaction.asMap())
              .frozenMap("compression", params.compression.asMap())
-             .frozenMap("extensions", params.extensions);
+             .frozenMap("extensions", params.extensions)
+             .frozenMap("repair_scheduling", params.repairScheduling.asMap());
     }
 
     public static Mutation makeUpdateTableMutation(KeyspaceMetadata keyspace,
@@ -1160,6 +1162,9 @@ public final class SchemaKeyspace
                .readRepairChance(row.getDouble("read_repair_chance"))
                .crcCheckChance(row.getDouble("crc_check_chance"))
                .speculativeRetry(SpeculativeRetryParam.fromString(row.getString("speculative_retry")));
+
+        if (row.has("repair_scheduling"))
+            builder.repairScheduling(RepairSchedulingParams.fromMap(row.getFrozenTextMap("repair_scheduling")));
 
         if (row.has("extensions"))
             builder.extensions(row.getFrozenMap("extensions", UTF8Type.instance, BytesType.instance));

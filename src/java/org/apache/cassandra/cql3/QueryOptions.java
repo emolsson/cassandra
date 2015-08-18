@@ -53,6 +53,13 @@ public abstract class QueryOptions
         return new DefaultQueryOptions(consistency, values, false, SpecificOptions.DEFAULT, Server.VERSION_3);
     }
 
+    public static QueryOptions forInternalCalls(ConsistencyLevel consistency, ConsistencyLevel serial, List<ByteBuffer> values)
+    {
+        SpecificOptions specOpts = new SpecificOptions(-1, null, serial, Long.MIN_VALUE);
+
+        return new DefaultQueryOptions(consistency, values, false, specOpts, Server.VERSION_3);
+    }
+
     public static QueryOptions forInternalCalls(ConsistencyLevel consistency, List<ByteBuffer> values)
     {
         return new DefaultQueryOptions(consistency, values, false, SpecificOptions.DEFAULT, Server.VERSION_3);

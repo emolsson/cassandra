@@ -112,6 +112,9 @@ public final class TableAttributes extends PropertyDefinitions
         if (hasOption(Option.CRC_CHECK_CHANCE))
             builder.crcCheckChance(getDouble(Option.CRC_CHECK_CHANCE));
 
+        if (hasOption(Option.REPAIR_SCHEDULING))
+            builder.repairScheduling(RepairSchedulingParams.fromMap(getMap(Option.REPAIR_SCHEDULING)));
+
         return builder.build();
     }
 

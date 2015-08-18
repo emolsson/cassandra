@@ -104,6 +104,9 @@ import org.apache.cassandra.repair.RepairParallelism;
 import org.apache.cassandra.repair.RepairRunnable;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
 import org.apache.cassandra.repair.messages.RepairOption;
+import org.apache.cassandra.scheduling.DistributedLock;
+import org.apache.cassandra.scheduling.ScheduleManager;
+import org.apache.cassandra.scheduling.ScheduledRepairJob;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.paxos.CommitVerbHandler;
 import org.apache.cassandra.service.paxos.PrepareVerbHandler;
@@ -970,7 +973,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             maybeAddKeyspace(TraceKeyspace.metadata());
 
         if (Schema.instance.getKSMetaData(SystemDistributedKeyspace.NAME) == null)
+        {
             MigrationManager.announceNewKeyspace(SystemDistributedKeyspace.metadata(), 0, false);
+            for (CFMetaData cfm : DistributedLock.metadata())
+            {
+                MigrationManager.announceNewColumnFamily(cfm, false);
+            }
+        }
 
         if (!isSurveyMode)
         {
@@ -2843,6 +2852,36 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public int repairAsync(String keyspace, Map<String, String> repairSpec)
     {
+        return forceRepairAsync(keyspace, createRepairOptions(keyspace, repairSpec));
+    }
+
+    public int scheduleRepair(String keyspace, Map<String, String> repairSpec, boolean scheduledHigh)
+    {
+        RepairOption options = createRepairOptions(keyspace, repairSpec);
+        if (options.getRanges().isEmpty() || Keyspace.open(keyspace).getReplicationStrategy().getReplicationFactor() < 2)
+            return 0;
+
+        if (options.getColumnFamilies().isEmpty())
+        {
+            for (ColumnFamilyStore cfs : Keyspace.open(keyspace).getColumnFamilyStores())
+            {
+                options.getColumnFamilies().add(cfs.name);
+            }
+        }
+
+        int scheduledJobs = options.getColumnFamilies().size();
+
+        for (String table : options.getColumnFamilies())
+        {
+            ScheduleManager.instance.schedule(ScheduledRepairJob.fromRepairOptions(keyspace, table, options,
+                    scheduledHigh));
+        }
+
+        return scheduledJobs;
+    }
+
+    private RepairOption createRepairOptions(String keyspace, Map<String, String> repairSpec)
+    {
         RepairOption option = RepairOption.parse(repairSpec, tokenMetadata.partitioner);
         // if ranges are not specified
         if (option.getRanges().isEmpty())
@@ -2863,7 +2902,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                 option.getRanges().addAll(getLocalRanges(keyspace));
             }
         }
-        return forceRepairAsync(keyspace, option);
+
+        return option;
     }
 
     @Deprecated
@@ -3068,6 +3108,19 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         int cmd = nextRepairCommand.incrementAndGet();
         new Thread(createRepairTask(cmd, keyspace, options)).start();
         return cmd;
+    }
+
+    public void forceRepairBlocking(String keyspace, RepairOption options) throws InterruptedException, ExecutionException
+    {
+        // TODO: Should throw some exception
+        if (options.getRanges().isEmpty() || Keyspace.open(keyspace).getReplicationStrategy().getReplicationFactor() < 2)
+            return;
+
+        int cmd = nextRepairCommand.incrementAndGet();
+        FutureTask<Object> future = createRepairTask(cmd, keyspace, options);
+        new Thread(future).start();
+
+        future.get();
     }
 
     private FutureTask<Object> createRepairTask(final int cmd, final String keyspace, final RepairOption options)

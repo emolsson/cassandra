@@ -934,3 +934,22 @@ enable_scripted_user_defined_functions: false
 # below their system default. The sysinternals 'clockres' tool can confirm your system's default
 # setting.
 windows_timer_interval: 1
+
+# The maintenance schedulers are responsible for creating jobs and tasks that perform maintenance
+# activity in the background.
+#
+# The schedulers must implement the org.apache.cassandra.scheduling.IScheduler interface.
+maintenance_schedulers:
+    - org.apache.cassandra.scheduling.RepairScheduler
+
+# The time in seconds before starting up the maintenance scheduler. It's still possible to
+# schedule tasks manually, e.g. by nodetool and have them run before this startup period.
+#
+# Default value is 3600 (1 hour).
+# maintenance_scheduler_startup_delay: 3600
+
+# The scheduling policies determines if a scheduled job should run.
+#
+# The policies must implement the org.apache.cassandra.scheduling.ISchedulePolicy interface.
+# maintenance_schedule_policies:
+#     - org.apache.cassandra.scheduling.FileSchedulePolicy

@@ -27,6 +27,7 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.rmi.server.RMIClientSocketFactory;
 import java.rmi.server.RMISocketFactory;
+import java.text.SimpleDateFormat;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -328,6 +329,31 @@ public class NodeProbe implements AutoCloseable
             {
                 out.println("Exception occurred during clean-up. " + e);
             }
+        }
+    }
+
+    public void scheduleRepair(final PrintStream out, final String keyspace, Map<String, String> options,
+            boolean scheduledHigh) throws IOException
+    {
+        try
+        {
+            int scheduled = ssProxy.scheduleRepair(keyspace, options, scheduledHigh);
+
+            String time = new SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss,SSS").format(System.currentTimeMillis());
+
+            if (scheduled == 0)
+            {
+                out.println(String.format("[%s] Nothing to repair for keyspace '%s'", time, keyspace));
+            }
+            else
+            {
+                out.println(String.format("[%s] %d repair(s) scheduled", time, scheduled));
+            }
+        }
+        catch (Exception e)
+        {
+            throw new IOException(e);
         }
     }
 

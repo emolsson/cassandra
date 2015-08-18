@@ -68,6 +68,7 @@ import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.schema.LegacySchemaMigrator;
 import org.apache.cassandra.cql3.functions.ThreadAwareSecurityManager;
+import org.apache.cassandra.scheduling.ScheduleManager;
 import org.apache.cassandra.thrift.ThriftServer;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
@@ -479,6 +480,8 @@ public class CassandraDaemon
             thriftServer.start();
         else
             logger.info("Not starting RPC server as requested. Use JMX (StorageService->startRPCServer()) or nodetool (enablethrift) to start it");
+
+        ScheduleManager.instance.startup();
     }
 
     /**

@@ -81,6 +81,12 @@ public class Repair extends NodeToolCmd
     @Option(title = "trace_repair", name = {"-tr", "--trace"}, description = "Use -tr to trace the repair. Traces are logged to system_traces.events.")
     private boolean trace = false;
 
+    @Option(title = "scheduled", name = { "-s", "--scheduled" }, description = "Use -s to schedule the repair to run when possible.")
+    private boolean scheduled = false;
+
+    @Option(title = "scheduled_high", name = { "-sh", "--scheduled-high" }, description = "Use -sn to try to schedule the repair to run as soon as possible, using the highest priority.")
+    private boolean scheduledHigh = false;
+
     @Override
     public void execute(NodeProbe probe)
     {
@@ -123,7 +129,10 @@ public class Repair extends NodeToolCmd
             options.put(RepairOption.HOSTS_KEY, StringUtils.join(specificHosts, ","));
             try
             {
-                probe.repairAsync(System.out, keyspace, options);
+                if (scheduled)
+                    probe.scheduleRepair(System.out, keyspace, options, scheduledHigh);
+                else
+                    probe.repairAsync(System.out, keyspace, options);
             } catch (Exception e)
             {
                 throw new RuntimeException("Error occurred during repair", e);

@@ -294,6 +294,19 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     public int repairAsync(String keyspace, Map<String, String> options);
 
+    /**
+     * Schedule a repair.
+     *
+     * @param keyspace
+     *            Keyspace name to repair. Should not be null.
+     * @param options
+     *            repair option.
+     * @param scheduledHigh
+     *            if the repair should be scheduled with highest priority.
+     * @return 0 if nothing to repair
+     */
+    public int scheduleRepair(String keyspace, Map<String, String> options, boolean scheduledHigh);
+
     @Deprecated
     public int forceRepairAsync(String keyspace, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts,  boolean primaryRange, boolean repairedAt, String... tableNames) throws IOException;
 

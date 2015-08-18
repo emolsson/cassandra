@@ -47,7 +47,8 @@ public final class TableParams
         MIN_INDEX_INTERVAL,
         READ_REPAIR_CHANCE,
         SPECULATIVE_RETRY,
-        CRC_CHECK_CHANCE;
+        CRC_CHECK_CHANCE,
+        REPAIR_SCHEDULING;
 
         @Override
         public String toString()
@@ -81,6 +82,7 @@ public final class TableParams
     public final CompactionParams compaction;
     public final CompressionParams compression;
     public final ImmutableMap<String, ByteBuffer> extensions;
+    public final RepairSchedulingParams repairScheduling;
 
     private TableParams(Builder builder)
     {
@@ -101,6 +103,7 @@ public final class TableParams
         compaction = builder.compaction;
         compression = builder.compression;
         extensions = builder.extensions;
+        repairScheduling = builder.repairScheduling;
     }
 
     public static Builder builder()
@@ -124,13 +127,15 @@ public final class TableParams
                             .minIndexInterval(params.minIndexInterval)
                             .readRepairChance(params.readRepairChance)
                             .speculativeRetry(params.speculativeRetry)
-                            .extensions(params.extensions);
+                            .extensions(params.extensions)
+                            .repairScheduling(params.repairScheduling);
     }
 
     public void validate()
     {
         compaction.validate();
         compression.validate();
+        repairScheduling.validate();
 
         if (bloomFilterFpChance <= 0 || bloomFilterFpChance > 1)
         {
@@ -212,7 +217,8 @@ public final class TableParams
             && caching.equals(p.caching)
             && compaction.equals(p.compaction)
             && compression.equals(p.compression)
-            && extensions.equals(p.extensions);
+            && extensions.equals(p.extensions)
+            && repairScheduling.equals(p.repairScheduling);
     }
 
     @Override
@@ -232,7 +238,8 @@ public final class TableParams
                                 caching,
                                 compaction,
                                 compression,
-                                extensions);
+                                extensions,
+                                repairScheduling);
     }
 
     @Override
@@ -254,6 +261,7 @@ public final class TableParams
                           .add(Option.COMPACTION.toString(), compaction)
                           .add(Option.COMPRESSION.toString(), compression)
                           .add(Option.EXTENSIONS.toString(), extensions)
+                          .add(Option.REPAIR_SCHEDULING.toString(), repairScheduling)
                           .toString();
     }
 
@@ -274,6 +282,7 @@ public final class TableParams
         private CompactionParams compaction = CompactionParams.DEFAULT;
         private CompressionParams compression = CompressionParams.DEFAULT;
         private ImmutableMap<String, ByteBuffer> extensions = ImmutableMap.of();
+        private RepairSchedulingParams repairScheduling = RepairSchedulingParams.DEFAULT;
 
         public Builder()
         {
@@ -371,6 +380,12 @@ public final class TableParams
         public Builder extensions(Map<String, ByteBuffer> val)
         {
             extensions = ImmutableMap.copyOf(val);
+            return this;
+        }
+
+        public Builder repairScheduling(RepairSchedulingParams prop)
+        {
+            repairScheduling = prop;
             return this;
         }
     }
