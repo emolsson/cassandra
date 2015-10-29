@@ -19,12 +19,17 @@ package org.apache.cassandra.schema;
 
 import static java.lang.String.format;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
+import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.repair.RepairParallelism;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,6 +38,8 @@ import com.google.common.base.MoreObjects;
 
 public class RepairSchedulingParams
 {
+    public static IVersionedSerializer<RepairSchedulingParams> serializer = new RepairSchedulingParamsSerializer();
+
     private static final Logger logger = LoggerFactory.getLogger(RepairSchedulingParams.class);
 
     public enum Option
@@ -210,5 +217,56 @@ public class RepairSchedulingParams
     public int hashCode()
     {
         return Objects.hash(enabled, incremental, minDelay);
+    }
+
+    public static class RepairSchedulingParamsSerializer implements IVersionedSerializer<RepairSchedulingParams>
+    {
+
+        @Override
+        public void serialize(RepairSchedulingParams t, DataOutputPlus out, int version) throws IOException
+        {
+            Map<String, String> params = t.asMap();
+            out.writeInt(params.size());
+            for (Map.Entry<String, String> entry : params.entrySet())
+            {
+                out.writeUTF(entry.getKey());
+                out.writeUTF(entry.getValue());
+            }
+        }
+
+        @Override
+        public RepairSchedulingParams deserialize(DataInputPlus in, int version) throws IOException
+        {
+            Map<String, String> params = new HashMap<>();
+
+            int entries = in.readInt();
+
+            for (int i = 0; i < entries; i++)
+            {
+                String key = in.readUTF();
+                String value = in.readUTF();
+                params.put(key, value);
+            }
+
+            return fromMap(params);
+        }
+
+        @Override
+        public long serializedSize(RepairSchedulingParams t, int version)
+        {
+            int size = 0;
+
+            Map<String, String> params = t.asMap();
+
+            size += TypeSizes.sizeof(params.size());
+            for (Map.Entry<String, String> entry : params.entrySet())
+            {
+                size += TypeSizes.sizeof(entry.getKey());
+                size += TypeSizes.sizeof(entry.getValue());
+            }
+
+            return size;
+        }
+
     }
 }

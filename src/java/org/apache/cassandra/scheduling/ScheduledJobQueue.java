@@ -20,7 +20,6 @@ package org.apache.cassandra.scheduling;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -70,10 +69,7 @@ class ScheduledJobQueue
     {
         synchronized (lock)
         {
-            for (ScheduledJob job : jobs)
-            {
-                replaceOrAddJob(job);
-            }
+            jobs.forEach(job -> replaceOrAddJob(job));
         }
     }
 
@@ -84,13 +80,7 @@ class ScheduledJobQueue
     {
         synchronized (lock)
         {
-            for (Iterator<ScheduledJob> it = myJobs.iterator(); it.hasNext();)
-            {
-                ScheduledJob job = it.next();
-
-                if (!job.update())
-                    it.remove();
-            }
+            myJobs.removeIf(p -> !p.update());
         }
     }
 
@@ -121,18 +111,11 @@ class ScheduledJobQueue
      */
     public void remove(ScheduledJob job)
     {
+        assert job != null;
+
         synchronized (lock)
         {
-            for (Iterator<ScheduledJob> it = myJobs.iterator(); it.hasNext();)
-            {
-                ScheduledJob tmp = it.next();
-
-                if (tmp.equals(job))
-                {
-                    it.remove();
-                    return;
-                }
-            }
+            myJobs.remove(job);
         }
     }
 
@@ -144,18 +127,9 @@ class ScheduledJobQueue
      */
     private void replaceOrAddJob(ScheduledJob newJob)
     {
-        Iterator<ScheduledJob> it = myJobs.iterator();
+        assert newJob != null;
 
-        while (it.hasNext())
-        {
-            ScheduledJob j = it.next();
-
-            if (j.equals(newJob))
-            {
-                it.remove();
-                break;
-            }
-        }
+        myJobs.remove(newJob);
 
         myJobs.add(newJob);
     }

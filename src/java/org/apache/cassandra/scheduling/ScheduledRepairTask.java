@@ -60,10 +60,36 @@ class ScheduledRepairTask extends ScheduledTask
      */
     public ScheduledRepairTask(String keyspace, String table, Range<Token> repairRange, RepairSchedulingParams params)
     {
+        this(-1, keyspace, table, repairRange, params);
+    }
+
+    /**
+     * Create a new repair task with the provided parameters.
+     *
+     * @param lastRepairedAt
+     *            The last time this task was run.
+     * @param keyspace
+     *            The keyspace to repair.
+     * @param table
+     *            The table to repair.
+     * @param repairRange
+     *            The range to repair.
+     * @param params
+     *            The repair configuration.
+     */
+    public ScheduledRepairTask(long lastRepairedAt, String keyspace, String table, Range<Token> repairRange,
+            RepairSchedulingParams params)
+    {
+        super(lastRepairedAt);
         this.keyspace = keyspace;
         this.table = table;
         this.repairRange = repairRange;
         this.params = params;
+    }
+
+    public Range<Token> getRepairRange()
+    {
+        return repairRange;
     }
 
     @Override

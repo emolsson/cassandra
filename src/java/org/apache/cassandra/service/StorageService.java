@@ -104,9 +104,7 @@ import org.apache.cassandra.repair.RepairParallelism;
 import org.apache.cassandra.repair.RepairRunnable;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
 import org.apache.cassandra.repair.messages.RepairOption;
-import org.apache.cassandra.scheduling.DistributedLock;
-import org.apache.cassandra.scheduling.ScheduleManager;
-import org.apache.cassandra.scheduling.ScheduledRepairJob;
+import org.apache.cassandra.scheduling.*;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.paxos.CommitVerbHandler;
 import org.apache.cassandra.service.paxos.PrepareVerbHandler;
@@ -326,6 +324,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
         MessagingService.instance().registerVerbHandlers(MessagingService.Verb.BATCH_STORE, new BatchStoreVerbHandler());
         MessagingService.instance().registerVerbHandlers(MessagingService.Verb.BATCH_REMOVE, new BatchRemoveVerbHandler());
+
+        MessagingService.instance().registerVerbHandlers(MessagingService.Verb.SCHEDULED_JOB, new ScheduledJobVerbHandler());
     }
 
     public void registerDaemon(CassandraDaemon daemon)

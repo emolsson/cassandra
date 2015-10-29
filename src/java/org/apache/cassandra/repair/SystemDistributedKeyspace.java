@@ -32,9 +32,9 @@ import com.google.common.collect.Sets;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -192,6 +192,17 @@ public final class SystemDistributedKeyspace
         processSilent(fmtQry, t.getMessage(), sw.toString());
     }
 
+    public static UntypedResultSet getRepairJobs(String keyspaceName, String cfname)
+    {
+        String query = "SELECT * FROM %s.%s WHERE keyspace_name=%s AND columnfamily_name=%s";
+
+        String fmtQry = String.format(query, NAME, REPAIR_HISTORY,
+                keyspaceName,
+                cfname);
+
+        return QueryProcessor.process(fmtQry, ConsistencyLevel.ONE);
+    }
+
     private static void processSilent(String fmtQry, String... values)
     {
         try
@@ -210,7 +221,7 @@ public final class SystemDistributedKeyspace
     }
 
 
-    private enum RepairState
+    public static enum RepairState
     {
         STARTED, SUCCESS, FAILED
     }

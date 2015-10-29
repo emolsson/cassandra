@@ -18,11 +18,14 @@
 package org.apache.cassandra.scheduling;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -36,7 +39,7 @@ public class ScheduleManager
 {
     private static final Logger logger = LoggerFactory.getLogger(ScheduleManager.class);
 
-    private static final String SCHEDULE_LOCK = "schedule_lock";
+    public static final String SCHEDULE_LOCK = "schedule_lock";
 
     private static final long updateDelay = 3600;
 
@@ -49,6 +52,7 @@ public class ScheduleManager
     private final Object updateLock = new Object();
 
     private volatile ScheduledFuture<?> runFuture;
+    private volatile ScheduledFuture<?> updateFuture;
 
     private Collection<IScheduler> schedulers;
     private Collection<ISchedulePolicy> schedulePolicies;
@@ -68,8 +72,27 @@ public class ScheduleManager
             return;
         }
 
-        ScheduledExecutors.scheduledLongTasks.scheduleWithFixedDelay(new JobUpdateTask(),
+        updateFuture = ScheduledExecutors.scheduledLongTasks.scheduleWithFixedDelay(new JobUpdateTask(),
                 DatabaseDescriptor.getMaintenaneSchedulerStartupDelay(), updateDelay, TimeUnit.SECONDS);
+    }
+
+    @VisibleForTesting
+    public void startup(ISchedulePolicy policy)
+    {
+        schedulePolicies = Arrays.asList(policy);
+    }
+
+    @VisibleForTesting
+    public void shutdown()
+    {
+        if (updateFuture != null)
+        {
+            updateFuture.cancel(true);
+        }
+        if (runFuture != null)
+        {
+            runFuture.cancel(true);
+        }
     }
 
     /**
@@ -167,6 +190,9 @@ public class ScheduleManager
         {
             long delay = -1;
 
+            if (schedulePolicies == null)
+                return delay;
+
             for (ISchedulePolicy policy : schedulePolicies)
             {
                 long tmp = policy.validate(job);
@@ -180,7 +206,7 @@ public class ScheduleManager
 
         private void tryRunJob(ScheduledJob job)
         {
-            try (Lock lock = DistributedLock.instance.tryGetLock(SCHEDULE_LOCK, job.getPriority()))
+            try (Lock lock = job.getLock())
             {
                 runJob(job);
             }
@@ -236,14 +262,17 @@ public class ScheduleManager
                 long oldScheduledRunTime = nextScheduledRunTime;
                 nextScheduledRunTime = now + delay;
 
-                // Avoid rescheduling if within one minute
-                if (difference(oldScheduledRunTime, nextScheduledRunTime) < 60000)
+                if (oldScheduledRunTime != -1)
                 {
-                    return;
-                }
+                    // Avoid rescheduling if within one minute
+                    if (difference(oldScheduledRunTime, nextScheduledRunTime) < 60000)
+                    {
+                        return;
+                    }
 
-                if (delay < DistributedLock.getLockTime())
-                    delay = DistributedLock.getLockTime();
+                    if (delay < DistributedLock.getLockTime())
+                        delay = DistributedLock.getLockTime();
+                }
 
                 logger.info("Next scheduled job at '{}'", new DateTime(now + delay));
 
@@ -289,5 +318,11 @@ public class ScheduleManager
                 scheduledJobs.addAll(scheduler.createNewJobs());
             }
         }
+    }
+
+    @VisibleForTesting
+    public static ScheduleManager getManagerForTest()
+    {
+        return new ScheduleManager();
     }
 }

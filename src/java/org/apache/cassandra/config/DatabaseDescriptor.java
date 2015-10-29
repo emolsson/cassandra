@@ -56,6 +56,7 @@ import org.apache.cassandra.scheduling.ISchedulePolicy;
 import org.apache.cassandra.scheduling.IScheduler;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.thrift.ThriftServer;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.memory.*;
 

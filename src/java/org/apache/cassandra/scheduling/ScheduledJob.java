@@ -17,10 +17,17 @@
  */
 package org.apache.cassandra.scheduling;
 
-import java.util.ArrayList;
+import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.Collection;
 
 import org.apache.cassandra.cache.CachedValue;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.scheduling.DistributedLock.Lock;
+import org.apache.cassandra.scheduling.DistributedLock.LockException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,9 +46,9 @@ import org.slf4j.LoggerFactory;
  */
 public abstract class ScheduledJob
 {
-    private static final Logger logger = LoggerFactory.getLogger(ScheduledJob.class);
+    public static IVersionedSerializer<ScheduledJob> serializer = new ScheduledJobSerializer();
 
-    private final Collection<ScheduledTask> tasks;
+    private static final Logger logger = LoggerFactory.getLogger(ScheduledJob.class);
 
     private final CachedValue<Long> cachedRunTime = new CachedValue<>();
 
@@ -49,25 +56,22 @@ public abstract class ScheduledJob
 
     protected ScheduledJob(JobConfiguration configuration)
     {
-        this(configuration, new ArrayList<ScheduledTask>());
-    }
-
-    protected ScheduledJob(JobConfiguration configuration, Collection<? extends ScheduledTask> tasks)
-    {
-        assert configuration != null && tasks != null;
-        this.tasks = new ArrayList<>(tasks);
+        assert configuration != null;
 
         this.configuration = configuration;
+    }
 
+    protected void init()
+    {
         if (getLastRunTime() == -1)
         {
             long lastRunTime = System.currentTimeMillis() - this.configuration.getMinimumDelay();
-            for (ScheduledTask task : this.tasks)
-            {
-                task.setLastRunTime(lastRunTime);
-            }
+
+            getTasks().forEach(p -> p.setLastRunTime(lastRunTime));
         }
     }
+
+    protected abstract Collection<? extends ScheduledTask> getTasks();
 
     /**
      * Set the {@link JobConfiguration} for this job.
@@ -107,24 +111,26 @@ public abstract class ScheduledJob
     {
         cachedRunTime.invalidate();
 
-        for (ScheduledTask task : tasks)
-        {
-            try
-            {
-                if (task.getLastRunTime() + configuration.getMinimumDelay() < System.currentTimeMillis())
-                {
-                    task.execute();
-                    task.setLastRunTime(System.currentTimeMillis());
-                }
-            }
-            catch (Exception e)
-            {
-                logger.warn("Unable to run task", e);
-                // TODO: Handle re-running of tasks later
-            }
-        }
+        getTasks().forEach(this::execute);
 
         return true;
+    }
+
+    private final void execute(ScheduledTask task)
+    {
+        try
+        {
+            if (task.getLastRunTime() + configuration.getMinimumDelay() < System.currentTimeMillis())
+            {
+                task.execute();
+                task.setLastRunTime(System.currentTimeMillis());
+            }
+        }
+        catch (Exception e)
+        {
+            logger.warn("Unable to run task", e);
+            // TODO: Handle re-running of tasks later
+        }
     }
 
     /**
@@ -175,6 +181,13 @@ public abstract class ScheduledJob
      */
     public final int getPriority()
     {
+        int overridePrio = overridePriority();
+
+        if (overridePrio > -1)
+        {
+            return overridePrio;
+        }
+
         long now = System.currentTimeMillis();
         long diff = now - getLastRunTime();
 
@@ -187,6 +200,16 @@ public abstract class ScheduledJob
         return (hours + 1) * configuration.getBasePriority();
     }
 
+    public int overridePriority()
+    {
+        return -1;
+    }
+
+    public Lock getLock() throws LockException
+    {
+        return DistributedLock.instance.tryGetLock(ScheduleManager.SCHEDULE_LOCK, getPriority());
+    }
+
     private long getLastRunTime()
     {
         Long cached = cachedRunTime.getValue();
@@ -195,7 +218,7 @@ public abstract class ScheduledJob
 
         long ret = -1;
 
-        for (ScheduledTask task : tasks)
+        for (ScheduledTask task : getTasks())
         {
             if (ret == -1 || task.getLastRunTime() < ret)
             {
@@ -209,4 +232,51 @@ public abstract class ScheduledJob
     }
 
     public abstract String toString();
+
+    public abstract IVersionedSerializer<ScheduledJob> getSerializer();
+
+    public static class ScheduledJobSerializer implements IVersionedSerializer<ScheduledJob>
+    {
+
+        @Override
+        public void serialize(ScheduledJob t, DataOutputPlus out, int version) throws IOException
+        {
+            out.writeUTF(t.getClass().getCanonicalName());
+            t.getSerializer().serialize(t, out, version);
+        }
+
+        @SuppressWarnings("unchecked")
+        @Override
+        public ScheduledJob deserialize(DataInputPlus in, int version) throws IOException
+        {
+            String className = in.readUTF();
+
+            try
+            {
+                Class<?> clazz = Class.forName(className);
+                assert clazz.isAssignableFrom(ScheduledJob.class);
+                Field serializerField = clazz.getDeclaredField("serializer");
+                Object serializer = serializerField.get(null);
+                assert serializer instanceof IVersionedSerializer;
+
+                return ((IVersionedSerializer<ScheduledJob>) serializer).deserialize(in, version);
+            }
+            catch (Exception e)
+            {
+                logger.error("Unable to get the scheduled job", e);
+            }
+
+            return null;
+        }
+
+        @Override
+        public long serializedSize(ScheduledJob t, int version)
+        {
+            int size = TypeSizes.sizeof(t.getClass().getCanonicalName());
+            size += t.getSerializer().serializedSize(t, version);
+
+            return size;
+        }
+
+    }
 }

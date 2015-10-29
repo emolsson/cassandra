@@ -17,8 +17,13 @@
  */
 package org.apache.cassandra.scheduling;
 
+import java.io.IOException;
 import java.util.Objects;
 
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 
 /**
@@ -38,7 +43,9 @@ import org.apache.commons.lang3.builder.HashCodeBuilder;
  */
 public class JobConfiguration
 {
-    public enum BasePriority
+    public static IVersionedSerializer<JobConfiguration> serializer = new JobConfigurationSerializer();
+
+    public static enum BasePriority
     {
         LOW(1),
         MEDIUM(2),
@@ -55,6 +62,16 @@ public class JobConfiguration
         public int getPriority()
         {
             return priority;
+        }
+
+        public static BasePriority fromInt(int i)
+        {
+            for (BasePriority bp : values())
+            {
+                if (bp.priority == i)
+                    return bp;
+            }
+            throw new IllegalArgumentException("Unknown JobConfiguration.BasePriority: " + i);
         }
     }
 
@@ -165,5 +182,40 @@ public class JobConfiguration
                 .append(enabled)
                 .append(runOnce)
                 .toHashCode();
+    }
+
+    private static class JobConfigurationSerializer implements IVersionedSerializer<JobConfiguration>
+    {
+        @Override
+        public void serialize(JobConfiguration t, DataOutputPlus out, int version) throws IOException
+        {
+            out.writeLong(t.minimumDelay);
+            out.writeInt(t.basePriority.priority);
+            out.writeBoolean(t.enabled);
+            out.writeBoolean(t.runOnce);
+        }
+
+        @Override
+        public JobConfiguration deserialize(DataInputPlus in, int version) throws IOException
+        {
+            long minimumDelay = in.readLong();
+            BasePriority basePriority = BasePriority.fromInt(in.readInt());
+            boolean enabled = in.readBoolean();
+            boolean runOnce = in.readBoolean();
+
+            return new JobConfiguration(minimumDelay, basePriority, enabled, runOnce);
+        }
+
+        @Override
+        public long serializedSize(JobConfiguration t, int version)
+        {
+            long size = TypeSizes.sizeof(t.minimumDelay);
+            size += TypeSizes.sizeof(t.basePriority.priority);
+            size += TypeSizes.sizeof(t.enabled);
+            size += TypeSizes.sizeof(t.runOnce);
+
+            return size;
+        }
+
     }
 }
