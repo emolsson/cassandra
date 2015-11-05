@@ -49,23 +49,6 @@ class ScheduledRepairTask extends ScheduledTask
     /**
      * Create a new repair task with the provided parameters.
      *
-     * @param keyspace
-     *            The keyspace to repair.
-     * @param table
-     *            The table to repair.
-     * @param repairRange
-     *            The range to repair.
-     * @param params
-     *            The repair configuration.
-     */
-    public ScheduledRepairTask(String keyspace, String table, Range<Token> repairRange, RepairSchedulingParams params)
-    {
-        this(-1, keyspace, table, repairRange, params);
-    }
-
-    /**
-     * Create a new repair task with the provided parameters.
-     *
      * @param lastRepairedAt
      *            The last time this task was run.
      * @param keyspace
@@ -77,7 +60,10 @@ class ScheduledRepairTask extends ScheduledTask
      * @param params
      *            The repair configuration.
      */
-    public ScheduledRepairTask(long lastRepairedAt, String keyspace, String table, Range<Token> repairRange,
+    private ScheduledRepairTask(long lastRepairedAt,
+            String keyspace,
+            String table,
+            Range<Token> repairRange,
             RepairSchedulingParams params)
     {
         super(lastRepairedAt);
@@ -87,6 +73,9 @@ class ScheduledRepairTask extends ScheduledTask
         this.params = params;
     }
 
+    /**
+     * @return The range this task should repair.
+     */
     public Range<Token> getRepairRange()
     {
         return repairRange;
@@ -110,6 +99,93 @@ class ScheduledRepairTask extends ScheduledTask
         {
             logger.warn("Error while running repair for {}.{} of range {}", keyspace, table, repairRange, e);
             return false;
+        }
+    }
+
+    /**
+     * Helper class used to create a {@link ScheduledRepairTask}.
+     */
+    public static class Builder
+    {
+        private String keyspace;
+        private String table;
+        private Range<Token> range;
+        private RepairSchedulingParams params;
+        private long lastRepairedAt = -1;
+
+        public Builder()
+        {
+
+        }
+
+        /**
+         * Set the keyspace for the {@link ScheduledRepairTask}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withKeyspace(String keyspace)
+        {
+            this.keyspace = keyspace;
+            return this;
+        }
+
+        /**
+         * Set the table fpr the {@link ScheduledRepairTask}.
+         *
+         * @param table
+         * @return this
+         */
+        public Builder withTable(String table)
+        {
+            this.table = table;
+            return this;
+        }
+
+        /**
+         * Set the range for the {@link ScheduledRepairTask}.
+         *
+         * @param range
+         * @return this
+         */
+        public Builder withRange(Range<Token> range)
+        {
+            this.range = range;
+            return this;
+        }
+
+        /**
+         * Set the repair params for the {@link ScheduledRepairTask}.
+         *
+         * @param params
+         * @return this
+         */
+        public Builder withParams(RepairSchedulingParams params)
+        {
+            this.params = params;
+            return this;
+        }
+
+        /**
+         * Set the last repaired flag for the {@link ScheduledRepairTask}.
+         *
+         * @param lastRepairedAt
+         * @return this
+         */
+        public Builder withLastRepairedAt(long lastRepairedAt)
+        {
+            this.lastRepairedAt = lastRepairedAt;
+            return this;
+        }
+
+        /**
+         * Build the {@link ScheduledRepairTask}.
+         *
+         * @return A {@link ScheduledRepairTask} based on the attributes specified.
+         */
+        public ScheduledRepairTask build()
+        {
+            return new ScheduledRepairTask(lastRepairedAt, keyspace, table, range, params);
         }
     }
 

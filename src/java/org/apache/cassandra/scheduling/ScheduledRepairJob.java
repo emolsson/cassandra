@@ -84,29 +84,47 @@ public class ScheduledRepairJob extends ScheduledJob
         RepairSchedulingParams params = new RepairSchedulingParams(true, option.isIncremental(), 0,
                 option.getParallelism());
 
-        option.getRanges().forEach(range -> tasks.add(new ScheduledRepairTask(keyspace, table, range, params)));
+        option.getRanges().forEach(range -> tasks.add(new ScheduledRepairTask.Builder()
+                        .withKeyspace(keyspace)
+                        .withTable(table)
+                        .withRange(range)
+                        .withParams(params)
+                        .build()));
 
-        if (scheduledHigh)
-            return new ScheduledRepairJob(keyspace, table, tasks, params, true, BasePriority.HIGHEST);
-        else
-            return new ScheduledRepairJob(keyspace, table, tasks, params, true, BasePriority.HIGH);
+        JobConfiguration.Builder configBuilder = new JobConfiguration.Builder()
+                .withMinimumDelay(0).withEnabled(true)
+                .withRunOnce(true)
+                .withPriority(scheduledHigh ? BasePriority.HIGHEST : BasePriority.HIGH);
+
+        Builder builder = new Builder()
+                .withKeyspace(keyspace)
+                .withTable(table)
+                .withTasks(tasks)
+                .withRepairParams(params)
+                .withConfiguration(configBuilder.build());
+
+        return builder.build();
     }
 
-    public ScheduledRepairJob(String keyspace, String table, Collection<ScheduledRepairTask> tasks,
+    /**
+     * Create a new repair job with the provided parameters.
+     * 
+     * @param configuration
+     *            The job configuartion.
+     * @param keyspace
+     *            The keyspace this job repairs.
+     * @param table
+     *            The table this job repairs.
+     * @param tasks
+     *            The tasks assigned to this repair job.
+     * @param params
+     *            The repair configuration.
+     */
+    private ScheduledRepairJob(JobConfiguration configuration,
+            String keyspace,
+            String table,
+            Collection<ScheduledRepairTask> tasks,
             RepairSchedulingParams params)
-    {
-        this(keyspace, table, tasks, params, false, BasePriority.LOW);
-    }
-
-    private ScheduledRepairJob(String keyspace, String table, Collection<ScheduledRepairTask> tasks,
-            RepairSchedulingParams params, boolean runOnce, BasePriority priority)
-    {
-        this(new JobConfiguration(params.minDelay(), priority, params.enabled(), runOnce), keyspace, table, tasks,
-                params);
-    }
-
-    public ScheduledRepairJob(JobConfiguration configuration, String keyspace, String table,
-            Collection<ScheduledRepairTask> tasks, RepairSchedulingParams params)
     {
         super(configuration);
         this.keyspace = keyspace;
@@ -143,16 +161,6 @@ public class ScheduledRepairJob extends ScheduledJob
         return true;
     }
 
-    private JobConfiguration reloadConfiguration()
-    {
-        CFMetaData cfMetaData = Schema.instance.getCFMetaData(keyspace, table);
-        assert cfMetaData != null;
-
-        RepairSchedulingParams params = cfMetaData.params.repairScheduling;
-
-        return new JobConfiguration(params.minDelay(), BasePriority.LOW, params.enabled());
-    }
-
     @Override
     public String toString()
     {
@@ -165,9 +173,98 @@ public class ScheduledRepairJob extends ScheduledJob
         return DistributedLock.instance.tryGetLock(ScheduleManager.SCHEDULE_LOCK + "_repair", getPriority());
     }
 
+    @Override
     public IVersionedSerializer<ScheduledJob> getSerializer()
     {
         return serializer;
+    }
+
+    /**
+     * Helper class used to create a {@link ScheduledRepairJob}.
+     */
+    public static class Builder
+    {
+        private String keyspace;
+        private String table;
+        private Collection<ScheduledRepairTask> tasks;
+        private RepairSchedulingParams params = RepairSchedulingParams.DEFAULT;
+        private JobConfiguration configuration;
+
+        public Builder()
+        {
+        }
+
+        /**
+         * Set the keyspace for the {@link ScheduledRepairJob}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withKeyspace(String keyspace)
+        {
+            this.keyspace = keyspace;
+            return this;
+        }
+
+        /**
+         * Set the table for the {@link ScheduledRepairJob}.
+         *
+         * @param table
+         * @return this
+         */
+        public Builder withTable(String table)
+        {
+            this.table = table;
+            return this;
+        }
+
+        /**
+         * Set the {@link RepairSchedulingParams} for the {@link ScheduledRepairJob}.
+         *
+         * @param params
+         * @return this
+         */
+        public Builder withRepairParams(RepairSchedulingParams params)
+        {
+            this.params = params;
+            return this;
+        }
+
+        /**
+         * Set the list of tasks for the {@link ScheduledRepairJob}.
+         *
+         * @param tasks
+         * @return this
+         */
+        public Builder withTasks(Collection<ScheduledRepairTask> tasks)
+        {
+            this.tasks = tasks;
+            return this;
+        }
+
+        /**
+         * Set the configuration for the {@link ScheduledRepairJob}.
+         *
+         * @param configuration
+         * @return this
+         */
+        public Builder withConfiguration(JobConfiguration configuration)
+        {
+            this.configuration = configuration;
+            return this;
+        }
+
+        /**
+         * Build the {@link ScheduledRepairJob}.
+         *
+         * @return A {@link ScheduledRepairJob} based on the attributes specified.
+         */
+        public ScheduledRepairJob build()
+        {
+            assert keyspace != null && table != null && configuration != null && tasks != null;
+
+            return new ScheduledRepairJob(configuration, keyspace, table, tasks, params);
+        }
     }
 
     public static class ScheduledRepairJobSerializer implements IVersionedSerializer<ScheduledJob>
@@ -203,7 +300,13 @@ public class ScheduledRepairJob extends ScheduledJob
             {
                 Range<Token> range = (Range<Token>) AbstractBounds.tokenSerializer.deserialize(in,
                         MessagingService.globalPartitioner(), version);
-                tasks.add(new ScheduledRepairTask(keyspace, table, range, params));
+
+                tasks.add(new ScheduledRepairTask.Builder()
+                        .withKeyspace(keyspace)
+                        .withTable(table)
+                        .withRange(range)
+                        .withParams(params)
+                        .build());
             }
 
             return new ScheduledRepairJob(configuration, keyspace, table, tasks, params);
@@ -228,5 +331,19 @@ public class ScheduledRepairJob extends ScheduledJob
             return size;
         }
 
+    }
+
+    private JobConfiguration reloadConfiguration()
+    {
+        CFMetaData cfMetaData = Schema.instance.getCFMetaData(keyspace, table);
+        assert cfMetaData != null;
+
+        RepairSchedulingParams params = cfMetaData.params.repairScheduling;
+
+        return new JobConfiguration.Builder()
+                .withMinimumDelay(params.minDelay())
+                .withPriority(BasePriority.LOW)
+                .withEnabled(params.enabled())
+                .build();
     }
 }

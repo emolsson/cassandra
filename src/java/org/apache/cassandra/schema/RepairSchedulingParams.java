@@ -59,11 +59,11 @@ public class RepairSchedulingParams
     /**
      * 1 day
      */
-    private static final long DEFAULT_INTERVAL = 86400;
+    private static final long DEFAULT_MIN_DELAY = 86400;
     private static final boolean DEFAULT_INCREMENTAL = true;
-    private static final RepairParallelism DEFAULT_PARALLELISM = RepairParallelism.SEQUENTIAL;
+    public static final RepairParallelism DEFAULT_PARALLELISM = RepairParallelism.SEQUENTIAL;
 
-    public static final RepairSchedulingParams DEFAULT = new RepairSchedulingParams(false, DEFAULT_INCREMENTAL, DEFAULT_INTERVAL, DEFAULT_PARALLELISM);
+    public static final RepairSchedulingParams DEFAULT = new RepairSchedulingParams(false, DEFAULT_INCREMENTAL, DEFAULT_MIN_DELAY, DEFAULT_PARALLELISM);
 
     private final boolean enabled;
     private final boolean incremental;
@@ -120,7 +120,7 @@ public class RepairSchedulingParams
     private static long removeMinDelay(Map<String, String> options)
     {
         String minDelay = options.remove(Option.MIN_DELAY.toString());
-        return minDelay == null ? DEFAULT_INTERVAL : Long.parseLong(minDelay);
+        return minDelay == null ? DEFAULT_MIN_DELAY : Long.parseLong(minDelay);
     }
 
     private static boolean removeIncremental(Map<String, String> options)

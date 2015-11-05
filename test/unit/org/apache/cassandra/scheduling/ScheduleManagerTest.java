@@ -53,7 +53,7 @@ public class ScheduleManagerTest
     @Test
     public void testScheduleJobNow() throws InterruptedException
     {
-        JobConfiguration configuration = new JobConfiguration(1, BasePriority.LOW, true, true);
+        JobConfiguration configuration = getJobConfiguration();
 
         final long lastRunTime = System.currentTimeMillis() - 1000;
         final SimpleCondition lock = new SimpleCondition();
@@ -66,7 +66,7 @@ public class ScheduleManagerTest
     @Test
     public void testScheduleJobNowWithThrowingLock() throws InterruptedException
     {
-        JobConfiguration configuration = new JobConfiguration(1, BasePriority.LOW, true, true);
+        JobConfiguration configuration = getJobConfiguration();
 
         final long lastRunTime = System.currentTimeMillis() - 1000;
         final SimpleCondition lock = new SimpleCondition();
@@ -93,7 +93,7 @@ public class ScheduleManagerTest
     @Test
     public void testScheduleJob1Second() throws InterruptedException
     {
-        JobConfiguration configuration = new JobConfiguration(1, BasePriority.LOW, true, true);
+        JobConfiguration configuration = getJobConfiguration();
 
         final long lastRunTime = System.currentTimeMillis();
         final SimpleCondition lock = new SimpleCondition();
@@ -108,8 +108,8 @@ public class ScheduleManagerTest
     @Test
     public void testSchedule2JobsRunOrder() throws InterruptedException
     {
-        JobConfiguration configuration = new JobConfiguration(1, BasePriority.LOW, true, true);
-        JobConfiguration configuration2 = new JobConfiguration(1, BasePriority.HIGH, true, true);
+        JobConfiguration configuration = getJobConfiguration();
+        JobConfiguration configuration2 = getJobConfiguration(BasePriority.HIGH);
 
         final long lastRunTime = System.currentTimeMillis() - 1000;
         final SimpleCondition lock = new SimpleCondition();
@@ -128,7 +128,7 @@ public class ScheduleManagerTest
     @Test
     public void testDummyPolicy() throws InterruptedException
     {
-        JobConfiguration configuration = new JobConfiguration(1, BasePriority.LOW, true, true);
+        JobConfiguration configuration = getJobConfiguration();
 
         final long lastRunTime = System.currentTimeMillis() - 1000;
         final SimpleCondition lock = new SimpleCondition();
@@ -155,6 +155,17 @@ public class ScheduleManagerTest
         Thread.sleep(1500);
         assertFalse(lock.isSignaled());
         assertTrue(lock.await(2, TimeUnit.SECONDS));
+    }
+
+    private JobConfiguration getJobConfiguration()
+    {
+        return getJobConfiguration(BasePriority.LOW);
+    }
+
+    private JobConfiguration getJobConfiguration(BasePriority priority)
+    {
+        return new JobConfiguration.Builder().withEnabled(true).withRunOnce(true).withMinimumDelay(1)
+                .withPriority(BasePriority.LOW).build();
     }
 
     private void scheduleJob(final JobConfiguration configuration, final long lastRunTime, final SimpleCondition lock)

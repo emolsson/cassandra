@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.Objects;
 
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -81,26 +82,6 @@ public class JobConfiguration
     private boolean runOnce;
 
     /**
-     * Create a new job configuration based on the provided parameters. Identical to calling the
-     * {@link JobConfiguration#JobConfiguration(long, BasePriority, boolean, boolean) constructor} as
-     *
-     * <br>
-     *
-     * <b>new JobConfiguration(minimumDelay,basePriority,enabled,<i>false</i>)</b>
-     *
-     * @param minimumDelay
-     *            The minimum time in seconds to wait after this job has run before it is run again.
-     * @param basePriority
-     *            The base priority used to calculate the "real" priority of the job.
-     * @param enabled
-     *            If the job should be scheduled to run.
-     */
-    public JobConfiguration(long minimumDelay, BasePriority basePriority, boolean enabled)
-    {
-        this(minimumDelay, basePriority, enabled, false);
-    }
-
-    /**
      * Create a new job configuration based on the provided parameters.
      *
      * @param minimumDelay
@@ -112,7 +93,10 @@ public class JobConfiguration
      * @param runOnce
      *            False if the job should be rescheduled after it has run.
      */
-    public JobConfiguration(long minimumDelay, BasePriority basePriority, boolean enabled, boolean runOnce)
+    private JobConfiguration(long minimumDelay,
+            BasePriority basePriority,
+            boolean enabled,
+            boolean runOnce)
     {
         this.minimumDelay = minimumDelay;
         this.basePriority = basePriority;
@@ -182,6 +166,83 @@ public class JobConfiguration
                 .append(enabled)
                 .append(runOnce)
                 .toHashCode();
+    }
+
+    /**
+     * Helper class used to create a {@link ScheduledRepairJob}.
+     */
+    public static class Builder
+    {
+        private BasePriority priority = BasePriority.LOW;
+        private boolean enabled = true;
+        private boolean runOnce = false;
+        private Long minimumDelay = null;
+
+        public Builder()
+        {
+
+        }
+
+        /**
+         * Set the enabled flag for the {@link JobConfiguration}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withEnabled(boolean enabled)
+        {
+            this.enabled = enabled;
+            return this;
+        }
+
+        /**
+         * Set the run once flag for the {@link JobConfiguration}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withRunOnce(boolean runOnce)
+        {
+            this.runOnce = runOnce;
+            return this;
+        }
+
+        /**
+         * Set the minimum delay for the {@link JobConfiguration}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withMinimumDelay(long minimumDelay)
+        {
+            this.minimumDelay = minimumDelay;
+            return this;
+        }
+
+        /**
+         * Set the priority for the {@link JobConfiguration}.
+         *
+         * @param keyspace
+         * @return this
+         */
+        public Builder withPriority(BasePriority priority)
+        {
+            this.priority = priority;
+            return this;
+        }
+
+        /**
+         * Build the {@link JobConfiguration}.
+         *
+         * @return A {@link JobConfiguration} based on the attributes specified.
+         */
+        public JobConfiguration build()
+        {
+            if (minimumDelay == null)
+                throw new ConfigurationException("There must be a minimum delay defined for a job configuration.");
+
+            return new JobConfiguration(minimumDelay, priority, enabled, runOnce);
+        }
     }
 
     private static class JobConfigurationSerializer implements IVersionedSerializer<JobConfiguration>

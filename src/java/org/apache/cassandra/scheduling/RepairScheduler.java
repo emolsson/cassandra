@@ -92,10 +92,12 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         {
             try
             {
-                Collection<ScheduledRepairTask> tasks = createTasks(keyspace, table, ranges,
-                        cfMetaData.params.repairScheduling);
-
-                return new ScheduledRepairJob(keyspace, table, tasks, cfMetaData.params.repairScheduling);
+                return new ScheduledRepairJob.Builder()
+                        .withKeyspace(keyspace)
+                        .withTable(table)
+                        .withTasks(createRepairTasks(cfMetaData, ranges))
+                        .withRepairParams(cfMetaData.params.repairScheduling)
+                        .build();
             }
             catch (ConfigurationException e)
             {
@@ -107,79 +109,31 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         return null;
     }
 
-    private Map<Range<Token>, Long> getLastRepairedForRanges(String keyspace, String table,
-            Collection<Range<Token>> ranges)
+    private Collection<ScheduledRepairTask> createRepairTasks(CFMetaData cfMetaData, Collection<Range<Token>> ranges)
     {
-        Map<Range<Token>, Long> lastRepairedAt = new HashMap<>();
-        IPartitioner partitioner = StorageService.instance.getTokenMetadata().partitioner;
+        final String keyspace = cfMetaData.ksName;
+        final String table = cfMetaData.cfName;
+        final RepairSchedulingParams params = cfMetaData.params.repairScheduling;
 
-        try
-        {
-            UntypedResultSet repairHistory = SystemDistributedKeyspace.getRepairJobs(keyspace, table);
-
-            Iterator<UntypedResultSet.Row> it = repairHistory.iterator();
-
-            while (it.hasNext() && lastRepairedAt.size() < ranges.size())
-            {
-                UntypedResultSet.Row row = it.next();
-
-                String status = row.getString("status");
-
-                if (!RepairState.SUCCESS.toString().equals(status))
-                {
-                    continue;
-                }
-
-                String range_begin = row.getString("range_begin");
-                String range_end = row.getString("range_end");
-
-                assert range_begin != null && range_end != null;
-
-                Token start = partitioner.getTokenFactory().fromString(range_begin);
-                Token end = partitioner.getTokenFactory().fromString(range_end);
-
-                Range<Token> range = new Range<Token>(start, end);
-
-                if (lastRepairedAt.containsKey(range) || !ranges.contains(range))
-                {
-                    continue;
-                }
-
-                if (row.has("finished_at"))
-                {
-                    Date finished_at = row.getTimestamp("finished_at");
-                    lastRepairedAt.put(range, finished_at.getTime());
-                }
-            }
-        }
-        catch (Throwable t)
-        {
-            logger.error("Unable to get repair history for table {}.{}: {}", keyspace, table, t);
-        }
-
-        return lastRepairedAt;
-    }
-
-    private Collection<ScheduledRepairTask> createTasks(String keyspace, String table, Collection<Range<Token>> ranges,
-            RepairSchedulingParams params)
-    {
-        Collection<ScheduledRepairTask> ret = new ArrayList<>();
+        Collection<ScheduledRepairTask> tasks = new ArrayList<>();
 
         Map<Range<Token>, Long> lastRepairedAt = getLastRepairedForRanges(keyspace, table, ranges);
 
         for (Range<Token> range : ranges)
         {
+            ScheduledRepairTask.Builder builder = new ScheduledRepairTask.Builder()
+                    .withKeyspace(keyspace)
+                    .withTable(table)
+                    .withRange(range)
+                    .withParams(params);
+
             if (lastRepairedAt.containsKey(range))
-            {
-                ret.add(new ScheduledRepairTask(lastRepairedAt.get(range), keyspace, table, range, params));
-            }
-            else
-            {
-                ret.add(new ScheduledRepairTask(keyspace, table, range, params));
-            }
+                builder.withLastRepairedAt(lastRepairedAt.get(range));
+
+            tasks.add(builder.build());
         }
 
-        return ret;
+        return tasks;
     }
 
     @Override
@@ -239,7 +193,13 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         {
             List<ScheduledJob> jobs = new ArrayList<>();
             long downTime = System.currentTimeMillis() - downSince;
-            JobConfiguration configuration = new JobConfiguration(3600, BasePriority.HIGHEST, true, true);
+            JobConfiguration configuration = new JobConfiguration.Builder()
+                    .withMinimumDelay(3600)
+                    .withPriority(BasePriority.HIGHEST)
+                    .withEnabled(true)
+                    .withRunOnce(true)
+                    .build();
+
             ScheduleableTableIterator it = new ScheduleableTableIterator();
 
             long maxHintWindow = DatabaseDescriptor.getMaxHintWindow();
@@ -257,13 +217,18 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
 
                 if (downTime >= minDownTime)
                 {
+                    String keyspace = cfMetaData.ksName;
                     String table = cfMetaData.cfName;
 
-                    Collection<ScheduledRepairTask> tasks = createTasks(cfMetaData.ksName, table, ranges,
-                            cfMetaData.params.repairScheduling);
 
-                    jobs.add(new ScheduledRepairJob(configuration, cfMetaData.ksName, table, tasks,
-                            cfMetaData.params.repairScheduling));
+                    ScheduledRepairJob.Builder builder = new ScheduledRepairJob.Builder()
+                            .withKeyspace(keyspace)
+                            .withTable(table)
+                            .withTasks(createRepairTasks(cfMetaData, ranges))
+                            .withRepairParams(cfMetaData.params.repairScheduling)
+                            .withConfiguration(configuration);
+
+                    jobs.add(builder.build());
                 }
             }
 
@@ -353,4 +318,56 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
 
     }
 
+    private static Map<Range<Token>, Long> getLastRepairedForRanges(String keyspace, String table,
+            Collection<Range<Token>> ranges)
+    {
+        Map<Range<Token>, Long> lastRepairedAt = new HashMap<>();
+        IPartitioner partitioner = StorageService.instance.getTokenMetadata().partitioner;
+
+        try
+        {
+            UntypedResultSet repairHistory = SystemDistributedKeyspace.getRepairJobs(keyspace, table);
+
+            Iterator<UntypedResultSet.Row> it = repairHistory.iterator();
+
+            while (it.hasNext() && lastRepairedAt.size() < ranges.size())
+            {
+                UntypedResultSet.Row row = it.next();
+
+                String status = row.getString("status");
+
+                if (!RepairState.SUCCESS.toString().equals(status))
+                {
+                    continue;
+                }
+
+                String range_begin = row.getString("range_begin");
+                String range_end = row.getString("range_end");
+
+                assert range_begin != null && range_end != null;
+
+                Token start = partitioner.getTokenFactory().fromString(range_begin);
+                Token end = partitioner.getTokenFactory().fromString(range_end);
+
+                Range<Token> range = new Range<Token>(start, end);
+
+                if (lastRepairedAt.containsKey(range) || !ranges.contains(range))
+                {
+                    continue;
+                }
+
+                if (row.has("finished_at"))
+                {
+                    Date finished_at = row.getTimestamp("finished_at");
+                    lastRepairedAt.put(range, finished_at.getTime());
+                }
+            }
+        }
+        catch (Throwable t)
+        {
+            logger.error("Unable to get repair history for table {}.{}: {}", keyspace, table, t);
+        }
+
+        return lastRepairedAt;
+    }
 }

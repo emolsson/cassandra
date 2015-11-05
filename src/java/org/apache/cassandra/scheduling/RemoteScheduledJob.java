@@ -27,29 +27,50 @@ import org.apache.cassandra.scheduling.DistributedLock.Lock;
 import org.apache.cassandra.scheduling.DistributedLock.LockException;
 import org.apache.cassandra.scheduling.JobConfiguration.BasePriority;
 
+/**
+ * A remote scheduled job is used to schedule a set of {@link ScheduledJob}.
+ *
+ * These jobs must implement the {@link ScheduledJob#getSerializer()} properly.
+ */
 public class RemoteScheduledJob extends ScheduledJob
 {
     public static RemoteScheduledJob createJob(InetAddress endpoint, List<ScheduledJob> jobs)
     {
-        Collection<RemoteScheduledRepairTask> tasks = new ArrayList<>();
+        Collection<RemoteScheduledTask> tasks = new ArrayList<>();
 
-        jobs.forEach(job -> tasks.add(new RemoteScheduledRepairTask(endpoint, job)));
+        jobs.forEach(job -> tasks.add(new RemoteScheduledTask(endpoint, job)));
 
-        JobConfiguration configuration = new JobConfiguration(3600, BasePriority.HIGHEST, true, true);
+        JobConfiguration configuration = new JobConfiguration.Builder()
+                .withMinimumDelay(3600)
+                .withPriority(BasePriority.HIGHEST)
+                .withEnabled(true)
+                .withRunOnce(true)
+                .build();
 
         return new RemoteScheduledJob(configuration, tasks, endpoint, jobs);
     }
 
-    private Collection<RemoteScheduledRepairTask> tasks;
+    private Collection<RemoteScheduledTask> tasks;
 
     private InetAddress endpoint;
     private final List<ScheduledJob> jobs;
 
     /**
+     * Create a new remote scheduled job based on the parameters provided.
+     *
      * @param configuration
+     *            The job configuration for this job.
+     * @param tasks
+     *            The tasks to run.
+     * @param endpoint
+     *            The endpoint to send the scheduled jobs.
+     * @param jobs
+     *            The list of scheduled jobs for the remote host.
      */
-    private RemoteScheduledJob(JobConfiguration configuration, Collection<RemoteScheduledRepairTask> tasks,
-            InetAddress endpoint, List<ScheduledJob> jobs)
+    private RemoteScheduledJob(JobConfiguration configuration,
+            Collection<RemoteScheduledTask> tasks,
+            InetAddress endpoint,
+            List<ScheduledJob> jobs)
     {
         super(configuration);
 
@@ -82,13 +103,13 @@ public class RemoteScheduledJob extends ScheduledJob
         return DistributedLock.instance.tryGetLock(ScheduleManager.SCHEDULE_LOCK + "_remote", getPriority());
     }
 
-    private static class RemoteScheduledRepairTask extends ScheduledTask
+    private static class RemoteScheduledTask extends ScheduledTask
     {
         private final InetAddress endpoint;
 
         private final ScheduledJob job;
 
-        public RemoteScheduledRepairTask(InetAddress endpoint, ScheduledJob job)
+        public RemoteScheduledTask(InetAddress endpoint, ScheduledJob job)
         {
             this.endpoint = endpoint;
             this.job = job;
@@ -108,6 +129,6 @@ public class RemoteScheduledJob extends ScheduledJob
     @Override
     public IVersionedSerializer<ScheduledJob> getSerializer()
     {
-        throw new UnsupportedOperationException("RemoteScheduledRepairJob shouldn't be serialized");
+        throw new UnsupportedOperationException("RemoteScheduledJob shouldn't be serialized");
     }
 }

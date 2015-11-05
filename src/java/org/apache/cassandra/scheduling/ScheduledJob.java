@@ -233,6 +233,11 @@ public abstract class ScheduledJob
 
     public abstract String toString();
 
+    /**
+     * A serializer used to serialize the job when it should be sent to a remote host.
+     *
+     * @return
+     */
     public abstract IVersionedSerializer<ScheduledJob> getSerializer();
 
     public static class ScheduledJobSerializer implements IVersionedSerializer<ScheduledJob>

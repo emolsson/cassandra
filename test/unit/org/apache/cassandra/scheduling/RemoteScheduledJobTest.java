@@ -54,7 +54,8 @@ public class RemoteScheduledJobTest
     @Test
     public void testValidatorComplete() throws Throwable
     {
-        JobConfiguration configuration = new JobConfiguration(1000, BasePriority.LOW, true);
+        JobConfiguration configuration = new JobConfiguration.Builder().withMinimumDelay(1000)
+                .withPriority(BasePriority.LOW).withEnabled(true).build();
 
         final DummyJob job = new DummyJob(configuration, "TestDummyJob");
 
