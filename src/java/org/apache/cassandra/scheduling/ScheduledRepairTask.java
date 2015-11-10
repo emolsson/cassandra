@@ -20,8 +20,10 @@ package org.apache.cassandra.scheduling;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ScheduledExecutionException;
 import org.apache.cassandra.repair.messages.RepairOption;
 import org.apache.cassandra.schema.RepairSchedulingParams;
 import org.apache.cassandra.service.StorageService;
@@ -82,7 +84,7 @@ class ScheduledRepairTask extends ScheduledTask
     }
 
     @Override
-    public boolean execute()
+    public void execute() throws ScheduledExecutionException
     {
         logger.debug("Running repair of {}.{} for the range {}", keyspace, table, repairRange);
         RepairOption option = RepairOption.parse(createRepairOptions(), StorageService.instance.getTokenMetadata().partitioner);
@@ -93,13 +95,33 @@ class ScheduledRepairTask extends ScheduledTask
         {
             StorageService.instance.forceRepairBlocking(keyspace, option);
             logger.debug("Repair of {}.{} for the range {} finished", keyspace, table, repairRange);
-            return true;
         }
         catch (Exception e)
         {
             logger.warn("Error while running repair for {}.{} of range {}", keyspace, table, repairRange, e);
-            return false;
+            throw new ScheduledExecutionException(e);
         }
+    }
+
+    @Override
+    public String toString()
+    {
+        return String.format("RepairTask %d,%d", repairRange.left, repairRange.right);
+    }
+
+    public static Range<Token> fromString(String task)
+    {
+        IPartitioner partitioner = StorageService.instance.getTokenMetadata().partitioner;
+        String[] task_part = task.split(" ");
+        assert task_part.length == 2;
+
+        String[] tokens = task_part[1].split(",");
+        assert tokens.length == 2;
+
+        Token start = partitioner.getTokenFactory().fromString(tokens[0]);
+        Token end = partitioner.getTokenFactory().fromString(tokens[1]);
+
+        return new Range<Token>(start, end);
     }
 
     /**

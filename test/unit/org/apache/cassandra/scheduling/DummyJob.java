@@ -130,9 +130,8 @@ public class DummyJob extends ScheduledJob
         }
 
         @Override
-        public boolean execute()
+        public void execute()
         {
-            return true;
         }
 
         @Override
@@ -157,6 +156,12 @@ public class DummyJob extends ScheduledJob
             if (id != other.id)
                 return false;
             return true;
+        }
+
+        @Override
+        public String toString()
+        {
+            return "DummyJob";
         }
     }
 

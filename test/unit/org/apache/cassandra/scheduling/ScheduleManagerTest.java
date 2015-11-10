@@ -42,6 +42,7 @@ public class ScheduleManagerTest
     public void startup()
     {
         scheduleManager = ScheduleManager.getManagerForTest();
+        scheduleManager.startup(new DummyPolicy());
     }
 
     @After
@@ -80,10 +81,15 @@ public class ScheduleManagerTest
             }
 
             @Override
-            public boolean execute()
+            public void execute()
             {
                 lock.signalAll();
-                return true;
+            }
+
+            @Override
+            public String toString()
+            {
+                return "DummyTask";
             }
         }, null));
 
@@ -102,7 +108,7 @@ public class ScheduleManagerTest
 
         Thread.sleep(500);
         assertFalse(lock.isSignaled());
-        assertTrue(lock.await(2, TimeUnit.SECONDS));
+        assertTrue(lock.await(3, TimeUnit.SECONDS));
     }
 
     @Test
@@ -152,7 +158,7 @@ public class ScheduleManagerTest
 
         scheduleJob(configuration, lastRunTime, lock);
 
-        Thread.sleep(1500);
+        Thread.sleep(1000);
         assertFalse(lock.isSignaled());
         assertTrue(lock.await(2, TimeUnit.SECONDS));
     }
@@ -165,7 +171,7 @@ public class ScheduleManagerTest
     private JobConfiguration getJobConfiguration(BasePriority priority)
     {
         return new JobConfiguration.Builder().withEnabled(true).withRunOnce(true).withMinimumDelay(1)
-                .withPriority(BasePriority.LOW).build();
+                .withPriority(priority).build();
     }
 
     private void scheduleJob(final JobConfiguration configuration, final long lastRunTime, final SimpleCondition lock)
@@ -179,12 +185,27 @@ public class ScheduleManagerTest
             }
 
             @Override
-            public boolean execute()
+            public void execute()
             {
                 lock.signalAll();
-                return true;
+            }
+
+            @Override
+            public String toString()
+            {
+                return "DummyTask";
             }
         }));
+    }
+
+    private class DummyPolicy implements ISchedulePolicy
+    {
+
+        @Override
+        public long validate(ScheduledJob job)
+        {
+            return -1;
+        }
     }
 
     private class DummyJob extends ScheduledJob

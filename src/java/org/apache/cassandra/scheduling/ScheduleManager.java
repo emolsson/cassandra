@@ -17,21 +17,16 @@
  */
 package org.apache.cassandra.scheduling;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.scheduling.DistributedLock.Lock;
-import org.apache.cassandra.scheduling.DistributedLock.LockException;
-import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,12 +42,11 @@ public class ScheduleManager
 
     private final ScheduledJobQueue scheduledJobs = new ScheduledJobQueue();
 
-    private final JobRunTask runTask = new JobRunTask();
-
     private final Object updateLock = new Object();
 
-    private volatile ScheduledFuture<?> runFuture;
     private volatile ScheduledFuture<?> updateFuture;
+
+    private volatile ScheduledJobRunner jobRunner;
 
     private Collection<IScheduler> schedulers;
     private Collection<ISchedulePolicy> schedulePolicies;
@@ -72,6 +66,8 @@ public class ScheduleManager
             return;
         }
 
+        jobRunner = new ScheduledJobRunner(scheduledJobs, schedulePolicies);
+
         updateFuture = ScheduledExecutors.scheduledLongTasks.scheduleWithFixedDelay(new JobUpdateTask(),
                 DatabaseDescriptor.getMaintenaneSchedulerStartupDelay(), updateDelay, TimeUnit.SECONDS);
     }
@@ -80,6 +76,8 @@ public class ScheduleManager
     public void startup(ISchedulePolicy policy)
     {
         schedulePolicies = Arrays.asList(policy);
+
+        jobRunner = new ScheduledJobRunner(scheduledJobs, schedulePolicies);
     }
 
     @VisibleForTesting
@@ -89,9 +87,9 @@ public class ScheduleManager
         {
             updateFuture.cancel(true);
         }
-        if (runFuture != null)
+        if (jobRunner != null)
         {
-            runFuture.cancel(true);
+            jobRunner.stop();
         }
     }
 
@@ -102,9 +100,9 @@ public class ScheduleManager
      */
     public void schedule(ScheduledJob job)
     {
-        scheduledJobs.add(job);
+        scheduledJobs.add(job, ScheduleManager::compareJob);
 
-        runTask.maybeReschedule();
+        jobRunner.maybeReschedule();
     }
 
     /**
@@ -116,7 +114,7 @@ public class ScheduleManager
     {
         updateJobs();
 
-        runTask.maybeReschedule();
+        jobRunner.maybeReschedule();
     }
 
     /**
@@ -129,178 +127,7 @@ public class ScheduleManager
         {
             updateJobs();
 
-            runTask.maybeReschedule();
-        }
-    }
-
-    /**
-     * A task that tries to run scheduled jobs and checks with the policies if the job should have permission to run
-     * before running it.
-     *
-     * Reschedules itself to run when the next job should run.
-     *
-     * Uses distributed locks to synchronize between the nodes.
-     */
-    private class JobRunTask implements Runnable
-    {
-        private final AtomicBoolean running = new AtomicBoolean(false);
-
-        private final Object schedulingLock = new Object();
-
-        private volatile long nextScheduledRunTime = -1;
-
-        @Override
-        public void run()
-        {
-            if (!running.compareAndSet(false, true))
-            {
-                logger.debug("Scheduled job shouldn't be running, but was.");
-                return;
-            }
-
-            long delay = -1;
-
-            try
-            {
-                ScheduledJob job = scheduledJobs.peek();
-
-                if (job != null && job.couldRunNow())
-                {
-                    delay = validate(job);
-
-                    if (delay == -1)
-                        tryRunJob(job);
-                }
-            }
-            finally
-            {
-                if (!running.compareAndSet(true, false))
-                    logger.warn("Scheduled job should be running, but wasn't.");
-
-                synchronized (schedulingLock)
-                {
-                    nextScheduledRunTime = -1;
-
-                    maybeReschedule(delay);
-                }
-            }
-        }
-
-        private long validate(ScheduledJob job)
-        {
-            long delay = -1;
-
-            if (schedulePolicies == null)
-                return delay;
-
-            for (ISchedulePolicy policy : schedulePolicies)
-            {
-                long tmp = policy.validate(job);
-
-                if (tmp > delay)
-                    delay = tmp;
-            }
-
-            return delay;
-        }
-
-        private void tryRunJob(ScheduledJob job)
-        {
-            try (Lock lock = job.getLock())
-            {
-                runJob(job);
-            }
-            catch (LockException | IOException e)
-            {
-                if (e.getCause() != null)
-                    logger.warn("Unable to get schedule lock", e);
-            }
-        }
-
-        private void runJob(ScheduledJob job)
-        {
-            try
-            {
-                job.execute();
-
-                if (job.shouldRunOnce())
-                    scheduledJobs.remove(job);
-
-                // TODO: Save job status
-            }
-            catch (Exception e)
-            {
-                logger.warn("Unable to run job", e);
-                // TODO: Fallback handling
-            }
-        }
-
-        /**
-         * Try to reschedule the task runner if it isn't already running.
-         */
-        public void maybeReschedule()
-        {
-            synchronized (schedulingLock)
-            {
-                maybeReschedule(-1);
-            }
-        }
-
-        private void maybeReschedule(long wantedDelay)
-        {
-            long delay = wantedDelay == -1 ? delayToNextJob() : wantedDelay;
-
-            if (delay >= 0)
-            {
-                if (running.get())
-                    return;
-
-                delay += 1000;
-
-                long now = System.currentTimeMillis();
-
-                long oldScheduledRunTime = nextScheduledRunTime;
-                nextScheduledRunTime = now + delay;
-
-                if (oldScheduledRunTime != -1)
-                {
-                    // Avoid rescheduling if within one minute
-                    if (difference(oldScheduledRunTime, nextScheduledRunTime) < 60000)
-                    {
-                        return;
-                    }
-
-                    if (delay < DistributedLock.getLockTime())
-                        delay = DistributedLock.getLockTime();
-                }
-
-                logger.info("Next scheduled job at '{}'", new DateTime(now + delay));
-
-                ScheduledFuture<?> oldFuture = runFuture;
-                runFuture = ScheduledExecutors.scheduledLongTasks.schedule(runTask, delay,
-                        TimeUnit.MILLISECONDS);
-
-                if (oldFuture != null && !oldFuture.isDone())
-                    oldFuture.cancel(false);
-            }
-        }
-
-        private long difference(long l1, long l2)
-        {
-            if (l1 < l2)
-                return l2 - l1;
-            else
-                return l1 - l2;
-        }
-
-        private long delayToNextJob()
-        {
-            ScheduledJob nextJob = scheduledJobs.peek();
-
-            if (nextJob != null && nextJob.isEnabled())
-                return nextJob.timeToNextRun();
-
-            return -1;
+            jobRunner.maybeReschedule();
         }
     }
 
@@ -315,7 +142,7 @@ public class ScheduleManager
 
             for (IScheduler scheduler : schedulers)
             {
-                scheduledJobs.addAll(scheduler.createNewJobs());
+                scheduledJobs.addAll(scheduler.createNewJobs(), ScheduleManager::compareJob);
             }
         }
     }
@@ -324,5 +151,28 @@ public class ScheduleManager
     public static ScheduleManager getManagerForTest()
     {
         return new ScheduleManager();
+    }
+
+    public static int compareJob(ScheduledJob j1, ScheduledJob j2)
+    {
+        if (!j1.isEnabled())
+            return 1;
+        if (!j2.isEnabled())
+            return -1;
+
+        if (!j1.couldRunNow())
+            return 1;
+        if (!j2.couldRunNow())
+            return -1;
+
+        int o1Prio = j1.getPriority();
+        int o2Prio = j2.getPriority();
+
+        if (o2Prio > o1Prio)
+            return 1;
+        else if (o1Prio > o2Prio)
+            return -1;
+        else
+            return j1.toString().compareTo(j2.toString());
     }
 }

@@ -17,12 +17,14 @@
  */
 package org.apache.cassandra.scheduling;
 
+import org.apache.cassandra.exceptions.ScheduledExecutionException;
+
 /**
  * A scheduled task that gets executed by a {@link ScheduledJob}.
  */
 public abstract class ScheduledTask
 {
-    private long lastRunTime;
+    private volatile long lastRunTime;
 
     public ScheduledTask()
     {
@@ -52,5 +54,14 @@ public abstract class ScheduledTask
      *
      * @return True on success.
      */
-    public abstract boolean execute();
+    public abstract void execute() throws ScheduledExecutionException;
+
+    public abstract String toString();
+
+    public static enum TaskStatus
+    {
+        STARTED,
+        COMPLETED,
+        FAILED
+    }
 }

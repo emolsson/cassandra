@@ -20,20 +20,16 @@ package org.apache.cassandra.scheduling;
 import java.net.InetAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.repair.SystemDistributedKeyspace;
-import org.apache.cassandra.repair.SystemDistributedKeyspace.RepairState;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.scheduling.JobConfiguration.BasePriority;
+import org.apache.cassandra.scheduling.ScheduledRepairJob.RepairHistory;
 import org.apache.cassandra.schema.RepairSchedulingParams;
 import org.apache.cassandra.service.*;
 import org.slf4j.Logger;
@@ -46,7 +42,7 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
 {
     private static final Logger logger = LoggerFactory.getLogger(RepairScheduler.class);
 
-    private final ConcurrentMap<InetAddress, Long> endpointMap = new ConcurrentHashMap<>();
+    private final Map<InetAddress, Long> downEndpoints = new ConcurrentHashMap<>();
 
     private final Set<String> scheduledTables = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
@@ -69,9 +65,7 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         {
             CFMetaData cfMetaData = it.next();
 
-            Collection<Range<Token>> ranges = StorageService.instance.getPrimaryRanges(cfMetaData.ksName);
-
-            ScheduledJob job = maybeGetTableJob(cfMetaData, ranges);
+            ScheduledJob job = maybeGetTableJob(cfMetaData);
             if (job != null)
             {
                 ret.add(job);
@@ -82,7 +76,7 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         return ret;
     }
 
-    private ScheduledJob maybeGetTableJob(CFMetaData cfMetaData, Collection<Range<Token>> ranges)
+    private ScheduledJob maybeGetTableJob(CFMetaData cfMetaData)
     {
         String keyspace = cfMetaData.ksName;
         String table = cfMetaData.cfName;
@@ -92,11 +86,15 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         {
             try
             {
+                Collection<Range<Token>> ranges = StorageService.instance.getPrimaryRanges(cfMetaData.ksName);
+                RepairHistory repairHistory = ScheduledRepairJob.getRepairHistory(keyspace, table, ranges);
+
                 return new ScheduledRepairJob.Builder()
                         .withKeyspace(keyspace)
                         .withTable(table)
-                        .withTasks(createRepairTasks(cfMetaData, ranges))
+                        .withTasks(createRepairTasks(cfMetaData, ranges, repairHistory))
                         .withRepairParams(cfMetaData.params.repairScheduling)
+                        .withLastRepairId(repairHistory.getLatestRepairId())
                         .build();
             }
             catch (ConfigurationException e)
@@ -109,15 +107,19 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
         return null;
     }
 
-    private Collection<ScheduledRepairTask> createRepairTasks(CFMetaData cfMetaData, Collection<Range<Token>> ranges)
+    private Collection<ScheduledRepairTask> createRepairTasksForEndpoint(CFMetaData cfMetaData, InetAddress endpoint)
+    {
+        return createRepairTasks(cfMetaData, StorageService.instance.getPrimaryRangesForEndpoint(cfMetaData.ksName, endpoint), null);
+    }
+
+    private Collection<ScheduledRepairTask> createRepairTasks(CFMetaData cfMetaData, Collection<Range<Token>> ranges,
+            RepairHistory repairHistory)
     {
         final String keyspace = cfMetaData.ksName;
         final String table = cfMetaData.cfName;
         final RepairSchedulingParams params = cfMetaData.params.repairScheduling;
 
         Collection<ScheduledRepairTask> tasks = new ArrayList<>();
-
-        Map<Range<Token>, Long> lastRepairedAt = getLastRepairedForRanges(keyspace, table, ranges);
 
         for (Range<Token> range : ranges)
         {
@@ -127,8 +129,10 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
                     .withRange(range)
                     .withParams(params);
 
-            if (lastRepairedAt.containsKey(range))
-                builder.withLastRepairedAt(lastRepairedAt.get(range));
+            Long repaired = repairHistory == null ? null : repairHistory.get(range);
+
+            if (repaired != null)
+                builder.withLastRepairedAt(repaired);
 
             tasks.add(builder.build());
         }
@@ -187,12 +191,12 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
     @Override
     public void onUp(InetAddress endpoint)
     {
-        Long downSince = endpointMap.remove(endpoint);
+        Long downSince = downEndpoints.remove(endpoint);
 
         if (downSince != null)
         {
-            List<ScheduledJob> jobs = new ArrayList<>();
             long downTime = System.currentTimeMillis() - downSince;
+
             JobConfiguration configuration = new JobConfiguration.Builder()
                     .withMinimumDelay(3600)
                     .withPriority(BasePriority.HIGHEST)
@@ -200,31 +204,22 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
                     .withRunOnce(true)
                     .build();
 
+            List<ScheduledJob> jobs = new ArrayList<>();
             ScheduleableTableIterator it = new ScheduleableTableIterator();
-
-            long maxHintWindow = DatabaseDescriptor.getMaxHintWindow();
 
             while (it.hasNext())
             {
                 CFMetaData cfMetaData = it.next();
 
-                Collection<Range<Token>> ranges = StorageService.instance.getPrimaryRangesForEndpoint(
-                        cfMetaData.ksName, endpoint);
-
-                long cfGcGraceSeconds = cfMetaData.params.gcGraceSeconds * 1000;
-
-                long minDownTime = cfGcGraceSeconds < maxHintWindow ? cfGcGraceSeconds : maxHintWindow;
-
-                if (downTime >= minDownTime)
+                if (downTime >= ScheduledRepairJob.getActualHintWindow(cfMetaData))
                 {
                     String keyspace = cfMetaData.ksName;
                     String table = cfMetaData.cfName;
 
-
                     ScheduledRepairJob.Builder builder = new ScheduledRepairJob.Builder()
                             .withKeyspace(keyspace)
                             .withTable(table)
-                            .withTasks(createRepairTasks(cfMetaData, ranges))
+                            .withTasks(createRepairTasksForEndpoint(cfMetaData, endpoint))
                             .withRepairParams(cfMetaData.params.repairScheduling)
                             .withConfiguration(configuration);
 
@@ -234,7 +229,9 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
 
             if (!jobs.isEmpty())
             {
-                ScheduleManager.instance.schedule(RemoteScheduledJob.createJob(endpoint, jobs));
+                String uniqueId = "Repair-" + Integer.toString(Gossiper.instance.getCurrentGenerationNumber(endpoint));
+
+                ScheduleManager.instance.schedule(RemoteScheduledJob.createJob(endpoint, uniqueId, jobs));
                 ScheduleManager.instance.forceUpdate();
             }
         }
@@ -243,7 +240,7 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
     @Override
     public void onDown(InetAddress endpoint)
     {
-        endpointMap.put(endpoint, System.currentTimeMillis());
+        downEndpoints.put(endpoint, System.currentTimeMillis());
     }
 
     @Override
@@ -316,58 +313,5 @@ public class RepairScheduler extends MigrationListener implements IScheduler, IE
             return next;
         }
 
-    }
-
-    private static Map<Range<Token>, Long> getLastRepairedForRanges(String keyspace, String table,
-            Collection<Range<Token>> ranges)
-    {
-        Map<Range<Token>, Long> lastRepairedAt = new HashMap<>();
-        IPartitioner partitioner = StorageService.instance.getTokenMetadata().partitioner;
-
-        try
-        {
-            UntypedResultSet repairHistory = SystemDistributedKeyspace.getRepairJobs(keyspace, table);
-
-            Iterator<UntypedResultSet.Row> it = repairHistory.iterator();
-
-            while (it.hasNext() && lastRepairedAt.size() < ranges.size())
-            {
-                UntypedResultSet.Row row = it.next();
-
-                String status = row.getString("status");
-
-                if (!RepairState.SUCCESS.toString().equals(status))
-                {
-                    continue;
-                }
-
-                String range_begin = row.getString("range_begin");
-                String range_end = row.getString("range_end");
-
-                assert range_begin != null && range_end != null;
-
-                Token start = partitioner.getTokenFactory().fromString(range_begin);
-                Token end = partitioner.getTokenFactory().fromString(range_end);
-
-                Range<Token> range = new Range<Token>(start, end);
-
-                if (lastRepairedAt.containsKey(range) || !ranges.contains(range))
-                {
-                    continue;
-                }
-
-                if (row.has("finished_at"))
-                {
-                    Date finished_at = row.getTimestamp("finished_at");
-                    lastRepairedAt.put(range, finished_at.getTime());
-                }
-            }
-        }
-        catch (Throwable t)
-        {
-            logger.error("Unable to get repair history for table {}.{}: {}", keyspace, table, t);
-        }
-
-        return lastRepairedAt;
     }
 }

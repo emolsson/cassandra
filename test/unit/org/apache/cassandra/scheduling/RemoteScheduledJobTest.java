@@ -117,11 +117,11 @@ public class RemoteScheduledJobTest
 
         InetAddress remote = InetAddress.getByName("127.0.0.1");
 
-        ScheduledJob remoteJob = RemoteScheduledJob.createJob(remote, Arrays.asList(job));
+        ScheduledJob remoteJob = RemoteScheduledJob.createJob(remote, "id", Arrays.asList(job));
 
         for (ScheduledTask task : remoteJob.getTasks())
         {
-            assertTrue(task.execute());
+            task.execute();
         }
 
         if (!lock.isSignaled())

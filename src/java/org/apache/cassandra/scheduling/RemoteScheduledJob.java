@@ -20,9 +20,13 @@ package org.apache.cassandra.scheduling;
 import java.net.InetAddress;
 import java.util.*;
 
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.UntypedResultSet.Row;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.repair.SystemDistributedKeyspace;
+import org.apache.cassandra.repair.SystemDistributedKeyspace.JobState;
 import org.apache.cassandra.scheduling.DistributedLock.Lock;
 import org.apache.cassandra.scheduling.DistributedLock.LockException;
 import org.apache.cassandra.scheduling.JobConfiguration.BasePriority;
@@ -34,7 +38,7 @@ import org.apache.cassandra.scheduling.JobConfiguration.BasePriority;
  */
 public class RemoteScheduledJob extends ScheduledJob
 {
-    public static RemoteScheduledJob createJob(InetAddress endpoint, List<ScheduledJob> jobs)
+    public static RemoteScheduledJob createJob(InetAddress endpoint, String uniqueId, List<ScheduledJob> jobs)
     {
         Collection<RemoteScheduledTask> tasks = new ArrayList<>();
 
@@ -47,13 +51,14 @@ public class RemoteScheduledJob extends ScheduledJob
                 .withRunOnce(true)
                 .build();
 
-        return new RemoteScheduledJob(configuration, tasks, endpoint, jobs);
+        return new RemoteScheduledJob(configuration, tasks, uniqueId, endpoint);
     }
 
     private Collection<RemoteScheduledTask> tasks;
 
     private InetAddress endpoint;
-    private final List<ScheduledJob> jobs;
+
+    private final String uniqueId;
 
     /**
      * Create a new remote scheduled job based on the parameters provided.
@@ -62,20 +67,20 @@ public class RemoteScheduledJob extends ScheduledJob
      *            The job configuration for this job.
      * @param tasks
      *            The tasks to run.
+     * @param uniqueId
+     *            The unique id for the job, to reduce the number of nodes running this job.
      * @param endpoint
      *            The endpoint to send the scheduled jobs.
-     * @param jobs
-     *            The list of scheduled jobs for the remote host.
      */
     private RemoteScheduledJob(JobConfiguration configuration,
             Collection<RemoteScheduledTask> tasks,
-            InetAddress endpoint,
-            List<ScheduledJob> jobs)
+            String uniqueId,
+            InetAddress endpoint)
     {
         super(configuration);
 
+        this.uniqueId = uniqueId;
         this.endpoint = endpoint;
-        this.jobs = new ArrayList<>(jobs);
         this.tasks = new ArrayList<>(tasks);
     }
 
@@ -88,19 +93,58 @@ public class RemoteScheduledJob extends ScheduledJob
     @Override
     public boolean update()
     {
+        UntypedResultSet res = SystemDistributedKeyspace.getScheduledJob(toString(), endpoint);
+
+        Iterator<Row> it = res.iterator();
+
+        while (it.hasNext())
+        {
+            Row row = it.next();
+
+            String taskName = row.getString("task_name");
+            String status = row.getString("status");
+
+            if (taskName != null && JobState.SUCCESS.equals(status))
+            {
+                tryRemoveTask(taskName);
+
+                if (tasks.isEmpty())
+                {
+                    break;
+                }
+            }
+        }
+
+        if (tasks.isEmpty())
+        {
+            return false;
+        }
+
         return true;
+    }
+
+    @Override
+    public InetAddress getNode()
+    {
+        return endpoint;
     }
 
     @Override
     public String toString()
     {
-        return String.format("Scheduled remote job(s) for %s (%s)", endpoint, jobs);
+        return String.format("Remote %s-%s", endpoint, uniqueId);
     }
 
     @Override
     public Lock getLock() throws LockException
     {
         return DistributedLock.instance.tryGetLock(ScheduleManager.SCHEDULE_LOCK + "_remote", getPriority());
+    }
+
+    @Override
+    public IVersionedSerializer<ScheduledJob> getSerializer()
+    {
+        throw new UnsupportedOperationException("RemoteScheduledJob shouldn't be serialized");
     }
 
     private static class RemoteScheduledTask extends ScheduledTask
@@ -116,19 +160,34 @@ public class RemoteScheduledJob extends ScheduledJob
         }
 
         @Override
-        public boolean execute()
+        public void execute()
         {
             MessagingService.instance()
                     .sendOneWay(new MessageOut<>(MessagingService.Verb.SCHEDULED_JOB, job, ScheduledJob.serializer),
                             endpoint);
-            return true;
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("RemoteScheduledTask-%s", job);
         }
 
     }
 
-    @Override
-    public IVersionedSerializer<ScheduledJob> getSerializer()
+    private void tryRemoveTask(String taskName)
     {
-        throw new UnsupportedOperationException("RemoteScheduledJob shouldn't be serialized");
+        Iterator<RemoteScheduledTask> it = tasks.iterator();
+
+        while (it.hasNext())
+        {
+            RemoteScheduledTask task = it.next();
+
+            if (taskName.equals(task.toString()))
+            {
+                it.remove();
+                break;
+            }
+        }
     }
 }

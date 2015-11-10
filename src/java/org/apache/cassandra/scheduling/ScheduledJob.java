@@ -19,15 +19,21 @@ package org.apache.cassandra.scheduling;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.InetAddress;
 import java.util.Collection;
+import java.util.OptionalLong;
+import java.util.UUID;
 
 import org.apache.cassandra.cache.CachedValue;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.repair.SystemDistributedKeyspace;
 import org.apache.cassandra.scheduling.DistributedLock.Lock;
 import org.apache.cassandra.scheduling.DistributedLock.LockException;
+import org.apache.cassandra.utils.UUIDGen;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,6 +59,8 @@ public abstract class ScheduledJob
     private final CachedValue<Long> cachedRunTime = new CachedValue<>();
 
     private JobConfiguration configuration;
+
+    private UUID currentId;
 
     protected ScheduledJob(JobConfiguration configuration)
     {
@@ -96,13 +104,6 @@ public abstract class ScheduledJob
     }
 
     /**
-     * Update the job to get new configuration, etc.
-     *
-     * @return False if the job should be removed.
-     */
-    public abstract boolean update();
-
-    /**
      * Execute all tasks that this scheduled job contains.
      *
      * @return True on success.
@@ -111,26 +112,11 @@ public abstract class ScheduledJob
     {
         cachedRunTime.invalidate();
 
-        getTasks().forEach(this::execute);
+        currentId = UUIDGen.getTimeUUID();
+
+        getTasks().forEach(this::maybeExecute);
 
         return true;
-    }
-
-    private final void execute(ScheduledTask task)
-    {
-        try
-        {
-            if (task.getLastRunTime() + configuration.getMinimumDelay() < System.currentTimeMillis())
-            {
-                task.execute();
-                task.setLastRunTime(System.currentTimeMillis());
-            }
-        }
-        catch (Exception e)
-        {
-            logger.warn("Unable to run task", e);
-            // TODO: Handle re-running of tasks later
-        }
     }
 
     /**
@@ -152,9 +138,11 @@ public abstract class ScheduledJob
     /**
      * Calculates if this job could run now.
      *
+     * Subclasses can override this method to allow/disallow the job to run.
+     *
      * @return True if the job can run now.
      */
-    public final boolean couldRunNow()
+    public boolean couldRunNow()
     {
         return (getLastRunTime() + configuration.getMinimumDelay()) < System.currentTimeMillis();
     }
@@ -197,7 +185,7 @@ public abstract class ScheduledJob
         int hours = (int) (diff / (60 * 60 * 1000));
 
         // Using hours + 1 so that base priority works even if no time has passed
-        return (hours + 1) * configuration.getBasePriority();
+        return (hours + 1) * configuration.getPriority();
     }
 
     public int overridePriority()
@@ -205,31 +193,51 @@ public abstract class ScheduledJob
         return -1;
     }
 
+    /**
+     * Get the scheduling lock for this job.
+     *
+     * @return
+     * @throws LockException
+     */
     public Lock getLock() throws LockException
     {
         return DistributedLock.instance.tryGetLock(ScheduleManager.SCHEDULE_LOCK, getPriority());
     }
 
-    private long getLastRunTime()
+    /**
+     * Get the last time *all* tasks was run for this job.
+     * 
+     * @return the last time this job was fully run.
+     */
+    public long getLastRunTime()
     {
         Long cached = cachedRunTime.getValue();
         if (cached != null)
             return cached;
 
-        long ret = -1;
+        OptionalLong min = getTasks().stream().mapToLong(t -> t.getLastRunTime()).min();
 
-        for (ScheduledTask task : getTasks())
-        {
-            if (ret == -1 || task.getLastRunTime() < ret)
-            {
-                ret = task.getLastRunTime();
-            }
-        }
+        long ret = min.orElse(-1);
 
         cachedRunTime.set(ret);
 
         return ret;
     }
+
+    /**
+     * @return the node this job was run for.
+     */
+    public InetAddress getNode()
+    {
+        return DatabaseDescriptor.getBroadcastAddress();
+    }
+
+    /**
+     * Update the job to get new configuration, etc.
+     *
+     * @return False if the job should be removed.
+     */
+    public abstract boolean update();
 
     public abstract String toString();
 
@@ -283,5 +291,37 @@ public abstract class ScheduledJob
             return size;
         }
 
+    }
+
+    private final void maybeExecute(ScheduledTask task)
+    {
+        if (task.getLastRunTime() + configuration.getMinimumDelay() < System.currentTimeMillis())
+        {
+            SystemDistributedKeyspace.startScheduledTask(toString(), getNode(), currentId, task.toString());
+
+            executeWithRetries(task);
+        }
+    }
+
+    private void executeWithRetries(ScheduledTask task)
+    {
+        final int max_retries = 5;
+
+        for (int i = 0; i < max_retries; i++)
+        {
+            try
+            {
+                task.execute();
+                task.setLastRunTime(System.currentTimeMillis());
+
+                SystemDistributedKeyspace.successfulScheduledTask(toString(), getNode(), currentId, task.toString());
+                break;
+            }
+            catch (Exception e)
+            {
+                logger.warn("Unable to run task", e);
+                SystemDistributedKeyspace.failScheduledTask(toString(), getNode(), currentId, task.toString(), e);
+            }
+        }
     }
 }

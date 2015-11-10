@@ -21,11 +21,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.Sets;
@@ -57,6 +53,8 @@ public final class SystemDistributedKeyspace
     public static final String REPAIR_HISTORY = "repair_history";
 
     public static final String PARENT_REPAIR_HISTORY = "parent_repair_history";
+
+    public static final String SCHEDULED_JOB_HISTORY = "scheduled_job_history";
 
     private static final CFMetaData RepairHistory =
         compile(REPAIR_HISTORY,
@@ -92,6 +90,21 @@ public final class SystemDistributedKeyspace
                      + "successful_ranges set<text>,"
                      + "PRIMARY KEY (parent_id))");
 
+    private static final CFMetaData ScheduledJobHistory =
+            compile(SCHEDULED_JOB_HISTORY,
+                    "Scheduled job history",
+                    "CREATE TABLE %s ("
+                    + "job_name text,"
+                    + "node inet,"
+                    + "job_id timeuuid,"
+                    + "task_name text,"
+                    + "status text,"
+                    + "exception_message text,"
+                    + "exception_stacktrace text,"
+                    + "started_at timestamp,"
+                    + "finished_at timestamp,"
+                    + "PRIMARY KEY((job_name, node), job_id, task_name))");
+
     private static CFMetaData compile(String name, String description, String schema)
     {
         return CFMetaData.compile(String.format(schema, name), NAME)
@@ -100,7 +113,7 @@ public final class SystemDistributedKeyspace
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(NAME, KeyspaceParams.simple(3), Tables.of(RepairHistory, ParentRepairHistory));
+        return KeyspaceMetadata.create(NAME, KeyspaceParams.simple(3), Tables.of(RepairHistory, ParentRepairHistory, ScheduledJobHistory));
     }
 
     public static void startParentRepair(UUID parent_id, String keyspaceName, String[] cfnames, Collection<Range<Token>> ranges)
@@ -155,7 +168,7 @@ public final class SystemDistributedKeyspace
                                               range.right.toString(),
                                               coordinator,
                                               Joiner.on("', '").join(participants),
-                                              RepairState.STARTED.toString());
+                                              JobState.STARTED.toString());
                 processSilent(fmtQry);
             }
         }
@@ -171,7 +184,7 @@ public final class SystemDistributedKeyspace
     {
         String query = "UPDATE %s.%s SET status = '%s', finished_at = toTimestamp(now()) WHERE keyspace_name = '%s' AND columnfamily_name = '%s' AND id = %s";
         String fmtQuery = String.format(query, NAME, REPAIR_HISTORY,
-                                        RepairState.SUCCESS.toString(),
+                                        JobState.SUCCESS.toString(),
                                         keyspaceName,
                                         cfname,
                                         id.toString());
@@ -185,7 +198,7 @@ public final class SystemDistributedKeyspace
         PrintWriter pw = new PrintWriter(sw);
         t.printStackTrace(pw);
         String fmtQry = String.format(query, NAME, REPAIR_HISTORY,
-                RepairState.FAILED.toString(),
+                JobState.FAILED.toString(),
                 keyspaceName,
                 cfname,
                 id.toString());
@@ -201,6 +214,60 @@ public final class SystemDistributedKeyspace
                 cfname);
 
         return QueryProcessor.process(fmtQry, ConsistencyLevel.ONE);
+    }
+
+    public static UntypedResultSet getScheduledJob(String job, InetAddress node)
+    {
+        String query = "SELECT * FROM %s.%s WHERE job_name=%s AND node=%s";
+
+        String fmtQry = String.format(query, NAME, SCHEDULED_JOB_HISTORY,
+                job,
+                node);
+
+        return QueryProcessor.process(fmtQry, ConsistencyLevel.ONE);
+    }
+
+    public static void startScheduledTask(String job, InetAddress node, UUID id, String task)
+    {
+        String query = "INSERT INTO %s.%s (job_name, job_id, task_name, status, started_at) "
+                            + "VALUES    ( '%s',     %s,     '%s',      '%s',   toTimestamp(now()))";
+
+        String fmtQry = String.format(query, NAME, SCHEDULED_JOB_HISTORY,
+                job,
+                id,
+                task,
+                "STARTED");
+
+        processSilent(fmtQry);
+
+    }
+
+    public static void failScheduledTask(String job, InetAddress node, UUID id, String task, Throwable ex)
+    {
+        String query = "UPDATE %s.%s SET status = '%s', finished_at = toTimestamp(now()), exception_message=?, exception_stacktrace=? WHERE job_name = '%s' AND job_id = %s AND task_name = '%s'";
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        ex.printStackTrace(pw);
+        String fmtQry = String.format(query, NAME, SCHEDULED_JOB_HISTORY,
+                "FAILED",
+                job,
+                id,
+                task);
+
+        processSilent(fmtQry, ex.getMessage(), sw.toString());
+    }
+
+    public static void successfulScheduledTask(String job, InetAddress node, UUID id, String task)
+    {
+        String query = "UPDATE %s.%s SET status = '%s', finished_at = toTimestamp(now()) WHERE job_name = '%s' AND job_id = %s AND task_name = '%s'";
+
+        String fmtQry = String.format(query, NAME, SCHEDULED_JOB_HISTORY,
+                "COMPLETED",
+                job,
+                id,
+                task);
+
+        processSilent(fmtQry);
     }
 
     private static void processSilent(String fmtQry, String... values)
@@ -220,8 +287,7 @@ public final class SystemDistributedKeyspace
         }
     }
 
-
-    public static enum RepairState
+    public static enum JobState
     {
         STARTED, SUCCESS, FAILED
     }

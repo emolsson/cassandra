@@ -114,12 +114,17 @@ public class JobConfiguration
         return minimumDelay * 1000;
     }
 
+    public BasePriority getBasePriority()
+    {
+        return basePriority;
+    }
+
     /**
      * Get the base priority for the job.
      *
      * @return
      */
-    public int getBasePriority()
+    public int getPriority()
     {
         return basePriority.getPriority();
     }

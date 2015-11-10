@@ -17,11 +17,11 @@
  */
 package org.apache.cassandra.scheduling;
 
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.LinkedList;
-import java.util.List;
+import java.util.*;
+import java.util.function.Predicate;
+
+import org.apache.cassandra.scheduling.JobConfiguration.BasePriority;
+import org.apache.cassandra.utils.AbstractIterator;
 
 /**
  * A queue for scheduled jobs that finds the job with highest priority when {@link ScheduledJobQueue#peek() peek()} is
@@ -35,14 +35,16 @@ import java.util.List;
  */
 class ScheduledJobQueue
 {
-    private final List<ScheduledJob> myJobs = new LinkedList<>();
-
-    private final ScheduledJobComparator myJobComparator = new ScheduledJobComparator();
+    private final Map<BasePriority, List<ScheduledJob>> jobQueues = new HashMap<>();
 
     private final Object lock = new Object();
 
     ScheduledJobQueue()
     {
+        for (BasePriority basePriority : BasePriority.values())
+        {
+            jobQueues.put(basePriority, new LinkedList<ScheduledJob>());
+        }
     }
 
     /**
@@ -51,11 +53,12 @@ class ScheduledJobQueue
      * @param job
      *            The job to add.
      */
-    public void add(ScheduledJob job)
+    public void add(ScheduledJob job, Comparator<ScheduledJob> comparator)
     {
         synchronized (lock)
         {
             replaceOrAddJob(job);
+            Collections.sort(jobQueues.get(job.getConfiguration().getBasePriority()), comparator);
         }
     }
 
@@ -65,11 +68,16 @@ class ScheduledJobQueue
      * @param jobs
      *            The jobs to add.
      */
-    public void addAll(Collection<? extends ScheduledJob> jobs)
+    public void addAll(Collection<? extends ScheduledJob> jobs, Comparator<ScheduledJob> comparator)
     {
+        if (jobs.isEmpty())
+            return;
+
         synchronized (lock)
         {
             jobs.forEach(job -> replaceOrAddJob(job));
+
+            jobQueues.values().forEach(list -> Collections.sort(list, comparator));
         }
     }
 
@@ -80,24 +88,56 @@ class ScheduledJobQueue
     {
         synchronized (lock)
         {
-            myJobs.removeIf(p -> !p.update());
+            jobQueues.values().forEach(list -> list.removeIf(j -> !j.update()));
+        }
+    }
+
+    public void reQueue(ScheduledJob job)
+    {
+        synchronized (lock)
+        {
+            jobQueues.values().forEach(list -> list.remove(job));
+
+            jobQueues.get(job.getConfiguration().getBasePriority()).add(job);
         }
     }
 
     /**
      * Get the highest prioritized job in the queue without removing it.
      *
+     * @param comparator
+     *            The comparator to use when sorting the scheduled jobs.
      * @return The highest prioritized job or null if no job is in the queue.
      */
-    public ScheduledJob peek()
+    public ScheduledJob peek(Comparator<ScheduledJob> comparator, Predicate<ScheduledJob> validator)
     {
         synchronized (lock)
         {
-            if (!myJobs.isEmpty())
+            if (!jobQueues.isEmpty())
             {
-                Collections.sort(myJobs, myJobComparator);
+                Iterator<ScheduledJob> it = new JobMergeIterator(comparator);
 
-                return myJobs.get(0);
+                ScheduledJob first = null;
+
+                while (it.hasNext())
+                {
+                    ScheduledJob job = it.next();
+
+                    if (!job.update())
+                    {
+                        it.remove();
+                    }
+                    else if (validator.test(job) && job.isEnabled() && job.couldRunNow())
+                    {
+                        return job;
+                    }
+                    else if (first == null)
+                    {
+                        first = job;
+                    }
+                }
+
+                return first;
             }
         }
 
@@ -115,7 +155,7 @@ class ScheduledJobQueue
 
         synchronized (lock)
         {
-            myJobs.remove(job);
+            jobQueues.values().forEach(list -> list.remove(job));
         }
     }
 
@@ -129,33 +169,77 @@ class ScheduledJobQueue
     {
         assert newJob != null;
 
-        myJobs.remove(newJob);
+        jobQueues.values().forEach(list -> list.remove(newJob));
 
-        myJobs.add(newJob);
+        jobQueues.get(newJob.getConfiguration().getBasePriority()).add(newJob);
     }
 
-    /**
-     * Comparator that sorts jobs based on their priority.
-     */
-    private class ScheduledJobComparator implements Comparator<ScheduledJob>
+    private class JobMergeIterator extends AbstractIterator<ScheduledJob>
     {
-        @Override
-        public int compare(ScheduledJob o1, ScheduledJob o2)
+        private final List<Iterator<ScheduledJob>> iterators;
+
+        private final List<ScheduledJob> jobs;
+
+        private final Comparator<ScheduledJob> comparator;
+
+        private Iterator<ScheduledJob> lastIterator;
+
+        private JobMergeIterator(Comparator<ScheduledJob> comp)
         {
-            if (!o1.couldRunNow())
-                return 1;
-            if (!o2.couldRunNow())
-                return -1;
+            iterators = new ArrayList<>();
+            jobs = new ArrayList<>();
 
-            int o1Prio = o1.getPriority();
-            int o2Prio = o2.getPriority();
+            for (List<ScheduledJob> jobList : jobQueues.values())
+            {
+                iterators.add(jobList.iterator());
+                jobs.add(null);
+            }
 
-            if (o2Prio > o1Prio)
-                return 1;
-            else if (o1Prio > o2Prio)
-                return -1;
-            else
-                return o1.toString().compareTo(o2.toString());
+            comparator = comp;
         }
+
+        @Override
+        protected ScheduledJob computeNext()
+        {
+            for (int i = 0; i < jobs.size(); i++)
+            {
+                if (jobs.get(i) == null)
+                {
+                    if (iterators.get(i).hasNext())
+                    {
+                        jobs.set(i, iterators.get(i).next());
+                    }
+                }
+            }
+
+            return collectNext();
+        }
+
+        private ScheduledJob collectNext()
+        {
+            ScheduledJob maxJob = null;
+
+            for (int i = 0; i < jobs.size(); i++)
+            {
+                ScheduledJob job = jobs.get(i);
+                if (maxJob == null || (job != null && comparator.compare(job, maxJob) < 0))
+                {
+                    maxJob = job;
+                    lastIterator = iterators.get(i);
+                }
+            }
+
+            return maxJob != null ? maxJob : endOfData();
+        }
+
+        public void remove()
+        {
+            if (lastIterator != null)
+            {
+                lastIterator.remove();
+                lastIterator = null;
+            }
+        }
+
     }
 }
