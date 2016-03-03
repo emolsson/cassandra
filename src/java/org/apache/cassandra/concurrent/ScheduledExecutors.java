@@ -42,6 +42,11 @@ public class ScheduledExecutors
     }
 
     /**
+     * This pool is used for the distributed scheduler tasks.
+     */
+    public static final DebuggableScheduledThreadPoolExecutor distributedScheduledTasks = new DebuggableScheduledThreadPoolExecutor("DistributedScheduledTasks");
+
+    /**
      * This executor is used for tasks that do not need to be waited for on shutdown/drain.
      */
     public static final DebuggableScheduledThreadPoolExecutor optionalTasks = new DebuggableScheduledThreadPoolExecutor("OptionalTasks");
