@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.scheduling;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -27,9 +26,10 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.StreamSupport;
 
-import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.CFMetaData;
@@ -44,8 +44,6 @@ import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.Tables;
 import org.apache.cassandra.service.StorageService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * A distributed lock factory using CAS to acquire and maintain locks.
@@ -58,13 +56,13 @@ public class CasLockFactory implements IDistributedLockFactory
 
     private static final int LOCK_TIME = 30;
 
-    public static final String NAME = "system_lock";
+    public static final String KEYSPACE_NAME = "system_locks";
 
     public static final String RESOURCE_LOCK = "resource_lock";
 
     public static final String LOCK_PRIORITY = "resource_lock_priority";
 
-    protected static final CFMetaData Lock =
+    protected static final CFMetaData lock =
             compile(RESOURCE_LOCK,
                     "Resource lock",
                     "CREATE TABLE %s ("
@@ -73,9 +71,9 @@ public class CasLockFactory implements IDistributedLockFactory
                             + "metadata map<text,text>,"
                             + "PRIMARY KEY (resource))");
 
-    protected static final CFMetaData LockPriority =
+    protected static final CFMetaData lockFactory =
             compile(LOCK_PRIORITY,
-                    "Lock priority",
+                    "lock priority",
                     "CREATE TABLE %s ("
                             + "resource text,"
                             + "host uuid,"
@@ -84,12 +82,12 @@ public class CasLockFactory implements IDistributedLockFactory
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(NAME, KeyspaceParams.simple(3), Tables.of(Lock, LockPriority));
+        return KeyspaceMetadata.create(KEYSPACE_NAME, KeyspaceParams.simple(3), Tables.of(lock, lockFactory));
     }
 
     private static CFMetaData compile(String name, String description, String schema)
     {
-        return CFMetaData.compile(String.format(schema, name), NAME).defaultTimeToLive(LOCK_TIME).gcGraceSeconds(0).comment(description);
+        return CFMetaData.compile(String.format(schema, name), KEYSPACE_NAME).defaultTimeToLive(LOCK_TIME).gcGraceSeconds(0).comment(description);
     }
 
     private CasLockFactory()
@@ -119,7 +117,7 @@ public class CasLockFactory implements IDistributedLockFactory
                     logger.trace("Lock for resource {} acquired", resource);
                     ScheduledFuture<?> future = ScheduledExecutors.distributedScheduledTasks.scheduleWithFixedDelay(new LockUpdateTask(resource, serializedMetadata), 0, LOCK_TIME / 2, TimeUnit.SECONDS);
 
-                    return new CASResourceLock(future);
+                    return new CASResourceLock(future, resource);
                 }
             }
         }
@@ -142,9 +140,9 @@ public class CasLockFactory implements IDistributedLockFactory
     private boolean sufficientNodesForLocking(String resource)
     {
         ByteBuffer resourceKey = UTF8Type.instance.fromString(resource);
-        List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(NAME, resourceKey);
+        List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(KEYSPACE_NAME, resourceKey);
 
-        return ConsistencyLevel.QUORUM.isSufficientLiveNodes(Keyspace.open(NAME), Iterables.filter(naturalEndpoints, isAlive));
+        return ConsistencyLevel.QUORUM.isSufficientLiveNodes(Keyspace.open(KEYSPACE_NAME), Iterables.filter(naturalEndpoints, FailureDetector.instance::isAlive));
     }
 
     /**
@@ -177,10 +175,10 @@ public class CasLockFactory implements IDistributedLockFactory
     private void insertPriority(String resource, int priority)
     {
         String query = "INSERT INTO %s.%s (resource, host, priority) VALUES ('%s',%s,%d)";
-        String fmtQuery = String.format(query, NAME, LOCK_PRIORITY,
-                resource,
-                StorageService.instance.getLocalHostUUID(),
-                priority);
+        String fmtQuery = String.format(query, KEYSPACE_NAME, LOCK_PRIORITY,
+                                        resource,
+                                        StorageService.instance.getLocalHostUUID(),
+                                        priority);
 
         processSilent(fmtQuery);
     }
@@ -195,8 +193,8 @@ public class CasLockFactory implements IDistributedLockFactory
     private int getHighestPriorityForResource(String resource)
     {
         String query = "SELECT priority FROM %s.%s WHERE resource='%s'";
-        String fmtQuery = String.format(query, NAME, LOCK_PRIORITY,
-                resource);
+        String fmtQuery = String.format(query, KEYSPACE_NAME, LOCK_PRIORITY,
+                                        resource);
 
         UntypedResultSet res = processSilent(fmtQuery);
 
@@ -223,16 +221,13 @@ public class CasLockFactory implements IDistributedLockFactory
     private boolean lock(String resource, ByteBuffer metadata)
     {
         String query = "INSERT INTO %s.%s (resource, host, metadata) VALUES ('%s', %s, ?) IF NOT EXISTS";
-        String fmtQuery = String.format(query, NAME, RESOURCE_LOCK,
-                resource,
-                StorageService.instance.getLocalHostUUID());
+        String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LOCK,
+                                        resource,
+                                        StorageService.instance.getLocalHostUUID());
 
         UntypedResultSet res = processSilent(fmtQuery, metadata);
 
-        if (res == null)
-            return false;
-
-        return res.one().getBoolean("[applied]");
+        return res != null && res.one().getBoolean("[applied]");
     }
 
     /**
@@ -250,27 +245,26 @@ public class CasLockFactory implements IDistributedLockFactory
     {
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
         String query = "UPDATE %s.%s SET host=%s, metadata=? WHERE resource='%s' IF host=%s";
-        String fmtQuery = String.format(query, NAME, RESOURCE_LOCK,
-                localHostUUID,
-                resource,
-                localHostUUID);
+        String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LOCK,
+                                        localHostUUID,
+                                        resource,
+                                        localHostUUID);
 
         UntypedResultSet res = processSilent(fmtQuery, metadata);
 
-        if (res == null)
-            return false;
-
-        return res.one().getBoolean("[applied]");
+        return res != null && res.one().getBoolean("[applied]");
     }
 
-    private Predicate<InetAddress> isAlive = new Predicate<InetAddress>()
+    private void removeLock(String resource)
     {
-        @Override
-        public boolean apply(InetAddress endpoint)
-        {
-            return FailureDetector.instance.isAlive(endpoint);
-        }
-    };
+        UUID localHostUUID = StorageService.instance.getLocalHostUUID();
+        String query = "DELETE FROM %s.%s WHERE resource='%s' IF host=%s";
+        String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LOCK,
+                                        resource,
+                                        localHostUUID);
+
+        processSilent(fmtQuery);
+    }
 
     private class LockUpdateTask implements Runnable
     {
@@ -296,6 +290,10 @@ public class CasLockFactory implements IDistributedLockFactory
                     count++;
                 }
             }
+            catch (InterruptedException e)
+            {
+                // Intentionally left empty
+            }
             catch (Throwable t)
             {
                 logger.error("Failed to re-lock resource {}", resource, t);
@@ -307,16 +305,19 @@ public class CasLockFactory implements IDistributedLockFactory
     private class CASResourceLock implements DistributedLock
     {
         private final ScheduledFuture<?> future;
+        private final String resource;
 
-        private CASResourceLock(ScheduledFuture<?> future)
+        private CASResourceLock(ScheduledFuture<?> future, String resource)
         {
             this.future = future;
+            this.resource = resource;
         }
 
         @Override
-        public void close() throws IOException
+        public void close()
         {
-            future.cancel(false);
+            future.cancel(true);
+            removeLock(resource);
         }
 
     }

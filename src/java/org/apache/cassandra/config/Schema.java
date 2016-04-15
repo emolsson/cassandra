@@ -60,7 +60,7 @@ public class Schema
     public static final Set<String> REPLICATED_SYSTEM_KEYSPACE_NAMES = ImmutableSet.of(TraceKeyspace.NAME,
                                                                                        AuthKeyspace.NAME,
                                                                                        SystemDistributedKeyspace.NAME,
-                                                                                       CasLockFactory.NAME);
+                                                                                       CasLockFactory.KEYSPACE_NAME);
 
     /**
      * longest permissible KS or CF name.  Our main concern is that filename not be more than 255 characters;
