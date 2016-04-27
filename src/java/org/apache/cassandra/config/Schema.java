@@ -39,7 +39,7 @@ import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
-import org.apache.cassandra.scheduling.CasLockFactory;
+import org.apache.cassandra.scheduling.CasLeaseFactory;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.tracing.TraceKeyspace;
@@ -60,7 +60,7 @@ public class Schema
     public static final Set<String> REPLICATED_SYSTEM_KEYSPACE_NAMES = ImmutableSet.of(TraceKeyspace.NAME,
                                                                                        AuthKeyspace.NAME,
                                                                                        SystemDistributedKeyspace.NAME,
-                                                                                       CasLockFactory.KEYSPACE_NAME);
+                                                                                       CasLeaseFactory.KEYSPACE_NAME);
 
     /**
      * longest permissible KS or CF name.  Our main concern is that filename not be more than 255 characters;

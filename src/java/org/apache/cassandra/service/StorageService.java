@@ -158,7 +158,7 @@ import org.apache.cassandra.repair.RepairParallelism;
 import org.apache.cassandra.repair.RepairRunnable;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
 import org.apache.cassandra.repair.messages.RepairOption;
-import org.apache.cassandra.scheduling.CasLockFactory;
+import org.apache.cassandra.scheduling.CasLeaseFactory;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.paxos.CommitVerbHandler;
 import org.apache.cassandra.service.paxos.PrepareVerbHandler;
@@ -1018,7 +1018,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         // if we don't have system_traces keyspace at this point, then create it manually
         maybeAddOrUpdateKeyspace(TraceKeyspace.metadata());
         maybeAddOrUpdateKeyspace(SystemDistributedKeyspace.metadata());
-        maybeAddOrUpdateKeyspace(CasLockFactory.metadata());
+        maybeAddOrUpdateKeyspace(CasLeaseFactory.metadata());
 
         if (!isSurveyMode)
         {
