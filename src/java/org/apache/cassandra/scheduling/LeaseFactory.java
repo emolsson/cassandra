@@ -22,6 +22,31 @@ import java.util.Optional;
 
 import org.apache.cassandra.exceptions.LeaseException;
 
+/**
+ * Interface for a lease factory.
+ * <p>
+ * The lifecycle of a lease begins with requesting a new lease by calling {@link #newLease(String, int, Map)}.
+ * If the lease was acquired it's then possible to manipulate the lease by the methods defined in the interface {@link Lease}.
+ * The caller is responsible to call {@link Lease#renew(int)} to renew the lease for the needed duration.
+ * When done with the leased resource the caller uses the {@link Lease#cancel()} method to release the leased resource.
+ * <p>
+ * An example usage:
+ * <pre>
+ * Lease lease = LeaseFactoryImplementation.newLease("a-resource", 1, new HashMap&lt;&gt;());
+ * if (lease != null)
+ * {
+ *     try {
+ *         // Do something with the resource.
+ *         if (lease.isValid()) { // Check if the lease is still valid.
+ *             lease.renew(60); // We need the lease for another 60 seconds from now.
+ *             // Do some more things with the leased resource.
+ *         }
+ *     } finally {
+ *         lease.cancel();
+ *     }
+ * }
+ * </pre>
+ */
 public interface LeaseFactory
 {
 

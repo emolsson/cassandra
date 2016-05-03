@@ -21,6 +21,10 @@ import org.apache.cassandra.exceptions.LeaseException;
 
 /**
  * A leased resource.
+ * <p>
+ * Example usage is found in the LeaseFactory interface.
+ *
+ * @see org.apache.cassandra.scheduling.LeaseFactory
  */
 public interface Lease
 {

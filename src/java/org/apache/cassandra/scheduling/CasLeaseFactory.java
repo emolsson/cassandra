@@ -42,6 +42,12 @@ import org.apache.cassandra.service.StorageService;
 
 /**
  * A distributed lease factory using CAS to acquire and maintain leases.
+ * <p>
+ * The leases are acquired using CAS to serialize access to resource leases and TTL is used to make sure that a leased
+ * resource isn't kept in case the lease object is lost (node failure, etc).
+ * <p>
+ * To avoid starvation of resource access a priority table is used to determine if a node should try to lease the
+ * resource by comparing it's local priority with the other nodes.
  */
 public class CasLeaseFactory implements LeaseFactory
 {
@@ -153,7 +159,7 @@ public class CasLeaseFactory implements LeaseFactory
     }
 
     /**
-     * Insert the local priority of the resource in the resource priority table as an inactive priority.
+     * Insert the local priority of the resource in the resource priority table with a duration of {@value DEFAULT_LEASE_TIME} seconds.
      *
      * @param resource The resource to lease
      * @param priority The local priority to lease the resource
@@ -227,7 +233,7 @@ public class CasLeaseFactory implements LeaseFactory
     }
 
     /**
-     * Try to lease the resource using CAS.
+     * Try to lease the resource for {@value DEFAULT_LEASE_TIME} seconds.
      *
      * @param resource The resource to lease
      * @param metadata The metadata of the lease
@@ -235,33 +241,23 @@ public class CasLeaseFactory implements LeaseFactory
      */
     private boolean lease(String resource, ByteBuffer metadata)
     {
-        String query = "INSERT INTO %s.%s (resource, host, metadata) VALUES ('%s', %s, ?) IF NOT EXISTS USING TTL %d";
-        String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LEASE,
-                resource,
-                StorageService.instance.getLocalHostUUID(),
-                DEFAULT_LEASE_TIME);
-
-        UntypedResultSet res = processSilent(fmtQuery, metadata);
-
-        if (res != null && res.one().getBoolean("[applied]"))
-        {
-            insertPriority(resource, -1, true, DEFAULT_LEASE_TIME);
-            return true;
-        }
-
-        return false;
+        return renewLease(resource, metadata, null, DEFAULT_LEASE_TIME);
     }
 
     /**
-     * Update the resource lease.
+     * Try to renew a lease for the resource for the provided duration.
+     * <p>
+     * When trying to get a new lease the host parameter should be set to null.
      * <p>
      * This method will be called repeatedly while the local node has the lease.
      *
      * @param resource The resource to lease
      * @param metadata The metadata of the lease
+     * @param host The expected current host id of the leased resource
+     * @param duration The duration of the lease
      * @return True if able to update the resource lease
      */
-    private boolean updateLease(String resource, ByteBuffer metadata, int duration)
+    private boolean renewLease(String resource, ByteBuffer metadata, UUID host, int duration)
     {
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
         String query = "UPDATE %s.%s USING TTL %d SET host=%s, metadata=? WHERE resource='%s' IF host=%s";
@@ -269,7 +265,7 @@ public class CasLeaseFactory implements LeaseFactory
                 duration,
                 localHostUUID,
                 resource,
-                localHostUUID);
+                host);
 
         UntypedResultSet res = processSilent(fmtQuery, metadata);
 
@@ -285,7 +281,7 @@ public class CasLeaseFactory implements LeaseFactory
     /**
      * Check if the resource lease is held by the local node.
      *
-     * @param resource The resource
+     * @param resource The leased resource
      * @return True if the lease is held by the local node
      */
     private boolean holdsLease(String resource)
@@ -297,9 +293,15 @@ public class CasLeaseFactory implements LeaseFactory
 
         UntypedResultSet res = processSilent(fmtQuery, ConsistencyLevel.SERIAL);
 
-        return res != null && localHostUUID.equals(res.one().getUUID("host"));
+        return res != null && !res.isEmpty() && localHostUUID.equals(res.one().getUUID("host"));
     }
 
+    /**
+     * Clear the lease and the active flag from the priority table to allow other nodes to lease this resource.
+     *
+     * @param resource The leased resource
+     * @return True if able to clear the lease
+     */
     private boolean clearLease(String resource)
     {
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
@@ -346,7 +348,7 @@ public class CasLeaseFactory implements LeaseFactory
 
             try
             {
-                if (updateLease(resource, metadata, duration))
+                if (renewLease(resource, metadata, StorageService.instance.getLocalHostUUID(), duration))
                 {
                     expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(duration);
                     return true;

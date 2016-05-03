@@ -182,6 +182,43 @@ public class CasLeaseFactoryTest
         assertFalse(lease.cancel());
     }
 
+    @Test
+    public void testRemovedLeaseIsNotValid() throws LeaseException
+    {
+        Lease lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
+        assertNotNull(lease);
+
+        clearLease("lease");
+
+        assertFalse(lease.isValid());
+    }
+
+    @Test
+    public void testRemovedLeaseIsNotRenewable() throws LeaseException
+    {
+        Lease lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
+        assertNotNull(lease);
+
+        clearLease("lease");
+
+        assertFalse(lease.renew(10));
+
+        clearPriority("lease");
+    }
+
+    @Test
+    public void testRemovedLeasePriorityIsNotLeasable() throws LeaseException
+    {
+        Lease lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
+        assertNotNull(lease);
+
+        clearPriority("lease");
+
+        assertFalse(CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).isPresent());
+
+        lease.cancel();
+    }
+
     private void insertPriority(String resource, int priority, boolean active)
     {
         String query = "INSERT INTO %s.%s (resource, host, priority, isActive) VALUES ('%s',%s,%d, %s)";
