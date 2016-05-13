@@ -42,11 +42,9 @@ import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.UUIDGen;
 
-import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 public class CasLeaseFactoryTest
@@ -106,7 +104,7 @@ public class CasLeaseFactoryTest
     {
         Lease lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
         assertNotNull(lease);
-        assertThat(CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).isPresent(), is(false));
+        assertFalse(CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).isPresent());
 
         assertTrue(lease.cancel());
     }

@@ -35,6 +35,10 @@ public interface Lease
 
     /**
      * Try to renew the resource lease for the provided duration.
+     * <p>
+     * This duration is not added to the current duration.
+     * <p>
+     * If this method gets called at 08:00:00 and the duration is 30 seconds the lease would be held until 08:00:30.
      *
      * @param duration The new duration for the lease in seconds.
      * @return True if able to renew the lease.

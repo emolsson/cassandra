@@ -62,6 +62,7 @@ public class CasLeaseFactory implements LeaseFactory
                             + "resource text,"
                             + "host uuid,"
                             + "metadata map<text,text>,"
+                            + "expirationTime bigint,"
                             + "PRIMARY KEY (resource))");
     protected static final CFMetaData leaseFactory =
             compile(RESOURCE_LEASE_PRIORITY,
@@ -125,10 +126,11 @@ public class CasLeaseFactory implements LeaseFactory
             {
                 logger.trace("Trying acquire lease for resource {}", resource);
                 ByteBuffer serializedMetadata = serializeMap(metadata);
-                if (lease(resource, serializedMetadata))
+                Optional<Long> expirationTime = lease(resource, serializedMetadata);
+                if (expirationTime.isPresent())
                 {
                     logger.trace("Lease for resource {} acquired", resource);
-                    return Optional.of(new CASResourceLease(resource, serializedMetadata, DEFAULT_LEASE_TIME));
+                    return Optional.of(new CASResourceLease(resource, serializedMetadata, DEFAULT_LEASE_TIME, expirationTime.get()));
                 }
             }
         }
@@ -237,11 +239,11 @@ public class CasLeaseFactory implements LeaseFactory
      *
      * @param resource The resource to lease
      * @param metadata The metadata of the lease
-     * @return True if the leasing was successful
+     * @return An optional with the expiration time inserted in the lease record or empty if the lease was not obtained
      */
-    private boolean lease(String resource, ByteBuffer metadata)
+    private Optional<Long> lease(String resource, ByteBuffer metadata)
     {
-        return renewLease(resource, metadata, null, DEFAULT_LEASE_TIME);
+        return renewLease(resource, metadata, null, DEFAULT_LEASE_TIME, null);
     }
 
     /**
@@ -255,45 +257,69 @@ public class CasLeaseFactory implements LeaseFactory
      * @param metadata The metadata of the lease
      * @param host The expected current host id of the leased resource
      * @param duration The duration of the lease
-     * @return True if able to update the resource lease
+     * @return An optional with the expiration time inserted in the lease record or empty if the lease was not renewed
      */
-    private boolean renewLease(String resource, ByteBuffer metadata, UUID host, int duration)
+    private Optional<Long> renewLease(String resource, ByteBuffer metadata, UUID host, int duration, Long expectedExpirationTime)
     {
+        long expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(duration);
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
-        String query = "UPDATE %s.%s USING TTL %d SET host=%s, metadata=? WHERE resource='%s' IF host=%s";
+        String query = "UPDATE %s.%s USING TTL %d SET host=%s, metadata=?, expirationTime=%s WHERE resource='%s' IF host=%s AND expirationTime=%s";
         String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LEASE,
                 duration,
                 localHostUUID,
+                expirationTime,
                 resource,
-                host);
+                host,
+                expectedExpirationTime);
 
         UntypedResultSet res = processSilent(fmtQuery, metadata);
 
-        if (res != null && res.one().getBoolean("[applied]"))
+        if (res == null)
         {
-            insertPriority(resource, -1, true, duration);
-            return true;
+            Optional<Long> leasedUntil = holdsLeaseUntil(resource);
+
+            if (!leasedUntil.isPresent() || leasedUntil.get() != expirationTime)
+            {
+                return Optional.empty();
+            }
+        }
+        else if (!res.one().getBoolean("[applied]"))
+        {
+            return Optional.empty();
         }
 
-        return false;
+        insertPriority(resource, -1, true, duration);
+        return Optional.of(expirationTime);
     }
 
     /**
-     * Check if the resource lease is held by the local node.
+     * Check if the specified resource is leased by the local node and when it expires.
      *
      * @param resource The leased resource
-     * @return True if the lease is held by the local node
+     * @return An optional with the timestamp in milliseconds for when the lease expires or empty if the lease is not held by the local node
      */
-    private boolean holdsLease(String resource)
+    private Optional<Long> holdsLeaseUntil(String resource)
     {
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
-        String query = "SELECT host FROM %s.%s where resource='%s'";
+        String query = "SELECT host, expirationTime FROM %s.%s where resource='%s'";
         String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LEASE,
                 resource);
 
         UntypedResultSet res = processSilent(fmtQuery, ConsistencyLevel.SERIAL);
 
-        return res != null && !res.isEmpty() && localHostUUID.equals(res.one().getUUID("host"));
+        if (res == null || res.isEmpty())
+        {
+            return Optional.empty();
+        }
+
+        UntypedResultSet.Row row = res.one();
+
+        if (!localHostUUID.equals(row.getUUID("host")) || !row.has("expirationtime"))
+        {
+            return Optional.empty();
+        }
+
+        return Optional.of(row.getLong("expirationtime"));
     }
 
     /**
@@ -327,11 +353,11 @@ public class CasLeaseFactory implements LeaseFactory
         private final ByteBuffer metadata;
         private volatile long expirationTime;
 
-        private CASResourceLease(String resource, ByteBuffer metadata, int duration)
+        private CASResourceLease(String resource, ByteBuffer metadata, int duration, long expirationTime)
         {
             this.resource = resource;
             this.metadata = metadata;
-            expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(duration);
+            this.expirationTime = expirationTime;
         }
 
         @Override
@@ -348,9 +374,10 @@ public class CasLeaseFactory implements LeaseFactory
 
             try
             {
-                if (renewLease(resource, metadata, StorageService.instance.getLocalHostUUID(), duration))
+                Optional<Long> newExpirationTime = renewLease(resource, metadata, StorageService.instance.getLocalHostUUID(), duration, expirationTime);
+                if (newExpirationTime.isPresent())
                 {
-                    expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(duration);
+                    expirationTime = newExpirationTime.get();
                     return true;
                 }
                 return false;
@@ -383,7 +410,7 @@ public class CasLeaseFactory implements LeaseFactory
         @Override
         public boolean isValid()
         {
-            return !hasExpired() && holdsLease(resource);
+            return !hasExpired() && holdsLeaseUntil(resource).isPresent();
         }
 
         private boolean hasExpired()
