@@ -410,7 +410,11 @@ public class CasLeaseFactory implements LeaseFactory
         @Override
         public boolean isValid()
         {
-            return !hasExpired() && holdsLeaseUntil(resource).isPresent();
+            if (hasExpired())
+                return false;
+
+            Optional<Long> holdsLeaseUntil = holdsLeaseUntil(resource);
+            return holdsLeaseUntil.isPresent() && holdsLeaseUntil.get().equals(expirationTime);
         }
 
         private boolean hasExpired()
