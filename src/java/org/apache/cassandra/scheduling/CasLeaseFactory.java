@@ -109,7 +109,7 @@ public class CasLeaseFactory implements LeaseFactory
         }
         catch (Throwable t)
         {
-            logger.error("Error executing query " + fmtQry, t);
+            logger.warn("Error executing query " + fmtQry, t);
         }
         return null;
     }
@@ -136,7 +136,7 @@ public class CasLeaseFactory implements LeaseFactory
         }
         catch (Throwable t)
         {
-            logger.error("Unable to compete for/lease resource {}", resource, t);
+            logger.warn("Unable to compete for/lease resource {}", resource, t);
             throw new LeaseException(t);
         }
 
@@ -384,7 +384,7 @@ public class CasLeaseFactory implements LeaseFactory
             }
             catch (Throwable t)
             {
-                logger.error("Unable to renew lease for {}", resource, t);
+                logger.warn("Unable to renew lease for {}", resource, t);
                 throw new LeaseException(t);
             }
         }
@@ -402,7 +402,7 @@ public class CasLeaseFactory implements LeaseFactory
             }
             catch (Throwable t)
             {
-                logger.error("Unable to cancel lease for {}", resource, t);
+                logger.warn("Unable to cancel lease for {}", resource, t);
                 throw new LeaseException(t);
             }
         }
