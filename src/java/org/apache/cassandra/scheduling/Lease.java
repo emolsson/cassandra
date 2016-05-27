@@ -34,17 +34,16 @@ public interface Lease
     long getExpiration();
 
     /**
-     * Try to renew the resource lease for the provided duration.
-     * <p>
-     * This duration is not added to the current duration.
-     * <p>
-     * If this method gets called at 08:00:00 and the duration is 30 seconds the lease would be held until 08:00:30.
+     * Try to renew the resource lease overwriting the current duration with <code>newDuration</code>.
      *
-     * @param duration The new duration for the lease in seconds.
+     * If the current lease is valid until 09:00:00 and this method gets called at 08:00:00 with a
+     * <code>newDuration</code> of 300 seconds the renewed lease would be valid until 08:05:00.
+     *
+     * @param newDuration The new duration for the lease in seconds.
      * @return True if able to renew the lease.
      * @throws LeaseException Thrown in case something unexpected happened while trying to renew the lease.
      */
-    boolean renew(int duration) throws LeaseException;
+    boolean renew(int newDuration) throws LeaseException;
 
     /**
      * Cancel the lease.

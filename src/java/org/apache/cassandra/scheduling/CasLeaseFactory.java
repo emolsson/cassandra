@@ -256,16 +256,16 @@ public class CasLeaseFactory implements LeaseFactory
      * @param resource The resource to lease
      * @param metadata The metadata of the lease
      * @param host The expected current host id of the leased resource
-     * @param duration The duration of the lease
+     * @param newDuration The duration of the lease
      * @return An optional with the expiration time inserted in the lease record or empty if the lease was not renewed
      */
-    private Optional<Long> renewLease(String resource, ByteBuffer metadata, UUID host, int duration, Long expectedExpirationTime)
+    private Optional<Long> renewLease(String resource, ByteBuffer metadata, UUID host, int newDuration, Long expectedExpirationTime)
     {
-        long expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(duration);
+        long expirationTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(newDuration);
         UUID localHostUUID = StorageService.instance.getLocalHostUUID();
         String query = "UPDATE %s.%s USING TTL %d SET host=%s, metadata=?, expirationTime=%s WHERE resource='%s' IF host=%s AND expirationTime=%s";
         String fmtQuery = String.format(query, KEYSPACE_NAME, RESOURCE_LEASE,
-                duration,
+                newDuration,
                 localHostUUID,
                 expirationTime,
                 resource,
@@ -288,7 +288,7 @@ public class CasLeaseFactory implements LeaseFactory
             return Optional.empty();
         }
 
-        insertPriority(resource, -1, true, duration);
+        insertPriority(resource, -1, true, newDuration);
         return Optional.of(expirationTime);
     }
 
@@ -367,14 +367,14 @@ public class CasLeaseFactory implements LeaseFactory
         }
 
         @Override
-        public boolean renew(int duration) throws LeaseException
+        public boolean renew(int newDuration) throws LeaseException
         {
             if (hasExpired())
                 return false;
 
             try
             {
-                Optional<Long> newExpirationTime = renewLease(resource, metadata, StorageService.instance.getLocalHostUUID(), duration, expirationTime);
+                Optional<Long> newExpirationTime = renewLease(resource, metadata, StorageService.instance.getLocalHostUUID(), newDuration, expirationTime);
                 if (newExpirationTime.isPresent())
                 {
                     expirationTime = newExpirationTime.get();
