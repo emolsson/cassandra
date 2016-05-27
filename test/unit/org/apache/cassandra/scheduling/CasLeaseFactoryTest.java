@@ -217,6 +217,21 @@ public class CasLeaseFactoryTest
         lease.cancel();
     }
 
+    @Test
+    public void testReacquireLeaseAfterShorterRenewalTime() throws LeaseException
+    {
+        Lease lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
+        assertNotNull(lease);
+
+        assertTrue(lease.renew(10));
+        assertTrue(lease.cancel());
+
+        lease = CasLeaseFactory.instance.newLease("lease", 1, new HashMap<>()).orElse(null);
+        assertNotNull(lease);
+
+        assertTrue(lease.cancel());
+    }
+
     private void insertPriority(String resource, int priority, boolean active)
     {
         String query = "INSERT INTO %s.%s (resource, host, priority, isActive) VALUES ('%s',%s,%d, %s)";
