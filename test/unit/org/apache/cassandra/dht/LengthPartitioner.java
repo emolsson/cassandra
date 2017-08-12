@@ -61,6 +61,12 @@ public class LengthPartitioner implements IPartitioner
         return MINIMUM;
     }
 
+    @Override
+    public Token getMaximumToken()
+    {
+        return null;
+    }
+
     public BigIntegerToken getRandomToken()
     {
         return new BigIntegerToken(BigInteger.valueOf(new Random().nextInt(15)));
@@ -126,7 +132,7 @@ public class LengthPartitioner implements IPartitioner
 
         for (String ks : Schema.instance.getKeyspaces())
         {
-            for (CFMetaData cfmd : Schema.instance.getTables(ks))
+            for (CFMetaData cfmd : Schema.instance.getTablesAndViews(ks))
             {
                 for (Range<Token> r : sortedRanges)
                 {

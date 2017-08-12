@@ -128,16 +128,23 @@ Function CalculateHeapSizes
     }
 
     # Validate that we need to run this function and that our config is good
-    if ($env:MAX_HEAP_SIZE)
+    if ($env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE)
     {
         return
+    }
+
+    if (($env:MAX_HEAP_SIZE -and !$env:HEAP_NEWSIZE) -or (!$env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE))
+    {
+        echo "Please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs.  Aborting startup."
+        exit 1
     }
 
     $memObject = Get-WMIObject -class win32_physicalmemory
     if ($memObject -eq $null)
     {
-        echo "WARNING!  Could not determine system memory.  Defaulting to 2G heap.  Manually override in conf\cassandra-env.ps1 for different heap values."
+        echo "WARNING!  Could not determine system memory.  Defaulting to 2G heap, 512M newgen.  Manually override in conf\jvm.options for different heap values."
         $env:MAX_HEAP_SIZE = "2048M"
+        $env:HEAP_NEWSIZE = "512M"
         return
     }
 
@@ -174,12 +181,26 @@ Function CalculateHeapSizes
         $maxHeapMB = $quarterMem
     }
     $env:MAX_HEAP_SIZE = [System.Convert]::ToString($maxHeapMB) + "M"
+
+    # Young gen: min(max_sensible_per_modern_cpu_core * num_cores, 1/4
+    $maxYGPerCore = 100
+    $maxYGTotal = $maxYGPerCore * $systemCores
+    $desiredYG = [Math]::Truncate($maxHeapMB / 4)
+
+    if ($desiredYG -gt $maxYGTotal)
+    {
+        $env:HEAP_NEWSIZE = [System.Convert]::ToString($maxYGTotal) + "M"
+    }
+    else
+    {
+        $env:HEAP_NEWSIZE = [System.Convert]::ToString($desiredYG) + "M"
+    }
 }
 
 #-----------------------------------------------------------------------------
 Function SetJsr223Env
 {
-    $cp = """$env:CLASSPATH"""
+    $cp = $env:CLASSPATH
     foreach ($jsrDir in Get-ChildItem -Path "$env:CASSANDRA_HOME\lib\jsr223")
     {
         foreach ($file in Get-ChildItem -Path "$env:CASSANDRA_HOME\lib\jsr223\$jsrDir\*.jar")
@@ -221,12 +242,27 @@ Function ParseJVMInfo
     $pinfo.RedirectStandardError = $true
     $pinfo.RedirectStandardOutput = $true
     $pinfo.UseShellExecute = $false
-    $pinfo.Arguments = "-version"
+    $pinfo.Arguments = "-d64 -version"
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $pinfo
     $p.Start() | Out-Null
     $p.WaitForExit()
     $stderr = $p.StandardError.ReadToEnd()
+
+    $env:JVM_ARCH = "64-bit"
+
+    if ($stderr.Contains("Error"))
+    {
+        # 32-bit JVM. re-run w/out -d64
+        echo "Failed 64-bit check. Re-running to get version from 32-bit"
+        $pinfo.Arguments = "-version"
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $pinfo
+        $p.Start() | Out-Null
+        $p.WaitForExit()
+        $stderr = $p.StandardError.ReadToEnd()
+        $env:JVM_ARCH = "32-bit"
+    }
 
     $sa = $stderr.Split("""")
     $env:JVM_VERSION = $sa[1]
@@ -246,29 +282,11 @@ Function ParseJVMInfo
 
     $pa = $sa[1].Split("_")
     $env:JVM_PATCH_VERSION=$pa[1]
-
-    # get 64-bit vs. 32-bit
-    $pinfo.Arguments = "-d64 -version"
-    $pArch = New-Object System.Diagnostics.Process
-    $p.StartInfo = $pinfo
-    $p.Start() | Out-Null
-    $p.WaitForExit()
-    $stderr = $p.StandardError.ReadToEnd()
-
-    if ($stderr.Contains("Error"))
-    {
-        $env:JVM_ARCH = "32-bit"
-    }
-    else
-    {
-        $env:JVM_ARCH = "64-bit"
-    }
 }
 
 #-----------------------------------------------------------------------------
 Function SetCassandraEnvironment
 {
-    echo "Setting up Cassandra environment"
     if (Test-Path Env:\JAVA_HOME)
     {
         $env:JAVA_BIN = "$env:JAVA_HOME\bin\java.exe"
@@ -297,14 +315,76 @@ Function SetCassandraEnvironment
     # Override these to set the amount of memory to allocate to the JVM at
     # start-up. For production use you may wish to adjust this for your
     # environment. MAX_HEAP_SIZE is the total amount of memory dedicated
-    # to the Java heap.
+    # to the Java heap. HEAP_NEWSIZE refers to the size of the young
+    # generation. Both MAX_HEAP_SIZE and HEAP_NEWSIZE should be either set
+    # or not (if you set one, set the other).
+    #
+    # The main trade-off for the young generation is that the larger it
+    # is, the longer GC pause times will be. The shorter it is, the more
+    # expensive GC will be (usually).
+    #
+    # The example HEAP_NEWSIZE assumes a modern 8-core+ machine for decent
+    # times. If in doubt, and if you do not particularly want to tweak, go
+    # 100 MB per physical CPU core.
 
     #$env:MAX_HEAP_SIZE="4096M"
+    #$env:HEAP_NEWSIZE="800M"
     CalculateHeapSizes
 
     ParseJVMInfo
+
+    #GC log path has to be defined here since it needs to find CASSANDRA_HOME
+    $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:$env:CASSANDRA_HOME/logs/gc.log"
+
+    # Read user-defined JVM options from jvm.options file
+    $content = Get-Content "$env:CASSANDRA_CONF\jvm.options"
+    for ($i = 0; $i -lt $content.Count; $i++)
+    {
+        $line = $content[$i]
+        if ($line.StartsWith("-"))
+        {
+            $env:JVM_OPTS = "$env:JVM_OPTS $line"
+        }
+    }
+
+    $defined_xmn = $env:JVM_OPTS -like '*Xmn*'
+    $defined_xmx = $env:JVM_OPTS -like '*Xmx*'
+    $defined_xms = $env:JVM_OPTS -like '*Xms*'
+    $using_cms = $env:JVM_OPTS -like '*UseConcMarkSweepGC*'
+
+    # We only set -Xms and -Xmx if they were not defined on jvm.options file
+    # If defined, both Xmx and Xms should be defined together.
+    if (($defined_xmx -eq $false) -and ($defined_xms -eq $false))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -Xms$env:MAX_HEAP_SIZE"
+        $env:JVM_OPTS="$env:JVM_OPTS -Xmx$env:MAX_HEAP_SIZE"
+    }
+    elseif (($defined_xmx -eq $false) -or ($defined_xms -eq $false))
+    {
+        echo "Please set or unset -Xmx and -Xms flags in pairs on jvm.options file."
+        exit
+    }
+
+    # We only set -Xmn flag if it was not defined in jvm.options file
+    # and if the CMS GC is being used
+    # If defined, both Xmn and Xmx should be defined together.
+    if (($defined_xmn -eq $true) -and ($defined_xmx -eq $false))
+    {
+        echo "Please set or unset -Xmx and -Xmn flags in pairs on jvm.options file."
+        exit
+    }
+    elseif (($defined_xmn -eq $false) -and ($using_cms -eq $true))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -Xmn$env:HEAP_NEWSIZE"
+    }
+
+    if (($env:JVM_ARCH -eq "64-Bit") -and ($using_cms -eq $true))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseCondCardMark"
+    }
+
     # Add sigar env - see Cassandra-7838
-    $env:JVM_OPTS = "$env:JVM_OPTS -Djava.library.path=$env:CASSANDRA_HOME\lib\sigar-bin"
+    $env:JVM_OPTS = "$env:JVM_OPTS -Djava.library.path=""$env:CASSANDRA_HOME\lib\sigar-bin"""
 
     # Confirm we're on high performance power plan, warn if not
     # Change to $true to suppress this warning
@@ -333,9 +413,11 @@ Function SetCassandraEnvironment
         $env:JVM_OPTS = "$env:JVM_OPTS -javaagent:""$env:CASSANDRA_HOME\lib\jamm-0.3.0.jar"""
     }
 
-    # enable assertions.  disabling this in production will give a modest
-    # performance benefit (around 5%).
-    $env:JVM_OPTS = "$env:JVM_OPTS -ea"
+    if ($env:JVM_VERSION.CompareTo("1.8.0_40") -eq -1)
+    {
+        echo "Cassandra 3.0 and later require Java 8u40 or later."
+        exit
+    }
 
     # Specifies the default port over which Cassandra will be available for
     # JMX connections.
@@ -344,90 +426,10 @@ Function SetCassandraEnvironment
     # store in env to check if it's avail in verification
     $env:JMX_PORT=$JMX_PORT
 
-    $env:JVM_OPTS = "$env:JVM_OPTS -Dlog4j.defaultInitOverride=true"
-
-    # enable thread priorities, primarily so we can give periodic tasks
-    # a lower priority to avoid interfering with client workload
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseThreadPriorities"
-    # allows lowering thread priority without being root on linux - probably
-    # not necessary on Windows but doesn't harm anything.
-    # see http://tech.stolsvik.com/2010/01/linux-java-thread-priorities-workar
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:ThreadPriorityPolicy=42"
-
-    # min and max heap sizes should be set to the same value to avoid
-    # stop-the-world GC pauses during resize.
-    $env:JVM_OPTS="$env:JVM_OPTS -Xms$env:MAX_HEAP_SIZE"
-    $env:JVM_OPTS="$env:JVM_OPTS -Xmx$env:MAX_HEAP_SIZE"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+HeapDumpOnOutOfMemoryError"
-
-    # Per-thread stack size.
-    $env:JVM_OPTS="$env:JVM_OPTS -Xss256k"
-
-    # Larger interned string table, for gossip's benefit (CASSANDRA-6410)
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:StringTableSize=1000003"
-
-    # GC tuning options
-    # Use the Hotspot garbage-first collector.
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseG1GC"
-
-    # Have the JVM do less remembered set work during STW, instead
-    # preferring concurrent GC. Reduces p99.9 latency.
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:G1RSetUpdatingPauseTimePercent=5"
-
-    # The JVM maximum is 8 PGC threads and 1/4 of that for ConcGC.
-    # Machines with > 10 cores may need additional threads. Increase to <= full cores.
-    #$env:JVM_OPTS="$env:JVM_OPTS -XX:ParallelGCThreads=16"
-    #$env:JVM_OPTS="$env:JVM_OPTS -XX:ConcGCThreads=16"
-
-    # Main G1GC tunable: lowering the pause target will lower throughput and vise versa.
-    # 200ms is the JVM default and lowest viable setting
-    # 1000ms increases throughput. Keep it smaller than the timeouts in cassandra.yaml.
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:MaxGCPauseMillis=500"
-
-    # Save CPU time on large (>= 16GB) heaps by delaying region scanning
-	# until the heap is 70% full. The default in Hotspot 8u40 is 40%.
-    #$env:JVM_OPTS="$env:JVM_OPTS -XX:InitiatingHeapOccupancyPercent=70"
-
-    # Make sure all memory is faulted and zeroed on startup.
-    # This helps prevent soft faults in containers and makes
-    # transparent hugepage allocation more effective.
-    #$env:JVM_OPTS="$env:JVM_OPTS -XX:+AlwaysPreTouch"
-
-    # Biased locking does not benefit Cassandra.
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:-UseBiasedLocking"
-
-    # Enable thread-local allocation blocks and allow the JVM to automatically
-    # resize them at runtime.
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseTLAB -XX:+ResizeTLAB"
-
-    # http://www.evanjones.ca/jvm-mmap-pause.html
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+PerfDisableSharedMem"
-
-    # GC logging options -- uncomment to enable
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCDetails"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCDateStamps"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintHeapAtGC"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintTenuringDistribution"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCApplicationStoppedTime"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintPromotionFailure"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:PrintFLSStatistics=1"
-    # $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:$env:CASSANDRA_HOME/logs/gc.log"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseGCLogFileRotation"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:NumberOfGCLogFiles=10"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:GCLogFileSize=10M"
-
     # Configure the following for JEMallocAllocator and if jemalloc is not available in the system
     # library path.
     # set LD_LIBRARY_PATH=<JEMALLOC_HOME>/lib/
     # $env:JVM_OPTS="$env:JVM_OPTS -Djava.library.path=<JEMALLOC_HOME>/lib/"
-
-    # uncomment to have Cassandra JVM listen for remote debuggers/profilers on port 1414
-    # $env:JVM_OPTS="$env:JVM_OPTS -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=1414"
-
-    # Prefer binding to IPv4 network intefaces (when net.ipv6.bindv6only=1). See
-    # http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6342561 (short version:
-    # comment out this entry to enable IPv6 support).
-    $env:JVM_OPTS="$env:JVM_OPTS -Djava.net.preferIPv4Stack=true"
 
     # jmx: metrics and administration interface
     #
@@ -450,8 +452,4 @@ Function SetCassandraEnvironment
     $env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT -XX:+DisableExplicitGC"
 
     $env:JVM_OPTS="$env:JVM_OPTS $env:JVM_EXTRA_OPTS"
-
-    $env:JVM_OPTS = "$env:JVM_OPTS -Dlog4j.configuration=log4j-server.properties"
-
-    #$env:JVM_OPTS="$env:JVM_OPTS -XX:+UnlockCommercialFeatures -XX:+FlightRecorder"
 }

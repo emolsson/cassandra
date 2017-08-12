@@ -28,6 +28,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.*;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.QueryHandler;
@@ -65,9 +67,12 @@ public class ClientState
 
         SchemaKeyspace.ALL.forEach(table -> READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaKeyspace.NAME, table)));
 
-        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthenticator().protectedResources());
-        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());
-        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());
+        if (!Config.isClientMode())
+        {
+            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthenticator().protectedResources());
+            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());
+            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());
+        }
 
         // allow users with sufficient privileges to alter KS level options on AUTH_KS and
         // TRACING_KS, and also to drop legacy tables (users, credentials, permissions) from
@@ -245,6 +250,12 @@ public class ClientState
         hasAccess(keyspace, perm, DataResource.table(keyspace, columnFamily));
     }
 
+    public void hasColumnFamilyAccess(CFMetaData cfm, Permission perm)
+    throws UnauthorizedException, InvalidRequestException
+    {
+        hasAccess(cfm.ksName, perm, cfm.resource);
+    }
+
     private void hasAccess(String keyspace, Permission perm, DataResource resource)
     throws UnauthorizedException, InvalidRequestException
     {
@@ -263,7 +274,7 @@ public class ClientState
 
     public void ensureHasPermission(Permission perm, IResource resource) throws UnauthorizedException
     {
-        if (DatabaseDescriptor.getAuthorizer() instanceof AllowAllAuthorizer)
+        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())
             return;
 
         // Access to built in functions is unrestricted
@@ -279,7 +290,7 @@ public class ClientState
     public void ensureHasPermission(Permission permission, Function function)
     {
         // Save creating a FunctionResource is we don't need to
-        if (DatabaseDescriptor.getAuthorizer() instanceof AllowAllAuthorizer)
+        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())
             return;
 
         // built in functions are always available to all

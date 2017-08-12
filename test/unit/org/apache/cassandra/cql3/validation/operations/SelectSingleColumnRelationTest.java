@@ -62,6 +62,10 @@ public class SelectSingleColumnRelationTest extends CQLTester
                              "SELECT * FROM %s WHERE c = 0 AND b <= ?", set(0));
         assertInvalidMessage("Collection column 'b' (set<int>) cannot be restricted by a 'IN' relation",
                              "SELECT * FROM %s WHERE c = 0 AND b IN (?)", set(0));
+        assertInvalidMessage("Unsupported \"!=\" relation: b != 5",
+                "SELECT * FROM %s WHERE c = 0 AND b != 5");
+        assertInvalidMessage("Unsupported restriction: b IS NOT NULL",
+                "SELECT * FROM %s WHERE c = 0 AND b IS NOT NULL");
     }
 
     @Test
@@ -559,5 +563,50 @@ public class SelectSingleColumnRelationTest extends CQLTester
         assertInvalidMessage("Unsupported unset value for indexed column s", "SELECT * from %s WHERE s = ?", unset());
         // range
         assertInvalidMessage("Invalid unset value for column i", "SELECT * from %s WHERE k = 1 AND i > ?", unset());
+    }
+
+    @Test
+    public void testInvalidSliceRestrictionOnPartitionKey() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c text)");
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "SELECT * FROM %s WHERE a >= 1 and a < 4");
+        assertInvalidMessage("Multi-column relations can only be applied to clustering columns but was applied to: a",
+                             "SELECT * FROM %s WHERE (a) >= (1) and (a) < (4)");
+    }
+
+    @Test
+    public void testInvalidMulticolumnSliceRestrictionOnPartitionKey() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c text, PRIMARY KEY ((a, b)))");
+        assertInvalidMessage("Multi-column relations can only be applied to clustering columns but was applied to: a",
+                             "SELECT * FROM %s WHERE (a, b) >= (1, 1) and (a, b) < (4, 1)");
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "SELECT * FROM %s WHERE a >= 1 and (a, b) < (4, 1)");
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "SELECT * FROM %s WHERE b >= 1 and (a, b) < (4, 1)");
+        assertInvalidMessage("Multi-column relations can only be applied to clustering columns but was applied to: a",
+                             "SELECT * FROM %s WHERE (a, b) >= (1, 1) and (b) < (4)");
+        assertInvalidMessage("Multi-column relations can only be applied to clustering columns but was applied to: b",
+                             "SELECT * FROM %s WHERE (b) < (4) and (a, b) >= (1, 1)");
+        assertInvalidMessage("Multi-column relations can only be applied to clustering columns but was applied to: a",
+                             "SELECT * FROM %s WHERE (a, b) >= (1, 1) and a = 1");
+    }
+
+    @Test
+    public void testInvalidColumnNames() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c map<int, int>, PRIMARY KEY (a, b))");
+        assertInvalidMessage("Undefined name d in where clause ('d = 0')", "SELECT * FROM %s WHERE d = 0");
+        assertInvalidMessage("Undefined name d in where clause ('d IN [0, 1]')", "SELECT * FROM %s WHERE d IN (0, 1)");
+        assertInvalidMessage("Undefined name d in where clause ('d > 0')", "SELECT * FROM %s WHERE d > 0 and d <= 2");
+        assertInvalidMessage("Undefined name d in where clause ('d CONTAINS 0')", "SELECT * FROM %s WHERE d CONTAINS 0");
+        assertInvalidMessage("Undefined name d in where clause ('d CONTAINS KEY 0')", "SELECT * FROM %s WHERE d CONTAINS KEY 0");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('d = 0')", "SELECT a AS d FROM %s WHERE d = 0");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('d IN [0, 1]')", "SELECT b AS d FROM %s WHERE d IN (0, 1)");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('d > 0')", "SELECT b AS d FROM %s WHERE d > 0 and d <= 2");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('d CONTAINS 0')", "SELECT c AS d FROM %s WHERE d CONTAINS 0");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('d CONTAINS KEY 0')", "SELECT c AS d FROM %s WHERE d CONTAINS KEY 0");
+        assertInvalidMessage("Undefined name d in selection clause", "SELECT d FROM %s WHERE a = 0");
     }
 }

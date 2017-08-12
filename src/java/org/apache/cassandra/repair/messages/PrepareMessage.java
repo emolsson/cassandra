@@ -40,14 +40,18 @@ public class PrepareMessage extends RepairMessage
 
     public final UUID parentRepairSession;
     public final boolean isIncremental;
+    public final long timestamp;
+    public final boolean isGlobal;
 
-    public PrepareMessage(UUID parentRepairSession, List<UUID> cfIds, Collection<Range<Token>> ranges, boolean isIncremental)
+    public PrepareMessage(UUID parentRepairSession, List<UUID> cfIds, Collection<Range<Token>> ranges, boolean isIncremental, long timestamp, boolean isGlobal)
     {
         super(Type.PREPARE_MESSAGE, null);
         this.parentRepairSession = parentRepairSession;
         this.cfIds = cfIds;
         this.ranges = ranges;
         this.isIncremental = isIncremental;
+        this.timestamp = timestamp;
+        this.isGlobal = isGlobal;
     }
 
     public static class PrepareMessageSerializer implements MessageSerializer<PrepareMessage>
@@ -65,6 +69,8 @@ public class PrepareMessage extends RepairMessage
                 Range.tokenSerializer.serialize(r, out, version);
             }
             out.writeBoolean(message.isIncremental);
+            out.writeLong(message.timestamp);
+            out.writeBoolean(message.isGlobal);
         }
 
         public PrepareMessage deserialize(DataInputPlus in, int version) throws IOException
@@ -79,7 +85,9 @@ public class PrepareMessage extends RepairMessage
             for (int i = 0; i < rangeCount; i++)
                 ranges.add((Range<Token>) Range.tokenSerializer.deserialize(in, MessagingService.globalPartitioner(), version));
             boolean isIncremental = in.readBoolean();
-            return new PrepareMessage(parentRepairSession, cfIds, ranges, isIncremental);
+            long timestamp = in.readLong();
+            boolean isGlobal = in.readBoolean();
+            return new PrepareMessage(parentRepairSession, cfIds, ranges, isIncremental, timestamp, isGlobal);
         }
 
         public long serializedSize(PrepareMessage message, int version)
@@ -93,6 +101,8 @@ public class PrepareMessage extends RepairMessage
             for (Range<Token> r : message.ranges)
                 size += Range.tokenSerializer.serializedSize(r, version);
             size += TypeSizes.sizeof(message.isIncremental);
+            size += TypeSizes.sizeof(message.timestamp);
+            size += TypeSizes.sizeof(message.isGlobal);
             return size;
         }
     }
@@ -105,6 +115,8 @@ public class PrepareMessage extends RepairMessage
                 ", ranges=" + ranges +
                 ", parentRepairSession=" + parentRepairSession +
                 ", isIncremental="+isIncremental +
+                ", timestamp=" + timestamp +
+                ", isGlobal=" + isGlobal +
                 '}';
     }
 }

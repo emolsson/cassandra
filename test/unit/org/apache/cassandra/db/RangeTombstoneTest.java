@@ -19,40 +19,34 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
-
-import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.Util;
 import org.apache.cassandra.UpdateBuilder;
+import org.apache.cassandra.Util;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
-import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.index.PerColumnSecondaryIndex;
-import org.apache.cassandra.db.index.SecondaryIndex;
-import org.apache.cassandra.db.index.SecondaryIndexSearcher;
-import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.StubIndex;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -69,7 +63,12 @@ public class RangeTombstoneTest
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KSNAME,
                                     KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KSNAME, CFNAME, 0, UTF8Type.instance, Int32Type.instance, Int32Type.instance));
+                                    SchemaLoader.standardCFMD(KSNAME,
+                                                              CFNAME,
+                                                              1,
+                                                              UTF8Type.instance,
+                                                              Int32Type.instance,
+                                                              Int32Type.instance));
     }
 
     @Test
@@ -113,17 +112,17 @@ public class RangeTombstoneTest
         int nowInSec = FBUtilities.nowInSeconds();
 
         for (int i : live)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
         for (int i : dead)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
 
         // Queries by slices
         partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).fromIncl(7).toIncl(30).build());
 
         for (int i : new int[]{ 7, 8, 9, 11, 13, 15, 17, 28, 29, 30 })
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
         for (int i : new int[]{ 10, 12, 14, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 })
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
     }
 
     @Test
@@ -145,7 +144,7 @@ public class RangeTombstoneTest
 
         new RowUpdateBuilder(cfs.metadata, 2, key).addRangeTombstone(15, 20).build().applyUnsafe();
 
-        ArrayBackedPartition partition;
+        ImmutableBTreePartition partition;
 
         partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).fromIncl(11).toIncl(14).build());
         Collection<RangeTombstone> rt = rangeTombstones(partition);
@@ -211,12 +210,12 @@ public class RangeTombstoneTest
         sb.add(Slice.Bound.create(cfs.getComparator(), true, true, 1), Slice.Bound.create(cfs.getComparator(), false, true, 10));
         sb.add(Slice.Bound.create(cfs.getComparator(), true, true, 16), Slice.Bound.create(cfs.getComparator(), false, true, 20));
 
-        partition = Util.getOnlyPartitionUnfiltered(SinglePartitionSliceCommand.create(cfs.metadata, FBUtilities.nowInSeconds(), Util.dk(key), sb.build()));
+        partition = Util.getOnlyPartitionUnfiltered(SinglePartitionReadCommand.create(cfs.metadata, FBUtilities.nowInSeconds(), Util.dk(key), sb.build()));
         rt = rangeTombstones(partition);
         assertEquals(2, rt.size());
     }
 
-    private Collection<RangeTombstone> rangeTombstones(ArrayBackedPartition partition)
+    private Collection<RangeTombstone> rangeTombstones(ImmutableBTreePartition partition)
     {
         List<RangeTombstone> tombstones = new ArrayList<RangeTombstone>();
         Iterators.addAll(tombstones, partition.deletionInfo().rangeIterator(false));
@@ -409,22 +408,22 @@ public class RangeTombstoneTest
         int nowInSec = FBUtilities.nowInSeconds();
 
         for (int i = 0; i < 5; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
         for (int i = 16; i < 20; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
         for (int i = 5; i <= 15; i++)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
 
         // Compact everything and re-test
         CompactionManager.instance.performMaximal(cfs, false);
         partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
 
         for (int i = 0; i < 5; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
         for (int i = 16; i < 20; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
+            assertTrue("Row " + i + " should be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
         for (int i = 5; i <= 15; i++)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live", partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec));
     }
 
     @Test
@@ -454,7 +453,55 @@ public class RangeTombstoneTest
     @Test
     public void testRowWithRangeTombstonesUpdatesSecondaryIndex() throws Exception
     {
-        runCompactionWithRangeTombstoneAndCheckSecondaryIndex();
+        Keyspace table = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = table.getColumnFamilyStore(CFNAME);
+        ByteBuffer key = ByteBufferUtil.bytes("k5");
+        ByteBuffer indexedColumnName = ByteBufferUtil.bytes("val");
+
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ColumnDefinition cd = cfs.metadata.getColumnDefinition(indexedColumnName).copy();
+        IndexMetadata indexDef =
+            IndexMetadata.fromIndexTargets(cfs.metadata,
+                                           Collections.singletonList(new IndexTarget(cd.name, IndexTarget.Type.VALUES)),
+                                           "test_index",
+                                           IndexMetadata.Kind.CUSTOM,
+                                           ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                           StubIndex.class.getName()));
+
+        if (!cfs.metadata.getIndexes().get("test_index").isPresent())
+            cfs.metadata.indexes(cfs.metadata.getIndexes().with(indexDef));
+
+        Future<?> rebuild = cfs.indexManager.addIndex(indexDef);
+        // If rebuild there is, wait for the rebuild to finish so it doesn't race with the following insertions
+        if (rebuild != null)
+            rebuild.get();
+
+        StubIndex index = (StubIndex)cfs.indexManager.listIndexes()
+                                                     .stream()
+                                                     .filter(i -> "test_index".equals(i.getIndexMetadata().name))
+                                                     .findFirst()
+                                                     .orElseThrow(() -> new RuntimeException(new AssertionError("Index not found")));
+        index.reset();
+
+        UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, key).withTimestamp(0);
+        for (int i = 0; i < 10; i++)
+            builder.newRow(i).add("val", i);
+        builder.applyUnsafe();
+        cfs.forceBlockingFlush();
+
+        new RowUpdateBuilder(cfs.metadata, 0, key).addRangeTombstone(0, 7).build().applyUnsafe();
+        cfs.forceBlockingFlush();
+
+        assertEquals(10, index.rowsInserted.size());
+
+        CompactionManager.instance.performMaximal(cfs, false);
+
+        // compacted down to single sstable
+        assertEquals(1, cfs.getLiveSSTables().size());
+
+        assertEquals(8, index.rowsDeleted.size());
     }
 
     @Test
@@ -467,7 +514,6 @@ public class RangeTombstoneTest
         // remove any existing sstables before starting
         cfs.truncateBlocking();
         cfs.disableAutoCompaction();
-        cfs.setCompactionStrategyClass(SizeTieredCompactionStrategy.class.getCanonicalName());
 
         UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, key).withTimestamp(0);
         for (int i = 0; i < 10; i += 2)
@@ -512,17 +558,26 @@ public class RangeTombstoneTest
 
         cfs.truncateBlocking();
         cfs.disableAutoCompaction();
-        cfs.setCompactionStrategyClass(SizeTieredCompactionStrategy.class.getCanonicalName());
 
         ColumnDefinition cd = cfs.metadata.getColumnDefinition(indexedColumnName).copy();
-        cd.setIndex("test_index", IndexType.CUSTOM, ImmutableMap.of(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, TestIndex.class.getName()));
-        Future<?> rebuild = cfs.indexManager.addIndexedColumn(cd);
+        IndexMetadata indexDef =
+            IndexMetadata.fromIndexTargets(cfs.metadata,
+                                           Collections.singletonList(new IndexTarget(cd.name, IndexTarget.Type.VALUES)),
+                                           "test_index",
+                                           IndexMetadata.Kind.CUSTOM,
+                                           ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                           StubIndex.class.getName()));
+
+        if (!cfs.metadata.getIndexes().get("test_index").isPresent())
+            cfs.metadata.indexes(cfs.metadata.getIndexes().with(indexDef));
+
+        Future<?> rebuild = cfs.indexManager.addIndex(indexDef);
         // If rebuild there is, wait for the rebuild to finish so it doesn't race with the following insertions
         if (rebuild != null)
             rebuild.get();
 
-        TestIndex index = ((TestIndex)cfs.indexManager.getIndexForColumn(cd));
-        index.resetCounts();
+        StubIndex index = (StubIndex)cfs.indexManager.getIndexByName("test_index");
+        index.reset();
 
         UpdateBuilder.create(cfs.metadata, key).withTimestamp(0).newRow(1).add("val", 1).applyUnsafe();
 
@@ -536,49 +591,8 @@ public class RangeTombstoneTest
 
         // We should have 1 insert and 1 update to the indexed "1" column
         // CASSANDRA-6640 changed index update to just update, not insert then delete
-        assertEquals(1, index.inserts.size());
-        assertEquals(1, index.updates.size());
-    }
-
-    private void runCompactionWithRangeTombstoneAndCheckSecondaryIndex() throws Exception
-    {
-        Keyspace table = Keyspace.open(KSNAME);
-        ColumnFamilyStore cfs = table.getColumnFamilyStore(CFNAME);
-        ByteBuffer key = ByteBufferUtil.bytes("k5");
-        ByteBuffer indexedColumnName = ByteBufferUtil.bytes("val");
-
-        cfs.truncateBlocking();
-        cfs.disableAutoCompaction();
-        cfs.setCompactionStrategyClass(SizeTieredCompactionStrategy.class.getCanonicalName());
-
-
-        ColumnDefinition cd = cfs.metadata.getColumnDefinition(indexedColumnName).copy();
-        cd.setIndex("test_index", IndexType.CUSTOM, ImmutableMap.of(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, TestIndex.class.getName()));
-        Future<?> rebuild = cfs.indexManager.addIndexedColumn(cd);
-        // If rebuild there is, wait for the rebuild to finish so it doesn't race with the following insertions
-        if (rebuild != null)
-            rebuild.get();
-
-        TestIndex index = ((TestIndex)cfs.indexManager.getIndexForColumn(cd));
-        index.resetCounts();
-
-        UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, key).withTimestamp(0);
-        for (int i = 0; i < 10; i++)
-            builder.newRow(i).add("val", i);
-        builder.applyUnsafe();
-        cfs.forceBlockingFlush();
-
-        new RowUpdateBuilder(cfs.metadata, 0, key).addRangeTombstone(0, 7).build().applyUnsafe();
-        cfs.forceBlockingFlush();
-
-        assertEquals(10, index.inserts.size());
-
-        CompactionManager.instance.performMaximal(cfs, false);
-
-        // compacted down to single sstable
-        assertEquals(1, cfs.getLiveSSTables().size());
-
-        assertEquals(8, index.deletes.size());
+        assertEquals(1, index.rowsInserted.size());
+        assertEquals(1, index.rowsUpdated.size());
     }
 
     private static ByteBuffer bb(int i)
@@ -589,69 +603,5 @@ public class RangeTombstoneTest
     private static int i(ByteBuffer bb)
     {
         return ByteBufferUtil.toInt(bb);
-    }
-
-    public static class TestIndex extends PerColumnSecondaryIndex
-    {
-        public List<Cell> inserts = new ArrayList<>();
-        public List<Cell> deletes = new ArrayList<>();
-        public List<Cell> updates = new ArrayList<>();
-
-        public void resetCounts()
-        {
-            inserts.clear();
-            deletes.clear();
-            updates.clear();
-        }
-
-        public void delete(ByteBuffer rowKey, Clustering clustering, Cell cell, OpOrder.Group opGroup, int nowInSec)
-        {
-            deletes.add(cell);
-        }
-
-        @Override
-        public void deleteForCleanup(ByteBuffer rowKey, Clustering clustering, Cell cell, OpOrder.Group opGroup, int nowInSec) {}
-
-        public void insert(ByteBuffer rowKey, Clustering clustering, Cell cell, OpOrder.Group opGroup)
-        {
-            inserts.add(cell);
-        }
-
-        public void update(ByteBuffer rowKey, Clustering clustering, Cell oldCell, Cell cell, OpOrder.Group opGroup, int nowInSec)
-        {
-            updates.add(cell);
-        }
-
-        public void init(){}
-
-        public void reload(){}
-
-        public void validateOptions() throws ConfigurationException{}
-
-        public String getIndexName(){ return "TestIndex";}
-
-        protected SecondaryIndexSearcher createSecondaryIndexSearcher(Set<ColumnDefinition> columns) { return null; };
-
-        public void forceBlockingFlush(){}
-
-        public ColumnFamilyStore getIndexCfs(){ return null; }
-
-        public void removeIndex(ByteBuffer columnName){}
-
-        public void invalidate(){}
-
-        public void validate(DecoratedKey key) {}
-        public void validate(ByteBuffer value, CellPath path) {}
-        public void validate(Clustering clustering) {}
-
-        public void truncateBlocking(long truncatedAt) { }
-
-        public boolean indexes(ColumnDefinition name) { return true; }
-
-        @Override
-        public long estimateResultRows()
-        {
-            return 0;
-        }
     }
 }

@@ -18,6 +18,7 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -31,7 +32,6 @@ import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.MapType;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.*;
 
 /**
@@ -80,7 +80,7 @@ public class RowUpdateBuilder
         assert staticBuilder == null : "Cannot update both static and non-static columns with the same RowUpdateBuilder object";
         assert regularBuilder == null : "Cannot add the clustering twice to the same row";
 
-        regularBuilder = BTreeBackedRow.unsortedBuilder(update.columns().regulars, FBUtilities.nowInSeconds());
+        regularBuilder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());
         regularBuilder.newRow(clustering);
 
         // If a CQL table, add the "row marker"
@@ -105,7 +105,7 @@ public class RowUpdateBuilder
         assert regularBuilder == null : "Cannot update both static and non-static columns with the same RowUpdateBuilder object";
         if (staticBuilder == null)
         {
-            staticBuilder = BTreeBackedRow.unsortedBuilder(update.columns().statics, FBUtilities.nowInSeconds());
+            staticBuilder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());
             staticBuilder.newRow(Clustering.STATIC_CLUSTERING);
         }
         return staticBuilder;
@@ -123,7 +123,7 @@ public class RowUpdateBuilder
 
     public RowUpdateBuilder(CFMetaData metadata, int localDeletionTime, long timestamp, Object partitionKey)
     {
-        this(metadata, localDeletionTime, timestamp, metadata.getDefaultTimeToLive(), partitionKey);
+        this(metadata, localDeletionTime, timestamp, metadata.params.defaultTimeToLive, partitionKey);
     }
 
     public RowUpdateBuilder(CFMetaData metadata, long timestamp, int ttl, Object partitionKey)
@@ -186,13 +186,13 @@ public class RowUpdateBuilder
         assert clusteringValues.length == update.metadata().comparator.size() || (clusteringValues.length == 0 && !update.columns().statics.isEmpty());
 
         boolean isStatic = clusteringValues.length != update.metadata().comparator.size();
-        Row.Builder builder = BTreeBackedRow.sortedBuilder(isStatic ? update.columns().statics : update.columns().regulars);
+        Row.Builder builder = BTreeRow.sortedBuilder();
 
         if (isStatic)
             builder.newRow(Clustering.STATIC_CLUSTERING);
         else
             builder.newRow(clusteringValues.length == 0 ? Clustering.EMPTY : update.metadata().comparator.make(clusteringValues));
-        builder.addRowDeletion(new DeletionTime(timestamp, localDeletionTime));
+        builder.addRowDeletion(Row.Deletion.regular(new DeletionTime(timestamp, localDeletionTime)));
 
         update.add(builder.build());
     }
@@ -331,11 +331,38 @@ public class RowUpdateBuilder
         return this;
     }
 
+    public RowUpdateBuilder frozenList(String columnName, List<?> list)
+    {
+        ColumnDefinition c = getDefinition(columnName);
+        assert c.isStatic() || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
+        assert c.type instanceof ListType && !c.type.isMultiCell() : "Column " + c + " is not a frozen list";
+        builder(c).addCell(makeCell(c, bb(((AbstractType)c.type).decompose(list), c.type), null));
+        return this;
+    }
+
+    public RowUpdateBuilder frozenSet(String columnName, Set<?> set)
+    {
+        ColumnDefinition c = getDefinition(columnName);
+        assert c.isStatic() || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
+        assert c.type instanceof SetType && !c.type.isMultiCell() : "Column " + c + " is not a frozen set";
+        builder(c).addCell(makeCell(c, bb(((AbstractType)c.type).decompose(set), c.type), null));
+        return this;
+    }
+
+    public RowUpdateBuilder frozenMap(String columnName, Map<?, ?> map)
+    {
+        ColumnDefinition c = getDefinition(columnName);
+        assert c.isStatic() || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
+        assert c.type instanceof MapType && !c.type.isMultiCell() : "Column " + c + " is not a frozen map";
+        builder(c).addCell(makeCell(c, bb(((AbstractType)c.type).decompose(map), c.type), null));
+        return this;
+    }
+
     public RowUpdateBuilder addMapEntry(String columnName, Object key, Object value)
     {
         ColumnDefinition c = getDefinition(columnName);
         assert c.isStatic() || update.metadata().comparator.size() == 0 || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
-        assert c.type instanceof MapType && c.type.isMultiCell();
+        assert c.type instanceof MapType && c.type.isMultiCell() : "Column " + c + " is not a non-frozen map";
         MapType mt = (MapType)c.type;
         builder(c).addCell(makeCell(c, bb(value, mt.getValuesType()), CellPath.create(bb(key, mt.getKeysType()))));
         return this;
@@ -345,7 +372,7 @@ public class RowUpdateBuilder
     {
         ColumnDefinition c = getDefinition(columnName);
         assert c.isStatic() || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
-        assert c.type instanceof ListType && c.type.isMultiCell();
+        assert c.type instanceof ListType && c.type.isMultiCell() : "Column " + c + " is not a non-frozen list";
         ListType lt = (ListType)c.type;
         builder(c).addCell(makeCell(c, bb(value, lt.getElementsType()), CellPath.create(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes()))));
         return this;
@@ -355,7 +382,7 @@ public class RowUpdateBuilder
     {
         ColumnDefinition c = getDefinition(columnName);
         assert c.isStatic() || regularBuilder != null : "Cannot set non static column " + c + " since no clustering has been provided";
-        assert c.type instanceof SetType && c.type.isMultiCell();
+        assert c.type instanceof SetType && c.type.isMultiCell() : "Column " + c + " is not a non-frozen set";
         SetType st = (SetType)c.type;
         builder(c).addCell(makeCell(c, ByteBufferUtil.EMPTY_BYTE_BUFFER, CellPath.create(bb(value, st.getElementsType()))));
         return this;

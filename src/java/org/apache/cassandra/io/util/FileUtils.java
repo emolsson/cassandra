@@ -21,12 +21,14 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
-import org.apache.cassandra.config.Config;
 import sun.nio.ch.DirectBuffer;
 
 import org.slf4j.Logger;
@@ -48,6 +50,8 @@ import static org.apache.cassandra.utils.Throwables.merge;
 
 public class FileUtils
 {
+    public static final Charset CHARSET = StandardCharsets.UTF_8;
+
     private static final Logger logger = LoggerFactory.getLogger(FileUtils.class);
     private static final double KB = 1024d;
     private static final double MB = 1024*1024d;
@@ -172,8 +176,8 @@ public class FileUtils
     public static void renameWithConfirm(File from, File to)
     {
         assert from.exists();
-        if (logger.isDebugEnabled())
-            logger.debug((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
+        if (logger.isTraceEnabled())
+            logger.trace((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
         // this is not FSWE because usually when we see it it's because we didn't close the file before renaming it,
         // and Windows is picky about that.
         try
@@ -200,7 +204,7 @@ public class FileUtils
         }
         catch (AtomicMoveNotSupportedException e)
         {
-            logger.debug("Could not do an atomic move", e);
+            logger.trace("Could not do an atomic move", e);
             Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
         }
 
@@ -318,16 +322,16 @@ public class FileUtils
     }
 
     /** Convert absolute path into a path relative to the base path */
-    public static String getRelativePath(String basePath, String absolutePath)
+    public static String getRelativePath(String basePath, String path)
     {
         try
         {
-            return Paths.get(basePath).relativize(Paths.get(absolutePath)).toString();
+            return Paths.get(basePath).relativize(Paths.get(path)).toString();
         }
         catch(Exception ex)
         {
             String absDataPath = FileUtils.getCanonicalPath(basePath);
-            return Paths.get(absDataPath).relativize(Paths.get(absolutePath)).toString();
+            return Paths.get(absDataPath).relativize(Paths.get(path)).toString();
         }
     }
 
@@ -338,6 +342,8 @@ public class FileUtils
 
     public static void clean(ByteBuffer buffer)
     {
+        if (buffer == null)
+            return;
         if (isCleanerAvailable() && buffer.isDirect())
         {
             DirectBuffer db = (DirectBuffer) buffer;
@@ -451,20 +457,8 @@ public class FileUtils
                 deleteRecursiveOnExit(new File(dir, child));
         }
 
-        logger.debug("Scheduling deferred deletion of file: " + dir);
+        logger.trace("Scheduling deferred deletion of file: " + dir);
         dir.deleteOnExit();
-    }
-
-    public static void skipBytesFully(DataInput in, int bytes) throws IOException
-    {
-        int n = 0;
-        while (n < bytes)
-        {
-            int skipped = in.skipBytes(bytes - n);
-            if (skipped == 0)
-                throw new EOFException("EOF after " + n + " bytes out of " + bytes);
-            n += skipped;
-        }
     }
 
     public static void handleCorruptSSTable(CorruptSSTableException e)
@@ -527,24 +521,33 @@ public class FileUtils
                 break;
         }
     }
+
     /**
      * Get the size of a directory in bytes
-     * @param directory The directory for which we need size.
+     * @param folder The directory for which we need size.
      * @return The size of the directory
      */
-    public static long folderSize(File directory)
+    public static long folderSize(File folder)
     {
-        long length = 0;
-        for (File file : directory.listFiles())
+        final long [] sizeArr = {0L};
+        try
         {
-            if (file.isFile())
-                length += file.length();
-            else
-                length += folderSize(file);
+            Files.walkFileTree(folder.toPath(), new SimpleFileVisitor<Path>()
+            {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                {
+                    sizeArr[0] += attrs.size();
+                    return FileVisitResult.CONTINUE;
+                }
+            });
         }
-        return length;
+        catch (IOException e)
+        {
+            logger.error("Error while getting {} folder size. {}", folder, e);
+        }
+        return sizeArr[0];
     }
-
 
     public static void copyTo(DataInput in, OutputStream out, int length) throws IOException
     {
@@ -584,24 +587,32 @@ public class FileUtils
     public static void append(File file, String ... lines)
     {
         if (file.exists())
-            write(file, StandardOpenOption.APPEND, lines);
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND);
         else
-            write(file, StandardOpenOption.CREATE, lines);
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE);
+    }
+
+    public static void appendAndSync(File file, String ... lines)
+    {
+        if (file.exists())
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND, StandardOpenOption.SYNC);
+        else
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE, StandardOpenOption.SYNC);
     }
 
     public static void replace(File file, String ... lines)
     {
-        write(file, StandardOpenOption.TRUNCATE_EXISTING, lines);
+        write(file, Arrays.asList(lines), StandardOpenOption.TRUNCATE_EXISTING);
     }
 
-    public static void write(File file, StandardOpenOption op, String ... lines)
+    public static void write(File file, List<String> lines, StandardOpenOption ... options)
     {
         try
         {
             Files.write(file.toPath(),
-                        Arrays.asList(lines),
-                        Charset.forName("utf-8"),
-                        op);
+                        lines,
+                        CHARSET,
+                        options);
         }
         catch (IOException ex)
         {
@@ -613,10 +624,13 @@ public class FileUtils
     {
         try
         {
-            return Files.readAllLines(file.toPath(), Charset.forName("utf-8"));
+            return Files.readAllLines(file.toPath(), CHARSET);
         }
         catch (IOException ex)
         {
+            if (ex instanceof NoSuchFileException)
+                return Collections.emptyList();
+
             throw new RuntimeException(ex);
         }
     }

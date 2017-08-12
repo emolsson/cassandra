@@ -17,17 +17,11 @@
  */
 package org.apache.cassandra.cql3.restrictions;
 
-import java.nio.ByteBuffer;
-
-import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.MultiCBuilder;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 
-import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
-import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
-import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import org.apache.cassandra.config.ColumnDefinition;
 
 /**
  * Base class for <code>Restriction</code>s
@@ -59,6 +53,12 @@ abstract class AbstractRestriction  implements Restriction
     }
 
     @Override
+    public boolean isLIKE()
+    {
+        return false;
+    }
+
+    @Override
     public boolean isIN()
     {
         return false;
@@ -66,6 +66,12 @@ abstract class AbstractRestriction  implements Restriction
 
     @Override
     public boolean isContains()
+    {
+        return false;
+    }
+
+    @Override
+    public boolean isNotNull()
     {
         return false;
     }
@@ -86,5 +92,17 @@ abstract class AbstractRestriction  implements Restriction
     public boolean isInclusive(Bound b)
     {
         return true;
+    }
+
+    /**
+     * Reverses the specified bound if the column type is a reversed one.
+     *
+     * @param columnDefinition the column definition
+     * @param bound the bound
+     * @return the bound reversed if the column type was a reversed one or the original bound
+     */
+    protected static Bound reverseBoundIfNeeded(ColumnDefinition columnDefinition, Bound bound)
+    {
+        return columnDefinition.isReversedType() ? bound.reverse() : bound;
     }
 }

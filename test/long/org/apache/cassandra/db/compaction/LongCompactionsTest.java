@@ -36,6 +36,7 @@ import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.SSTableUtils;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -49,13 +50,12 @@ public class LongCompactionsTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
-        Map<String, String> compactionOptions = new HashMap<>();
-        compactionOptions.put("tombstone_compaction_interval", "1");
+        Map<String, String> compactionOptions = Collections.singletonMap("tombstone_compaction_interval", "1");
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD)
-                                                .compactionStrategyOptions(compactionOptions));
+                                                .compaction(CompactionParams.scts(compactionOptions)));
     }
 
     @Before
@@ -114,20 +114,20 @@ public class LongCompactionsTest
                     builder.newRow(String.valueOf(i)).add("val", String.valueOf(i));
                 rows.put(key, builder.build());
             }
-            SSTableReader sstable = SSTableUtils.prepare().write(rows);
-            sstables.add(sstable);
-            store.addSSTable(sstable);
+            Collection<SSTableReader> readers = SSTableUtils.prepare().write(rows);
+            sstables.addAll(readers);
+            store.addSSTables(readers);
         }
 
         // give garbage collection a bit of time to catch up
         Thread.sleep(1000);
 
         long start = System.nanoTime();
-        final int gcBefore = (int) (System.currentTimeMillis() / 1000) - Schema.instance.getCFMetaData(KEYSPACE1, "Standard1").getGcGraceSeconds();
+        final int gcBefore = (int) (System.currentTimeMillis() / 1000) - Schema.instance.getCFMetaData(KEYSPACE1, "Standard1").params.gcGraceSeconds;
         try (LifecycleTransaction txn = store.getTracker().tryModify(sstables, OperationType.COMPACTION))
         {
             assert txn != null : "Cannot markCompacting all sstables";
-            new CompactionTask(store, txn, gcBefore, false).execute(null);
+            new CompactionTask(store, txn, gcBefore).execute(null);
         }
         System.out.println(String.format("%s: sstables=%d rowsper=%d colsper=%d: %d ms",
                                          this.getClass().getName(),
@@ -146,7 +146,7 @@ public class LongCompactionsTest
         cfs.clearUnsafe();
 
         final int ROWS_PER_SSTABLE = 10;
-        final int SSTABLES = cfs.metadata.getMinIndexInterval() * 3 / ROWS_PER_SSTABLE;
+        final int SSTABLES = cfs.metadata.params.minIndexInterval * 3 / ROWS_PER_SSTABLE;
 
         // disable compaction while flushing
         cfs.disableAutoCompaction();

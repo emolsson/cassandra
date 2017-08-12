@@ -21,7 +21,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.Iterator;
 import java.util.List;
-import java.util.UUID;
 
 import com.google.common.base.Objects;
 import io.netty.buffer.ByteBuf;
@@ -29,9 +28,9 @@ import io.netty.buffer.ByteBuf;
 public abstract class Event
 {
     public enum Type {
-        TOPOLOGY_CHANGE(Server.VERSION_1),
-        STATUS_CHANGE(Server.VERSION_1),
-        SCHEMA_CHANGE(Server.VERSION_1),
+        TOPOLOGY_CHANGE(Server.VERSION_3),
+        STATUS_CHANGE(Server.VERSION_3),
+        SCHEMA_CHANGE(Server.VERSION_3),
         TRACE_COMPLETE(Server.VERSION_4);
 
         public final int minimumVersion;
@@ -82,18 +81,32 @@ public abstract class Event
     protected abstract void serializeEvent(ByteBuf dest, int version);
     protected abstract int eventSerializedSize(int version);
 
-    public static class TopologyChange extends Event
+    public static abstract class NodeEvent extends Event
+    {
+        public final InetSocketAddress node;
+
+        public InetAddress nodeAddress()
+        {
+            return node.getAddress();
+        }
+
+        private NodeEvent(Type type, InetSocketAddress node)
+        {
+            super(type);
+            this.node = node;
+        }
+    }
+
+    public static class TopologyChange extends NodeEvent
     {
         public enum Change { NEW_NODE, REMOVED_NODE, MOVED_NODE }
 
         public final Change change;
-        public final InetSocketAddress node;
 
         private TopologyChange(Change change, InetSocketAddress node)
         {
-            super(Type.TOPOLOGY_CHANGE);
+            super(Type.TOPOLOGY_CHANGE, node);
             this.change = change;
-            this.node = node;
         }
 
         public static TopologyChange newNode(InetAddress host, int port)
@@ -154,18 +167,17 @@ public abstract class Event
         }
     }
 
-    public static class StatusChange extends Event
+
+    public static class StatusChange extends NodeEvent
     {
         public enum Status { UP, DOWN }
 
         public final Status status;
-        public final InetSocketAddress node;
 
         private StatusChange(Status status, InetSocketAddress node)
         {
-            super(Type.STATUS_CHANGE);
+            super(Type.STATUS_CHANGE, node);
             this.status = status;
-            this.node = node;
         }
 
         public static StatusChange nodeUp(InetAddress host, int port)

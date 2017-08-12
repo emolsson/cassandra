@@ -19,7 +19,6 @@ package org.apache.cassandra.io.sstable;
 
 import java.io.*;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -28,41 +27,15 @@ import org.apache.cassandra.io.ISerializer;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.*;
 
 /**
  * Provides helper to serialize, deserialize and use column indexes.
  */
-public class IndexHelper
+public final class IndexHelper
 {
-    public static void skipBloomFilter(DataInput in) throws IOException
+    private IndexHelper()
     {
-        int size = in.readInt();
-        FileUtils.skipBytesFully(in, size);
-    }
-
-    /**
-     * Skip the index
-     * @param in the data input from which the index should be skipped
-     * @throws IOException if an I/O error occurs.
-     */
-    public static void skipIndex(DataInput in) throws IOException
-    {
-        /* read only the column index list */
-        int columnIndexSize = in.readInt();
-        /* skip the column index data */
-        if (in instanceof FileDataInput)
-        {
-            FileUtils.skipBytesFully(in, columnIndexSize);
-        }
-        else
-        {
-            // skip bytes
-            byte[] skip = new byte[columnIndexSize];
-            in.readFully(skip);
-        }
     }
 
     /**
@@ -117,10 +90,10 @@ public class IndexHelper
     {
         private static final long EMPTY_SIZE = ObjectSizes.measure(new IndexInfo(null, null, 0, 0, null));
 
-        public final long width;
-        public final ClusteringPrefix lastName;
-        public final ClusteringPrefix firstName;
         public final long offset;
+        public final long width;
+        public final ClusteringPrefix firstName;
+        public final ClusteringPrefix lastName;
 
         // If at the end of the index block there is an open range tombstone marker, this marker
         // deletion infos. null otherwise.
@@ -141,60 +114,69 @@ public class IndexHelper
 
         public static class Serializer
         {
-            private final CFMetaData metadata;
+            // This is the default index size that we use to delta-encode width when serializing so we get better vint-encoding.
+            // This is imperfect as user can change the index size and ideally we would save the index size used with each index file
+            // to use as base. However, that's a bit more involved a change that we want for now and very seldom do use change the index
+            // size so using the default is almost surely better than using no base at all.
+            public static final long WIDTH_BASE = 64 * 1024;
+
+            private final ISerializer<ClusteringPrefix> clusteringSerializer;
             private final Version version;
 
-            public Serializer(CFMetaData metadata, Version version)
+            public Serializer(CFMetaData metadata, Version version, SerializationHeader header)
             {
-                this.metadata = metadata;
+                this.clusteringSerializer = metadata.serializers().indexEntryClusteringPrefixSerializer(version, header);
                 this.version = version;
             }
 
-            public void serialize(IndexInfo info, DataOutputPlus out, SerializationHeader header) throws IOException
+            public void serialize(IndexInfo info, DataOutputPlus out) throws IOException
             {
-                ISerializer<ClusteringPrefix> clusteringSerializer = metadata.serializers().clusteringPrefixSerializer(version, header);
+                assert version.storeRows() : "We read old index files but we should never write them";
+
                 clusteringSerializer.serialize(info.firstName, out);
                 clusteringSerializer.serialize(info.lastName, out);
-                out.writeLong(info.offset);
-                out.writeLong(info.width);
+                out.writeUnsignedVInt(info.offset);
+                out.writeVInt(info.width - WIDTH_BASE);
 
-                if (version.storeRows())
-                {
-                    out.writeBoolean(info.endOpenMarker != null);
-                    if (info.endOpenMarker != null)
-                        DeletionTime.serializer.serialize(info.endOpenMarker, out);
-                }
+                out.writeBoolean(info.endOpenMarker != null);
+                if (info.endOpenMarker != null)
+                    DeletionTime.serializer.serialize(info.endOpenMarker, out);
             }
 
-            public IndexInfo deserialize(DataInputPlus in, SerializationHeader header) throws IOException
+            public IndexInfo deserialize(DataInputPlus in) throws IOException
             {
-                ISerializer<ClusteringPrefix> clusteringSerializer = metadata.serializers().clusteringPrefixSerializer(version, header);
-
                 ClusteringPrefix firstName = clusteringSerializer.deserialize(in);
                 ClusteringPrefix lastName = clusteringSerializer.deserialize(in);
-                long offset = in.readLong();
-                long width = in.readLong();
-                DeletionTime endOpenMarker = version.storeRows() && in.readBoolean()
-                                           ? DeletionTime.serializer.deserialize(in)
-                                           : null;
-
+                long offset;
+                long width;
+                DeletionTime endOpenMarker = null;
+                if (version.storeRows())
+                {
+                    offset = in.readUnsignedVInt();
+                    width = in.readVInt() + WIDTH_BASE;
+                    if (in.readBoolean())
+                        endOpenMarker = DeletionTime.serializer.deserialize(in);
+                }
+                else
+                {
+                    offset = in.readLong();
+                    width = in.readLong();
+                }
                 return new IndexInfo(firstName, lastName, offset, width, endOpenMarker);
             }
 
-            public long serializedSize(IndexInfo info, SerializationHeader header)
+            public long serializedSize(IndexInfo info)
             {
-                ISerializer<ClusteringPrefix> clusteringSerializer = metadata.serializers().clusteringPrefixSerializer(version, header);
+                assert version.storeRows() : "We read old index files but we should never write them";
+
                 long size = clusteringSerializer.serializedSize(info.firstName)
                           + clusteringSerializer.serializedSize(info.lastName)
-                          + TypeSizes.sizeof(info.offset)
-                          + TypeSizes.sizeof(info.width);
+                          + TypeSizes.sizeofUnsignedVInt(info.offset)
+                          + TypeSizes.sizeofVInt(info.width - WIDTH_BASE)
+                          + TypeSizes.sizeof(info.endOpenMarker != null);
 
-                if (version.storeRows())
-                {
-                    size += TypeSizes.sizeof(info.endOpenMarker != null);
-                    if (info.endOpenMarker != null)
-                        size += DeletionTime.serializer.serializedSize(info.endOpenMarker);
-                }
+                if (info.endOpenMarker != null)
+                    size += DeletionTime.serializer.serializedSize(info.endOpenMarker);
                 return size;
             }
         }

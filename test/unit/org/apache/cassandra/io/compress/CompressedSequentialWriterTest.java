@@ -31,6 +31,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import junit.framework.Assert;
+
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -40,10 +41,12 @@ import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.FileMark;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.SequentialWriterTest;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ChecksumType;
 
 public class CompressedSequentialWriterTest extends SequentialWriterTest
 {
-    private CompressionParameters compressionParameters;
+    private CompressionParams compressionParameters;
 
     private void runTests(String testName) throws IOException
     {
@@ -51,30 +54,30 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         testWrite(File.createTempFile(testName + "_small", "1"), 25);
 
         // Test to confirm pipeline w/chunk-aligned data writes works
-        testWrite(File.createTempFile(testName + "_chunkAligned", "1"), CompressionParameters.DEFAULT_CHUNK_LENGTH);
+        testWrite(File.createTempFile(testName + "_chunkAligned", "1"), CompressionParams.DEFAULT_CHUNK_LENGTH);
 
         // Test to confirm pipeline on non-chunk boundaries works
-        testWrite(File.createTempFile(testName + "_large", "1"), CompressionParameters.DEFAULT_CHUNK_LENGTH * 3 + 100);
+        testWrite(File.createTempFile(testName + "_large", "1"), CompressionParams.DEFAULT_CHUNK_LENGTH * 3 + 100);
     }
 
     @Test
     public void testLZ4Writer() throws IOException
     {
-        compressionParameters = CompressionParameters.lz4();
+        compressionParameters = CompressionParams.lz4();
         runTests("LZ4");
     }
 
     @Test
     public void testDeflateWriter() throws IOException
     {
-        compressionParameters = CompressionParameters.deflate();
+        compressionParameters = CompressionParams.deflate();
         runTests("Deflate");
     }
 
     @Test
     public void testSnappyWriter() throws IOException
     {
-        compressionParameters = CompressionParameters.snappy();
+        compressionParameters = CompressionParams.snappy();
         runTests("Snappy");
     }
 
@@ -91,7 +94,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
             byte[] rawPost = new byte[bytesToTest];
             try (CompressedSequentialWriter writer = new CompressedSequentialWriter(f, filename + ".metadata", compressionParameters, sstableMetadataCollector);)
             {
-                Random r = new Random();
+                Random r = new Random(42);
 
                 // Test both write with byte[] and ByteBuffer
                 r.nextBytes(dataPre);
@@ -104,7 +107,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
                 FileMark mark = writer.mark();
 
                 // Write enough garbage to transition chunk
-                for (int i = 0; i < CompressionParameters.DEFAULT_CHUNK_LENGTH; i++)
+                for (int i = 0; i < CompressionParams.DEFAULT_CHUNK_LENGTH; i++)
                 {
                     writer.write((byte)i);
                 }
@@ -114,7 +117,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
             }
 
             assert f.exists();
-            RandomAccessReader reader = CompressedRandomAccessReader.open(channel, new CompressionMetadata(filename + ".metadata", f.length()));
+            RandomAccessReader reader = new CompressedRandomAccessReader.Builder(channel, new CompressionMetadata(filename + ".metadata", f.length(), ChecksumType.CRC32)).build();
             assertEquals(dataPre.length + rawPost.length, reader.length());
             byte[] result = new byte[(int)reader.length()];
 
@@ -177,7 +180,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         {
             this(file, offsetsFile, new CompressedSequentialWriter(file,
                                                                    offsetsFile.getPath(),
-                                                                   CompressionParameters.lz4(BUFFER_SIZE),
+                                                                   CompressionParams.lz4(BUFFER_SIZE),
                                                                    new MetadataCollector(new ClusteringComparator(UTF8Type.instance))));
         }
 
@@ -219,7 +222,6 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         protected void assertAborted() throws Exception
         {
             super.assertAborted();
-            Assert.assertFalse(offsetsFile.exists());
         }
 
         void cleanup()

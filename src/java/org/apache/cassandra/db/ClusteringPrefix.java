@@ -74,7 +74,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
          */
         public final int comparedToClustering;
 
-        private Kind(int comparison, int comparedToClustering)
+        Kind(int comparison, int comparedToClustering)
         {
             this.comparison = comparison;
             this.comparedToClustering = comparedToClustering;
@@ -259,7 +259,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             }
             else
             {
-                Slice.Bound.serializer.serialize((Slice.Bound)clustering, out, version, types);
+                RangeTombstone.Bound.serializer.serialize((RangeTombstone.Bound)clustering, out, version, types);
             }
         }
 
@@ -271,7 +271,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             if (kind == Kind.CLUSTERING)
                 return Clustering.serializer.deserialize(in, version, types);
             else
-                return Slice.Bound.serializer.deserializeValues(in, kind, version, types);
+                return RangeTombstone.Bound.serializer.deserializeValues(in, kind, version, types);
         }
 
         public long serializedSize(ClusteringPrefix clustering, int version, List<AbstractType<?>> types)
@@ -281,7 +281,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             if (clustering.kind() == Kind.CLUSTERING)
                 return 1 + Clustering.serializer.serializedSize((Clustering)clustering, version, types);
             else
-                return Slice.Bound.serializer.serializedSize((Slice.Bound)clustering, version, types);
+                return RangeTombstone.Bound.serializer.serializedSize((RangeTombstone.Bound)clustering, version, types);
         }
 
         void serializeValuesWithoutSize(ClusteringPrefix clustering, DataOutputPlus out, int version, List<AbstractType<?>> types) throws IOException
@@ -416,9 +416,9 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             this.serializationHeader = header;
         }
 
-        public void prepare(int flags) throws IOException
+        public void prepare(int flags, int extendedFlags) throws IOException
         {
-            assert !UnfilteredSerializer.isStatic(flags) : "Flags = " + flags;
+            assert !UnfilteredSerializer.isStatic(extendedFlags) : "Flags = " + flags;
             this.nextIsRow = UnfilteredSerializer.kind(flags) == Unfiltered.Kind.ROW;
             this.nextKind = nextIsRow ? Kind.CLUSTERING : ClusteringPrefix.Kind.values()[in.readByte()];
             this.nextSize = nextIsRow ? comparator.size() : in.readUnsignedShort();
@@ -500,7 +500,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
         {
             assert nextIsRow;
             deserializeAll();
-            Clustering clustering = new Clustering(nextValues);
+            Clustering clustering = Clustering.make(nextValues);
             nextValues = null;
             return clustering;
         }

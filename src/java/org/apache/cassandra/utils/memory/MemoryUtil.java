@@ -31,7 +31,7 @@ public abstract class MemoryUtil
     private static final long UNSAFE_COPY_THRESHOLD = 1024 * 1024L; // copied from java.nio.Bits
 
     private static final Unsafe unsafe;
-    private static final Class<?> DIRECT_BYTE_BUFFER_CLASS;
+    private static final Class<?> DIRECT_BYTE_BUFFER_CLASS, RO_DIRECT_BYTE_BUFFER_CLASS;
     private static final long DIRECT_BYTE_BUFFER_ADDRESS_OFFSET;
     private static final long DIRECT_BYTE_BUFFER_CAPACITY_OFFSET;
     private static final long DIRECT_BYTE_BUFFER_LIMIT_OFFSET;
@@ -65,6 +65,7 @@ public abstract class MemoryUtil
             DIRECT_BYTE_BUFFER_POSITION_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("position"));
             DIRECT_BYTE_BUFFER_ATTACHMENT_OFFSET = unsafe.objectFieldOffset(clazz.getDeclaredField("att"));
             DIRECT_BYTE_BUFFER_CLASS = clazz;
+            RO_DIRECT_BYTE_BUFFER_CLASS = ByteBuffer.allocateDirect(0).asReadOnlyBuffer().getClass();
 
             clazz = ByteBuffer.allocate(0).getClass();
             BYTE_BUFFER_OFFSET_OFFSET = unsafe.objectFieldOffset(ByteBuffer.class.getDeclaredField("offset"));
@@ -105,6 +106,11 @@ public abstract class MemoryUtil
         unsafe.putByte(address, b);
     }
 
+    public static void setByte(long address, int count, byte b)
+    {
+        unsafe.setMemory(address, count, b);
+    }
+
     public static void setShort(long address, short s)
     {
         unsafe.putShort(address, s);
@@ -133,7 +139,7 @@ public abstract class MemoryUtil
 
     public static int getShort(long address)
     {
-        return UNALIGNED ? unsafe.getShort(address) : getShortByByte(address);
+        return UNALIGNED ? unsafe.getShort(address) & 0xffff : getShortByByte(address);
     }
 
     public static int getInt(long address)
@@ -148,12 +154,22 @@ public abstract class MemoryUtil
 
     public static ByteBuffer getByteBuffer(long address, int length)
     {
-        ByteBuffer instance = getHollowDirectByteBuffer();
+        return getByteBuffer(address, length, ByteOrder.nativeOrder());
+    }
+
+    public static ByteBuffer getByteBuffer(long address, int length, ByteOrder order)
+    {
+        ByteBuffer instance = getHollowDirectByteBuffer(order);
         setByteBuffer(instance, address, length);
         return instance;
     }
 
     public static ByteBuffer getHollowDirectByteBuffer()
+    {
+        return getHollowDirectByteBuffer(ByteOrder.nativeOrder());
+    }
+
+    public static ByteBuffer getHollowDirectByteBuffer(ByteOrder order)
     {
         ByteBuffer instance;
         try
@@ -164,7 +180,7 @@ public abstract class MemoryUtil
         {
             throw new AssertionError(e);
         }
-        instance.order(ByteOrder.nativeOrder());
+        instance.order(order);
         return instance;
     }
 
@@ -204,7 +220,7 @@ public abstract class MemoryUtil
 
     public static ByteBuffer duplicateDirectByteBuffer(ByteBuffer source, ByteBuffer hollowBuffer)
     {
-        assert source.getClass() == DIRECT_BYTE_BUFFER_CLASS;
+        assert source.getClass() == DIRECT_BYTE_BUFFER_CLASS || source.getClass() == RO_DIRECT_BYTE_BUFFER_CLASS;
         unsafe.putLong(hollowBuffer, DIRECT_BYTE_BUFFER_ADDRESS_OFFSET, unsafe.getLong(source, DIRECT_BYTE_BUFFER_ADDRESS_OFFSET));
         unsafe.putInt(hollowBuffer, DIRECT_BYTE_BUFFER_POSITION_OFFSET, unsafe.getInt(source, DIRECT_BYTE_BUFFER_POSITION_OFFSET));
         unsafe.putInt(hollowBuffer, DIRECT_BYTE_BUFFER_LIMIT_OFFSET, unsafe.getInt(source, DIRECT_BYTE_BUFFER_LIMIT_OFFSET));

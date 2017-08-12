@@ -21,6 +21,7 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.schema.SchemaKeyspace;
 
@@ -112,12 +113,12 @@ public class AlterTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
 
         alterTable("ALTER TABLE %s WITH min_index_interval=256 AND max_index_interval=512");
-        assertEquals(256, cfs.metadata.getMinIndexInterval());
-        assertEquals(512, cfs.metadata.getMaxIndexInterval());
+        assertEquals(256, cfs.metadata.params.minIndexInterval);
+        assertEquals(512, cfs.metadata.params.maxIndexInterval);
 
-        alterTable("ALTER TABLE %s WITH caching = 'none'");
-        assertEquals(256, cfs.metadata.getMinIndexInterval());
-        assertEquals(512, cfs.metadata.getMaxIndexInterval());
+        alterTable("ALTER TABLE %s WITH caching = {}");
+        assertEquals(256, cfs.metadata.params.minIndexInterval);
+        assertEquals(512, cfs.metadata.params.maxIndexInterval);
     }
 
     /**
@@ -153,7 +154,9 @@ public class AlterTest extends CQLTester
 
         execute("CREATE TABLE cf1 (a int PRIMARY KEY, b int) WITH compaction = { 'class' : 'SizeTieredCompactionStrategy', 'min_threshold' : 7 }");
         assertRows(execute("SELECT table_name, compaction FROM system_schema.tables WHERE keyspace_name='ks1'"),
-                   row("cf1", map("class", "org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy", "min_threshold", "7")));
+                   row("cf1", map("class", "org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy",
+                                  "min_threshold", "7",
+                                  "max_threshold", "32")));
 
         // clean-up
         execute("DROP KEYSPACE ks1");
@@ -271,6 +274,37 @@ public class AlterTest extends CQLTester
                                            "ALTER TABLE %s WITH compression = { 'class' : 'SnappyCompressor', 'chunk_length_kb' : 32 , 'chunk_length_in_kb' : 32 };");
     }
 
+    @Test
+    public void testAlterType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, content text);");
+        alterTable("ALTER TABLE %s ALTER content TYPE blob");
+
+        createTable("CREATE TABLE %s (pk int, ck text, value blob, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)");
+        alterTable("ALTER TABLE %s ALTER ck TYPE blob");
+
+        createTable("CREATE TABLE %s (pk int, ck int, value blob, PRIMARY KEY (pk, ck))");
+        assertThrowsConfigurationException("Cannot change value from type blob to type text: types are incompatible.",
+                                           "ALTER TABLE %s ALTER value TYPE TEXT;");
+    }
+
+    /**
+     * tests CASSANDRA-10027
+     */
+    @Test
+    public void testAlterColumnTypeToDate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int PRIMARY KEY, c1 int);");
+        execute("INSERT INTO %s (key, c1) VALUES (1,1);");
+        execute("ALTER TABLE %s ALTER c1 TYPE date;");
+        assertRows(execute("SELECT * FROM %s"), row(1, 1));
+
+        createTable("CREATE TABLE %s (key int PRIMARY KEY, c1 varint);");
+        execute("INSERT INTO %s (key, c1) VALUES (1,1);");
+        assertInvalidMessage("Cannot change c1 from type varint to type date: types are incompatible.",
+                             "ALTER TABLE %s ALTER c1 TYPE date;");
+    }
+
     private void assertThrowsConfigurationException(String errorMsg, String alterStmt) throws Throwable
     {
         try
@@ -282,5 +316,12 @@ public class AlterTest extends CQLTester
         {
             assertEquals(errorMsg, e.getMessage());
         }
+    }
+
+    @Test // tests CASSANDRA-8879
+    public void testAlterClusteringColumnTypeInCompactTable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key blob, column1 blob, value blob, PRIMARY KEY ((key), column1)) WITH COMPACT STORAGE");
+        assertInvalidThrow(InvalidRequestException.class, "ALTER TABLE %s ALTER column1 TYPE ascii");
     }
 }

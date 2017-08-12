@@ -18,27 +18,47 @@
 package org.apache.cassandra.schema;
 
 import java.nio.ByteBuffer;
-import java.util.Iterator;
-import java.util.Optional;
+import java.util.*;
 
 import javax.annotation.Nullable;
 
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.MapDifference;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static java.lang.String.format;
 import static com.google.common.collect.Iterables.filter;
+import static java.util.stream.Collectors.toList;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 /**
  * An immutable container for a keyspace's UDTs.
  */
 public final class Types implements Iterable<UserType>
 {
-    private final ImmutableMap<ByteBuffer, UserType> types;
+    private static final Types NONE = new Types(ImmutableMap.of());
+
+    private final Map<ByteBuffer, UserType> types;
 
     private Types(Builder builder)
     {
         types = builder.types.build();
+    }
+
+    /*
+     * For use in RawBuilder::build only.
+     */
+    private Types(Map<ByteBuffer, UserType> types)
+    {
+        this.types = types;
     }
 
     public static Builder builder()
@@ -46,9 +66,14 @@ public final class Types implements Iterable<UserType>
         return new Builder();
     }
 
+    public static RawBuilder rawBuilder(String keyspace)
+    {
+        return new RawBuilder(keyspace);
+    }
+
     public static Types none()
     {
-        return builder().build();
+        return NONE;
     }
 
     public static Types of(UserType... types)
@@ -90,7 +115,7 @@ public final class Types implements Iterable<UserType>
     public Types with(UserType type)
     {
         if (get(type.name).isPresent())
-            throw new IllegalStateException(String.format("Type %s already exists", type.name));
+            throw new IllegalStateException(format("Type %s already exists", type.name));
 
         return builder().add(this).add(type).build();
     }
@@ -101,9 +126,14 @@ public final class Types implements Iterable<UserType>
     public Types without(ByteBuffer name)
     {
         UserType type =
-            get(name).orElseThrow(() -> new IllegalStateException(String.format("Type %s doesn't exists", name)));
+            get(name).orElseThrow(() -> new IllegalStateException(format("Type %s doesn't exists", name)));
 
         return builder().add(filter(this, t -> t != type)).build();
+    }
+
+    MapDifference<ByteBuffer, UserType> diff(Types other)
+    {
+        return Maps.difference(types, other.types);
     }
 
     @Override
@@ -126,7 +156,7 @@ public final class Types implements Iterable<UserType>
 
     public static final class Builder
     {
-        final ImmutableMap.Builder<ByteBuffer, UserType> types = new ImmutableMap.Builder<>();
+        final ImmutableMap.Builder<ByteBuffer, UserType> types = ImmutableMap.builder();
 
         private Builder()
         {
@@ -154,6 +184,129 @@ public final class Types implements Iterable<UserType>
         {
             types.forEach(this::add);
             return this;
+        }
+    }
+
+    public static final class RawBuilder
+    {
+        final String keyspace;
+        final List<RawUDT> definitions;
+
+        private RawBuilder(String keyspace)
+        {
+            this.keyspace = keyspace;
+            this.definitions = new ArrayList<>();
+        }
+
+        /**
+         * Build a Types instance from Raw definitions.
+         *
+         * Constructs a DAG of graph dependencies and resolves them 1 by 1 in topological order.
+         */
+        public Types build()
+        {
+            if (definitions.isEmpty())
+                return Types.none();
+
+            /*
+             * build a DAG of UDT dependencies
+             */
+            Map<RawUDT, Integer> vertices = new HashMap<>(); // map values are numbers of referenced types
+            for (RawUDT udt : definitions)
+                vertices.put(udt, 0);
+
+            Multimap<RawUDT, RawUDT> adjacencyList = HashMultimap.create();
+            for (RawUDT udt1 : definitions)
+                for (RawUDT udt2 : definitions)
+                    if (udt1 != udt2 && udt1.referencesUserType(udt2))
+                        adjacencyList.put(udt2, udt1);
+
+            /*
+             * resolve dependencies in topological order, using Kahn's algorithm
+             */
+            adjacencyList.values().forEach(vertex -> vertices.put(vertex, vertices.get(vertex) + 1));
+
+            Queue<RawUDT> resolvableTypes = new LinkedList<>(); // UDTs with 0 dependencies
+            for (Map.Entry<RawUDT, Integer> entry : vertices.entrySet())
+                if (entry.getValue() == 0)
+                    resolvableTypes.add(entry.getKey());
+
+            Types types = new Types(new HashMap<>());
+            while (!resolvableTypes.isEmpty())
+            {
+                RawUDT vertex = resolvableTypes.remove();
+
+                for (RawUDT dependentType : adjacencyList.get(vertex))
+                    if (vertices.replace(dependentType, vertices.get(dependentType) - 1) == 1)
+                        resolvableTypes.add(dependentType);
+
+                UserType udt = vertex.prepare(keyspace, types);
+                types.types.put(udt.name, udt);
+            }
+
+            if (types.types.size() != definitions.size())
+                throw new ConfigurationException(format("Cannot resolve UDTs for keyspace %s: some types are missing", keyspace));
+
+            /*
+             * return an immutable copy
+             */
+            return Types.builder().add(types).build();
+        }
+
+        public void add(String name, List<String> fieldNames, List<String> fieldTypes)
+        {
+            List<CQL3Type.Raw> rawFieldTypes =
+                fieldTypes.stream()
+                          .map(CQLTypeParser::parseRaw)
+                          .collect(toList());
+
+            definitions.add(new RawUDT(name, fieldNames, rawFieldTypes));
+        }
+
+        private static final class RawUDT
+        {
+            final String name;
+            final List<String> fieldNames;
+            final List<CQL3Type.Raw> fieldTypes;
+
+            RawUDT(String name, List<String> fieldNames, List<CQL3Type.Raw> fieldTypes)
+            {
+                this.name = name;
+                this.fieldNames = fieldNames;
+                this.fieldTypes = fieldTypes;
+            }
+
+            boolean referencesUserType(RawUDT other)
+            {
+                return fieldTypes.stream().anyMatch(t -> t.referencesUserType(other.name));
+            }
+
+            UserType prepare(String keyspace, Types types)
+            {
+                List<ByteBuffer> preparedFieldNames =
+                    fieldNames.stream()
+                              .map(ByteBufferUtil::bytes)
+                              .collect(toList());
+
+                List<AbstractType<?>> preparedFieldTypes =
+                    fieldTypes.stream()
+                              .map(t -> t.prepareInternal(keyspace, types).getType())
+                              .collect(toList());
+
+                return new UserType(keyspace, bytes(name), preparedFieldNames, preparedFieldTypes);
+            }
+
+            @Override
+            public int hashCode()
+            {
+                return name.hashCode();
+            }
+
+            @Override
+            public boolean equals(Object other)
+            {
+                return name.equals(((RawUDT) other).name);
+            }
         }
     }
 }

@@ -18,12 +18,8 @@
 package org.apache.cassandra.db.columniterator;
 
 import java.io.IOException;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
@@ -36,7 +32,7 @@ import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileMark;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
+abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 {
     protected final SSTableReader sstable;
     protected final DecoratedKey key;
@@ -51,18 +47,23 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
 
     private boolean isClosed;
 
+    protected final Slices slices;
+    protected int slice;
+
     @SuppressWarnings("resource") // We need this because the analysis is not able to determine that we do close
                                   // file on every path where we created it.
     protected AbstractSSTableIterator(SSTableReader sstable,
                                       FileDataInput file,
                                       DecoratedKey key,
                                       RowIndexEntry indexEntry,
+                                      Slices slices,
                                       ColumnFilter columnFilter,
                                       boolean isForThrift)
     {
         this.sstable = sstable;
         this.key = key;
         this.columns = columnFilter;
+        this.slices = slices;
         this.helper = new SerializationHelper(sstable.metadata, sstable.descriptor.version.correspondingMessagingVersion(), SerializationHelper.Flag.LOCAL, columnFilter);
         this.isForThrift = isForThrift;
 
@@ -102,15 +103,18 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
 
                     // Note that this needs to be called after file != null and after the partitionDeletion has been set, but before readStaticRow
                     // (since it uses it) so we can't move that up (but we'll be able to simplify as soon as we drop support for the old file format).
-                    this.reader = needsReader ? createReader(indexEntry, file, true, shouldCloseFile) : null;
+                    this.reader = needsReader ? createReader(indexEntry, file, shouldCloseFile) : null;
                     this.staticRow = readStaticRow(sstable, file, helper, columns.fetchedColumns().statics, isForThrift, reader == null ? null : reader.deserializer);
                 }
                 else
                 {
                     this.partitionLevelDeletion = indexEntry.deletionTime();
                     this.staticRow = Rows.EMPTY_STATIC_ROW;
-                    this.reader = needsReader ? createReader(indexEntry, file, false, shouldCloseFile) : null;
+                    this.reader = needsReader ? createReader(indexEntry, file, shouldCloseFile) : null;
                 }
+
+                if (reader != null && slices.size() > 0)
+                    reader.setForSlice(slices.get(0));
 
                 if (reader == null && file != null && shouldCloseFile)
                     file.close();
@@ -183,7 +187,7 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
         }
     }
 
-    protected abstract Reader createReader(RowIndexEntry indexEntry, FileDataInput file, boolean isAtPartitionStart, boolean shouldCloseFile);
+    protected abstract Reader createReader(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile);
 
     public CFMetaData metadata()
     {
@@ -212,14 +216,24 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
 
     public EncodingStats stats()
     {
-        // We could return sstable.header.stats(), but this may not be as accurate than the actual sstable stats (see
-        // SerializationHeader.make() for details) so we use the latter instead.
-        return new EncodingStats(sstable.getMinTimestamp(), sstable.getMinLocalDeletionTime(), sstable.getMinTTL(), sstable.getAvgColumnSetPerRow());
+        return sstable.stats();
     }
 
     public boolean hasNext()
     {
-        return reader != null && reader.hasNext();
+        while (true)
+        {
+            if (reader == null)
+                return false;
+
+            if (reader.hasNext())
+                return true;
+
+            if (++slice >= slices.size())
+                return false;
+
+            slice(slices.get(slice));
+        }
     }
 
     public Unfiltered next()
@@ -228,15 +242,12 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
         return reader.next();
     }
 
-    public Iterator<Unfiltered> slice(Slice slice)
+    private void slice(Slice slice)
     {
         try
         {
-            if (reader == null)
-                return Collections.emptyIterator();
-
-            reader.setForSlice(slice);
-            return reader;
+            if (reader != null)
+                reader.setForSlice(slice);
         }
         catch (IOException e)
         {
@@ -294,19 +305,13 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
         // Records the currently open range tombstone (if any)
         protected DeletionTime openMarker = null;
 
-        // !isInit means we have never seeked in the file and thus should seek before reading anything
-        protected boolean isInit;
-
-        protected Reader(FileDataInput file, boolean isInit, boolean shouldCloseFile)
+        protected Reader(FileDataInput file, boolean shouldCloseFile)
         {
             this.file = file;
-            this.isInit = isInit;
             this.shouldCloseFile = shouldCloseFile;
 
             if (file != null)
                 createDeserializer();
-            else
-                assert !isInit;
         }
 
         private void createDeserializer()
@@ -326,7 +331,6 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
             else
             {
                 file.seek(position);
-                deserializer.clearState();
             }
         }
 
@@ -347,12 +351,6 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
         {
             try
             {
-                if (!isInit)
-                {
-                    init();
-                    isInit = true;
-                }
-
                 return hasNextInternal();
             }
             catch (IOException e)
@@ -390,9 +388,6 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
                 throw new CorruptSSTableException(e, reader.file.getPath());
             }
         }
-
-        // Called is hasNext() is called but we haven't been yet initialized
-        protected abstract void init() throws IOException;
 
         // Set the reader so its hasNext/next methods return values within the provided slice
         public abstract void setForSlice(Slice slice) throws IOException;
@@ -441,11 +436,19 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
         public void setToBlock(int blockIdx) throws IOException
         {
             if (blockIdx >= 0 && blockIdx < indexes.size())
-                reader.seekToPosition(indexEntry.position + indexes.get(blockIdx).offset);
+            {
+                reader.seekToPosition(columnOffset(blockIdx));
+                reader.deserializer.clearState();
+            }
 
             currentIndexIdx = blockIdx;
             reader.openMarker = blockIdx > 0 ? indexes.get(blockIdx - 1).endOpenMarker : null;
             mark = reader.file.mark();
+        }
+
+        private long columnOffset(int i)
+        {
+            return indexEntry.position + indexes.get(i).offset;
         }
 
         public int blocksCount()
@@ -453,10 +456,50 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
             return indexes.size();
         }
 
+        // Update the block idx based on the current reader position if we're past the current block.
+        // This only makes sense for forward iteration (for reverse ones, when we reach the end of a block we
+        // should seek to the previous one, not update the index state and continue).
+        public void updateBlock() throws IOException
+        {
+            assert !reversed;
+
+            // If we get here with currentBlockIdx < 0, it means setToBlock() has never been called, so it means
+            // we're about to read from the beginning of the partition, but haven't "prepared" the IndexState yet.
+            // Do so by setting us on the first block.
+            if (currentIndexIdx < 0)
+            {
+                setToBlock(0);
+                return;
+            }
+
+            while (currentIndexIdx + 1 < indexes.size() && isPastCurrentBlock())
+            {
+                reader.openMarker = currentIndex().endOpenMarker;
+                ++currentIndexIdx;
+
+                // We have to set the mark, and we have to set it at the beginning of the block. So if we're not at the beginning of the block, this forces us to a weird seek dance.
+                // This can only happen when reading old file however.
+                long startOfBlock = columnOffset(currentIndexIdx);
+                long currentFilePointer = reader.file.getFilePointer();
+                if (startOfBlock == currentFilePointer)
+                {
+                    mark = reader.file.mark();
+                }
+                else
+                {
+                    reader.seekToPosition(startOfBlock);
+                    mark = reader.file.mark();
+                    reader.seekToPosition(currentFilePointer);
+                }
+            }
+        }
+
         // Check if we've crossed an index boundary (based on the mark on the beginning of the index block).
         public boolean isPastCurrentBlock()
         {
-            return reader.file.bytesPastMark(mark) >= currentIndex().width;
+            assert reader.deserializer != null;
+            long correction = reader.deserializer.bytesReadForUnconsumedData();
+            return reader.file.bytesPastMark(mark) - correction >= currentIndex().width;
         }
 
         public int currentBlockIdx()
@@ -466,7 +509,12 @@ abstract class AbstractSSTableIterator implements SliceableUnfilteredRowIterator
 
         public IndexHelper.IndexInfo currentIndex()
         {
-            return indexes.get(currentIndexIdx);
+            return index(currentIndexIdx);
+        }
+
+        public IndexHelper.IndexInfo index(int i)
+        {
+            return indexes.get(i);
         }
 
         // Finds the index of the first block containing the provided bound, starting at the provided index.

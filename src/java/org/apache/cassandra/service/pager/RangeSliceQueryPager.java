@@ -17,14 +17,18 @@
  */
 package org.apache.cassandra.service.pager;
 
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.exceptions.RequestExecutionException;
+import java.util.Optional;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.IndexMetadata;
 
 /**
  * Pages a RangeSliceCommand whose predicate is a slice query.
@@ -37,17 +41,17 @@ public class RangeSliceQueryPager extends AbstractQueryPager
     private static final Logger logger = LoggerFactory.getLogger(RangeSliceQueryPager.class);
 
     private volatile DecoratedKey lastReturnedKey;
-    private volatile Clustering lastReturnedClustering;
+    private volatile PagingState.RowMark lastReturnedRow;
 
-    public RangeSliceQueryPager(PartitionRangeReadCommand command, PagingState state)
+    public RangeSliceQueryPager(PartitionRangeReadCommand command, PagingState state, int protocolVersion)
     {
-        super(command);
+        super(command, protocolVersion);
         assert !command.isNamesQuery();
 
         if (state != null)
         {
             lastReturnedKey = command.metadata().decorateKey(state.partitionKey);
-            lastReturnedClustering = LegacyLayout.decodeClustering(command.metadata(), state.cellName);
+            lastReturnedRow = state.rowMark;
             restoreState(lastReturnedKey, state.remaining, state.remainingInPartition);
         }
     }
@@ -56,7 +60,7 @@ public class RangeSliceQueryPager extends AbstractQueryPager
     {
         return lastReturnedKey == null
              ? null
-             : new PagingState(lastReturnedKey.getKey(), LegacyLayout.encodeClustering(command.metadata(), lastReturnedClustering), maxRemaining(), remainingInPartition());
+             : new PagingState(lastReturnedKey.getKey(), lastReturnedRow, maxRemaining(), remainingInPartition());
     }
 
     protected ReadCommand nextPageReadCommand(int pageSize)
@@ -73,11 +77,11 @@ public class RangeSliceQueryPager extends AbstractQueryPager
         else
         {
             // We want to include the last returned key only if we haven't achieved our per-partition limit, otherwise, don't bother.
-            boolean includeLastKey = remainingInPartition() > 0;
+            boolean includeLastKey = remainingInPartition() > 0 && lastReturnedRow != null;
             AbstractBounds<PartitionPosition> bounds = makeKeyBounds(lastReturnedKey, includeLastKey);
             if (includeLastKey)
             {
-                pageRange = fullRange.forPaging(bounds, command.metadata().comparator, lastReturnedClustering, false);
+                pageRange = fullRange.forPaging(bounds, command.metadata().comparator, lastReturnedRow.clustering(command.metadata()), false);
                 limits = command.limits().forPaging(pageSize, lastReturnedKey.getKey(), remainingInPartition());
             }
             else
@@ -87,7 +91,9 @@ public class RangeSliceQueryPager extends AbstractQueryPager
             }
         }
 
-        return new PartitionRangeReadCommand(command.metadata(), command.nowInSec(), command.columnFilter(), command.rowFilter(), limits, pageRange);
+        Index index = command.getIndex(Keyspace.openAndGetStore(command.metadata()));
+        Optional<IndexMetadata> indexMetadata = index != null ? Optional.of(index.getIndexMetadata()) : Optional.empty();
+        return new PartitionRangeReadCommand(command.metadata(), command.nowInSec(), command.columnFilter(), command.rowFilter(), limits, pageRange, indexMetadata);
     }
 
     protected void recordLast(DecoratedKey key, Row last)
@@ -95,8 +101,15 @@ public class RangeSliceQueryPager extends AbstractQueryPager
         if (last != null)
         {
             lastReturnedKey = key;
-            lastReturnedClustering = last.clustering();
+            if (last.clustering() != Clustering.STATIC_CLUSTERING)
+                lastReturnedRow = PagingState.RowMark.create(command.metadata(), last, protocolVersion);
         }
+    }
+
+    protected boolean isPreviouslyReturnedPartition(DecoratedKey key)
+    {
+        // Note that lastReturnedKey can be null, but key cannot.
+        return key.equals(lastReturnedKey);
     }
 
     private AbstractBounds<PartitionPosition> makeKeyBounds(PartitionPosition lastReturnedKey, boolean includeLastKey)

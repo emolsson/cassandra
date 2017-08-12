@@ -33,21 +33,21 @@ import org.apache.cassandra.service.pager.PagingState;
  */
 public interface ReadQuery
 {
-    public static final ReadQuery EMPTY = new ReadQuery()
+    ReadQuery EMPTY = new ReadQuery()
     {
-        public ReadOrderGroup startOrderGroup()
+        public ReadExecutionController executionController()
         {
-            return ReadOrderGroup.emptyGroup();
+            return ReadExecutionController.empty();
         }
 
         public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
         }
 
-        public PartitionIterator executeInternal(ReadOrderGroup orderGroup)
+        public PartitionIterator executeInternal(ReadExecutionController controller)
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
         }
 
         public DataLimits limits()
@@ -58,7 +58,7 @@ public interface ReadQuery
             return DataLimits.cqlLimits(0);
         }
 
-        public QueryPager getPager(PagingState state)
+        public QueryPager getPager(PagingState state, int protocolVersion)
         {
             return QueryPager.EMPTY;
         }
@@ -66,6 +66,16 @@ public interface ReadQuery
         public QueryPager getLocalPager()
         {
             return QueryPager.EMPTY;
+        }
+
+        public boolean selectsKey(DecoratedKey key)
+        {
+            return false;
+        }
+
+        public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+        {
+            return false;
         }
     };
 
@@ -76,9 +86,9 @@ public interface ReadQuery
      * The returned object <b>must</b> be closed on all path and it is thus strongly advised to
      * use it in a try-with-ressource construction.
      *
-     * @return a newly started order group for this {@code ReadQuery}.
+     * @return a newly started execution controller for this {@code ReadQuery}.
      */
-    public ReadOrderGroup startOrderGroup();
+    public ReadExecutionController executionController();
 
     /**
      * Executes the query at the provided consistency level.
@@ -94,20 +104,21 @@ public interface ReadQuery
     /**
      * Execute the query for internal queries (that is, it basically executes the query locally).
      *
-     * @param orderGroup the {@code ReadOrderGroup} protecting the read.
+     * @param controller the {@code ReadExecutionController} protecting the read.
      * @return the result of the query.
      */
-    public PartitionIterator executeInternal(ReadOrderGroup orderGroup);
+    public PartitionIterator executeInternal(ReadExecutionController controller);
 
     /**
      * Returns a pager for the query.
      *
      * @param pagingState the {@code PagingState} to start from if this is a paging continuation. This can be
      * {@code null} if this is the start of paging.
+     * @param protocolVersion the protocol version to use for the paging state of that pager.
      *
      * @return a pager for the query.
      */
-    public QueryPager getPager(PagingState pagingState);
+    public QueryPager getPager(PagingState pagingState, int protocolVersion);
 
     /**
      * The limits for the query.
@@ -115,4 +126,16 @@ public interface ReadQuery
      * @return The limits for the query.
      */
     public DataLimits limits();
+
+    /**
+     * @return true if the read query would select the given key, including checks against the row filter, if
+     * checkRowFilter is true
+     */
+    public boolean selectsKey(DecoratedKey key);
+
+    /**
+     * @return true if the read query would select the given clustering, including checks against the row filter, if
+     * checkRowFilter is true
+     */
+    public boolean selectsClustering(DecoratedKey key, Clustering clustering);
 }

@@ -321,15 +321,15 @@ public class ColumnFamilyStoreTest
         }
         ScrubTest.fillIndexCF(cfs, false, colValues);
 
-        cfs.snapshot("nonEphemeralSnapshot", null, false);
-        cfs.snapshot("ephemeralSnapshot", null, true);
+        cfs.snapshot("nonEphemeralSnapshot", null, false, false);
+        cfs.snapshot("ephemeralSnapshot", null, true, false);
 
         Map<String, Pair<Long, Long>> snapshotDetails = cfs.getSnapshotDetails();
         assertEquals(2, snapshotDetails.size());
         assertTrue(snapshotDetails.containsKey("ephemeralSnapshot"));
         assertTrue(snapshotDetails.containsKey("nonEphemeralSnapshot"));
 
-        ColumnFamilyStore.clearEphemeralSnapshots(cfs.directories);
+        ColumnFamilyStore.clearEphemeralSnapshots(cfs.getDirectories());
 
         snapshotDetails = cfs.getSnapshotDetails();
         assertEquals(1, snapshotDetails.size());
@@ -350,7 +350,7 @@ public class ColumnFamilyStoreTest
 
         for (int version = 1; version <= 2; ++version)
         {
-            Descriptor existing = new Descriptor(cfs.directories.getDirectoryForNewSSTables(), KEYSPACE2, CF_STANDARD1, version);
+            Descriptor existing = new Descriptor(cfs.getDirectories().getDirectoryForNewSSTables(), KEYSPACE2, CF_STANDARD1, version);
             Descriptor desc = new Descriptor(Directories.getBackupsDirectory(existing), KEYSPACE2, CF_STANDARD1, version);
             for (Component c : new Component[]{ Component.DATA, Component.PRIMARY_INDEX, Component.FILTER, Component.STATS })
                 assertTrue("Cannot find backed-up file:" + desc.filenameFor(c), new File(desc.filenameFor(c)).exists());
@@ -530,9 +530,11 @@ public class ColumnFamilyStoreTest
         String tmpDataFileName = ssTable.descriptor.tmpFilenameFor(Component.DATA);
         new File(dataFileName).renameTo(new File(tmpDataFileName));
 
+        ssTable.selfRef().release();
+
         ColumnFamilyStore.scrubDataDirectories(cfs.metadata);
 
-        List<File> ssTableFiles = new Directories(cfs.metadata).sstableLister().listFiles();
+        List<File> ssTableFiles = new Directories(cfs.metadata).sstableLister(Directories.OnTxnErr.THROW).listFiles();
         assertNotNull(ssTableFiles);
         assertEquals(0, ssTableFiles.size());
     }

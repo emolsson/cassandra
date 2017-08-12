@@ -1,12 +1,18 @@
 package org.apache.cassandra.io.util;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInput;
+import java.io.DataInputStream;
+import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UTFDataFormatException;
 import java.lang.reflect.Field;
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 import java.util.Random;
@@ -161,12 +167,14 @@ public class BufferedDataOutputStreamTest
     private ByteArrayOutputStream canonical;
     private DataOutputStreamPlus dosp;
 
-    void setUp()
+    void setUp() throws Exception
     {
 
         generated = new ByteArrayOutputStream();
         canonical = new ByteArrayOutputStream();
         dosp = new WrappedDataOutputStreamPlus(canonical);
+        if (ndosp != null)
+            ndosp.close();
         ndosp = new BufferedDataOutputStreamPlus(adapter, 4096);
     }
 
@@ -463,6 +471,45 @@ public class BufferedDataOutputStreamTest
         return count;
     }
 
+    @Test
+    public void testWriteUTF() throws Exception
+    {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutput dataOut = new DataOutputStream(baos);
+
+        StringBuilder sb = new StringBuilder(65535);
+        for (int ii = 0; ii < 1 << 16; ii++)
+        {
+            String s = sb.toString();
+            UnbufferedDataOutputStreamPlus.writeUTF(s, dataOut);
+            DataInput dataIn = new DataInputStream(new ByteArrayInputStream(baos.toByteArray()));
+            assertEquals(s, dataIn.readUTF());
+            baos.reset();
+            sb.append("a");
+        }
+    }
+
+    @Test
+    public void testWriteUTFBigChar() throws Exception
+    {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutput dataOut = new DataOutputStream(baos);
+
+        StringBuilder sb = new StringBuilder(65535);
+        for (int ii = 0; ii < 1 << 15; ii++)
+        {
+            String s = sb.toString();
+            UnbufferedDataOutputStreamPlus.writeUTF(s, dataOut);
+            DataInput dataIn = new DataInputStream(new ByteArrayInputStream(baos.toByteArray()));
+            assertEquals(s, dataIn.readUTF());
+            baos.reset();
+            if (ii == (1 << 15) - 1)
+                sb.append("a");
+            else
+                sb.append(twoByte);
+        }
+    }
+
     /*
      * Add values to the array with a bit set in every position
      */
@@ -495,14 +542,12 @@ public class BufferedDataOutputStreamTest
 
         ndosp.flush();
 
-        @SuppressWarnings("resource")
-        ByteBufferDataInput bbdi = new ByteBufferDataInput(ByteBuffer.wrap(generated.toByteArray()), "", 0, 0);
-
+        DataInputBuffer in = new DataInputBuffer(generated.toByteArray());
         assertEquals(expectedSize, generated.toByteArray().length);
 
         for (long v : testValues)
         {
-            assertEquals(v, bbdi.readVInt());
+            assertEquals(v, in.readVInt());
         }
     }
 
@@ -527,12 +572,66 @@ public class BufferedDataOutputStreamTest
 
         ndosp.flush();
 
-        @SuppressWarnings("resource")
-        ByteBufferDataInput bbdi = new ByteBufferDataInput(ByteBuffer.wrap(generated.toByteArray()), "", 0, 0);
-
+        DataInputBuffer in = new DataInputBuffer(generated.toByteArray());
         assertEquals(expectedSize, generated.toByteArray().length);
 
         for (long v : testValues)
-            assertEquals(v, bbdi.readUnsignedVInt());
+            assertEquals(v, in.readUnsignedVInt());
+    }
+
+    @Test
+    public void testWriteSlowByteOrder() throws Exception
+    {
+        try (DataOutputBuffer dob = new DataOutputBuffer(4))
+        {
+            dob.order(ByteOrder.LITTLE_ENDIAN);
+            dob.writeLong(42);
+            assertEquals(42, ByteBuffer.wrap(dob.toByteArray()).order(ByteOrder.LITTLE_ENDIAN).getLong());
+        }
+    }
+
+    @Test
+    public void testWriteExcessSlow() throws Exception
+    {
+        try (DataOutputBuffer dob = new DataOutputBuffer(4))
+        {
+            dob.strictFlushing = true;
+            ByteBuffer buf = ByteBuffer.allocateDirect(8);
+            buf.putLong(0, 42);
+            dob.write(buf);
+            assertEquals(42, ByteBuffer.wrap(dob.toByteArray()).getLong());
+        }
+    }
+
+    @Test
+    public void testApplyToChannel() throws Exception
+    {
+        setUp();
+        Object obj = new Object();
+        Object retval = ndosp.applyToChannel( channel -> {
+            ByteBuffer buf = ByteBuffer.allocate(8);
+            buf.putLong(0, 42);
+            try
+            {
+                channel.write(buf);
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+            return obj;
+        });
+        assertEquals(obj, retval);
+        assertEquals(42, ByteBuffer.wrap(generated.toByteArray()).getLong());
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testApplyToChannelThrowsForMisaligned() throws Exception
+    {
+        setUp();
+        ndosp.strictFlushing = true;
+        ndosp.applyToChannel( channel -> {
+            return null;
+        });
     }
 }

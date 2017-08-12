@@ -17,14 +17,14 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.util.*;
 import java.security.MessageDigest;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -49,54 +49,20 @@ public abstract class RowIterators
             iterator.next().digest(digest);
     }
 
-    public static RowIterator emptyIterator(final CFMetaData cfm, final DecoratedKey partitionKey, final boolean isReverseOrder)
+    /**
+     * Filter the provided iterator to only include cells that are selected by the user.
+     *
+     * @param iterator the iterator to filter.
+     * @param filter the {@code ColumnFilter} to use when deciding which cells are queried by the user. This should be the filter
+     * that was used when querying {@code iterator}.
+     * @return the filtered iterator..
+     */
+    public static RowIterator withOnlyQueriedData(RowIterator iterator, ColumnFilter filter)
     {
-        return new RowIterator()
-        {
-            public CFMetaData metadata()
-            {
-                return cfm;
-            }
+        if (filter.allFetchedColumnsAreQueried())
+            return iterator;
 
-            public boolean isReverseOrder()
-            {
-                return isReverseOrder;
-            }
-
-            public PartitionColumns columns()
-            {
-                return PartitionColumns.NONE;
-            }
-
-            public DecoratedKey partitionKey()
-            {
-                return partitionKey;
-            }
-
-            public Row staticRow()
-            {
-                return Rows.EMPTY_STATIC_ROW;
-            }
-
-            public boolean hasNext()
-            {
-                return false;
-            }
-
-            public Row next()
-            {
-                throw new NoSuchElementException();
-            }
-
-            public void remove()
-            {
-                throw new UnsupportedOperationException();
-            }
-
-            public void close()
-            {
-            }
-        };
+        return Transformation.apply(iterator, new WithOnlyQueriedData(filter));
     }
 
     /**
@@ -115,24 +81,23 @@ public abstract class RowIterators
                     metadata.getKeyValidator().getString(iterator.partitionKey().getKey()),
                     iterator.isReverseOrder());
 
-        return new WrappingRowIterator(iterator)
+        class Log extends Transformation
         {
             @Override
-            public Row staticRow()
+            public Row applyToStatic(Row row)
             {
-                Row row = super.staticRow();
                 if (!row.isEmpty())
-                    logger.info("[{}] {}", id, row.toString(metadata()));
+                    logger.info("[{}] {}", id, row.toString(metadata));
                 return row;
             }
 
             @Override
-            public Row next()
+            public Row applyToRow(Row row)
             {
-                Row next = super.next();
-                logger.info("[{}] {}", id, next.toString(metadata()));
-                return next;
+                logger.info("[{}] {}", id, row.toString(metadata));
+                return row;
             }
-        };
+        }
+        return Transformation.apply(iterator, new Log());
     }
 }

@@ -24,6 +24,7 @@ import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.Server;
 
 /**
  * Static utility methods for paging.
@@ -47,15 +48,16 @@ public class QueryPagers
                                  boolean isForThrift) throws RequestValidationException, RequestExecutionException
     {
         SinglePartitionReadCommand command = SinglePartitionReadCommand.create(isForThrift, metadata, nowInSec, columnFilter, RowFilter.NONE, limits, key, filter);
-        final SinglePartitionPager pager = new SinglePartitionPager(command, null);
+        final SinglePartitionPager pager = new SinglePartitionPager(command, null, Server.CURRENT_VERSION);
 
         int count = 0;
         while (!pager.isExhausted())
         {
-            try (CountingPartitionIterator iter = new CountingPartitionIterator(pager.fetchPage(pageSize, consistencyLevel, state), limits, nowInSec))
+            try (PartitionIterator iter = pager.fetchPage(pageSize, consistencyLevel, state))
             {
-                PartitionIterators.consume(iter);
-                count += iter.counter().counted();
+                DataLimits.Counter counter = limits.newCounter(nowInSec, true);
+                PartitionIterators.consume(counter.applyTo(iter));
+                count += counter.counted();
             }
         }
         return count;

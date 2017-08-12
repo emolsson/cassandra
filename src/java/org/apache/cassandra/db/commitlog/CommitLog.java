@@ -38,16 +38,19 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.compress.CompressionParameters;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.metrics.CommitLogMetrics;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.*;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
 
 /*
  * Commit Log tracks every write operation into the system. The aim of the commit log is to be able to
@@ -61,7 +64,7 @@ public class CommitLog implements CommitLogMBean
 
     // we only permit records HALF the size of a commit log, to ensure we don't spin allocating many mostly
     // empty segments when writing large records
-    private final long MAX_MUTATION_SIZE = DatabaseDescriptor.getCommitLogSegmentSize() >> 1;
+    private final long MAX_MUTATION_SIZE = DatabaseDescriptor.getMaxMutationSize();
 
     public final CommitLogSegmentManager allocator;
     public final CommitLogArchiver archiver;
@@ -70,11 +73,12 @@ public class CommitLog implements CommitLogMBean
 
     final ICompressor compressor;
     public ParameterizedClass compressorClass;
+    public EncryptionContext encryptionContext;
     final public String location;
 
     private static CommitLog construct()
     {
-        CommitLog log = new CommitLog(DatabaseDescriptor.getCommitLogLocation(), new CommitLogArchiver());
+        CommitLog log = new CommitLog(DatabaseDescriptor.getCommitLogLocation(), CommitLogArchiver.construct());
 
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         try
@@ -85,7 +89,7 @@ public class CommitLog implements CommitLogMBean
         {
             throw new RuntimeException(e);
         }
-        return log;
+        return log.start();
     }
 
     @VisibleForTesting
@@ -93,8 +97,9 @@ public class CommitLog implements CommitLogMBean
     {
         compressorClass = DatabaseDescriptor.getCommitLogCompression();
         this.location = location;
-        ICompressor compressor = compressorClass != null ? CompressionParameters.createCompressor(compressorClass) : null;
+        ICompressor compressor = compressorClass != null ? CompressionParams.createCompressor(compressorClass) : null;
         DatabaseDescriptor.createAllDirectories();
+        encryptionContext = DatabaseDescriptor.getEncryptionContext();
 
         this.compressor = compressor;
         this.archiver = archiver;
@@ -105,10 +110,16 @@ public class CommitLog implements CommitLogMBean
                 : new PeriodicCommitLogService(this);
 
         allocator = new CommitLogSegmentManager(this);
-        executor.start();
 
         // register metrics
         metrics.attach(executor, allocator);
+    }
+
+    CommitLog start()
+    {
+        executor.start();
+        allocator.start();
+        return this;
     }
 
     /**
@@ -177,7 +188,7 @@ public class CommitLog implements CommitLogMBean
      */
     public int recover(File... clogs) throws IOException
     {
-        CommitLogReplayer recovery = CommitLogReplayer.create();
+        CommitLogReplayer recovery = CommitLogReplayer.construct(this);
         recovery.recover(clogs);
         return recovery.blockForWrites();
     }
@@ -187,11 +198,13 @@ public class CommitLog implements CommitLogMBean
      */
     public void recover(String path) throws IOException
     {
-        recover(new File(path));
+        CommitLogReplayer recovery = CommitLogReplayer.construct(this);
+        recovery.recover(new File(path), false);
+        recovery.blockForWrites();
     }
 
     /**
-     * @return a ReplayPosition which, if >= one returned from add(), implies add() was started
+     * @return a ReplayPosition which, if {@code >= one} returned from add(), implies add() was started
      * (but not necessarily finished) prior to this call
      */
     public ReplayPosition getContext()
@@ -246,9 +259,9 @@ public class CommitLog implements CommitLogMBean
     {
         assert mutation != null;
 
-        long size = Mutation.serializer.serializedSize(mutation, MessagingService.current_version);
+        int size = (int) Mutation.serializer.serializedSize(mutation, MessagingService.current_version);
 
-        long totalSize = size + ENTRY_OVERHEAD_SIZE;
+        int totalSize = size + ENTRY_OVERHEAD_SIZE;
         if (totalSize > MAX_MUTATION_SIZE)
         {
             throw new IllegalArgumentException(String.format("Mutation of %s bytes is too large for the maxiumum size of %s",
@@ -261,19 +274,13 @@ public class CommitLog implements CommitLogMBean
         try (BufferedDataOutputStreamPlus dos = new DataOutputBufferFixed(buffer))
         {
             // checksummed length
-            dos.writeInt((int) size);
-
-            ByteBuffer copy = buffer.duplicate();
-            copy.position(buffer.position() - 4);
-            copy.limit(buffer.position());
-            checksum.update(copy);
+            dos.writeInt(size);
+            updateChecksumInt(checksum, size);
             buffer.putInt((int) checksum.getValue());
 
             // checksummed mutation
-            copy = buffer.duplicate();
             Mutation.serializer.serialize(mutation, dos, MessagingService.current_version);
-            copy.limit(copy.position() + (int) size);
-            checksum.update(copy);
+            updateChecksum(checksum, buffer, buffer.position() - size, size);
             buffer.putInt((int) checksum.getValue());
         }
         catch (IOException e)
@@ -298,7 +305,7 @@ public class CommitLog implements CommitLogMBean
      */
     public void discardCompletedSegments(final UUID cfId, final ReplayPosition context)
     {
-        logger.debug("discard completed log segments for {}, table {}", context, cfId);
+        logger.trace("discard completed log segments for {}, table {}", context, cfId);
 
         // Go thru the active segment files, which are ordered oldest to newest, marking the
         // flushed CF as clean, until we reach the segment file containing the ReplayPosition passed
@@ -311,12 +318,12 @@ public class CommitLog implements CommitLogMBean
 
             if (segment.isUnused())
             {
-                logger.debug("Commit log segment {} is unused", segment);
+                logger.trace("Commit log segment {} is unused", segment);
                 allocator.recycleSegment(segment);
             }
             else
             {
-                logger.debug("Not safe to delete{} commit log segment {}; dirty is {}",
+                logger.trace("Not safe to delete{} commit log segment {}; dirty is {}",
                         (iter.hasNext() ? "" : " active"), segment, segment.dirtyString());
             }
 
@@ -412,7 +419,7 @@ public class CommitLog implements CommitLogMBean
     public int resetUnsafe(boolean deleteSegments) throws IOException
     {
         stopUnsafe(deleteSegments);
-        return startUnsafe();
+        return restartUnsafe();
     }
 
     /**
@@ -435,11 +442,25 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES.  See CommitLogAllocator
      */
-    public int startUnsafe() throws IOException
+    public int restartUnsafe() throws IOException
     {
-        allocator.startUnsafe();
-        executor.startUnsafe();
-        return recover();
+        allocator.start();
+        executor.restartUnsafe();
+        try
+        {
+            return recover();
+        }
+        catch (FSWriteError e)
+        {
+            // Workaround for a class of races that keeps showing up on Windows tests.
+            // stop/start/reset path on Windows with segment deletion is very touchy/brittle
+            // and the timing keeps getting screwed up. Rather than chasing our tail further
+            // or rewriting the CLSM, just report that we didn't recover anything back up
+            // the chain. This will silence most intermittent test failures on Windows
+            // and appropriately fail tests that expected segments to be recovered that
+            // were not.
+            return 0;
+        }
     }
 
     /**

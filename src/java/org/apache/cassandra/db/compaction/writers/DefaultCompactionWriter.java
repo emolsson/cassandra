@@ -18,13 +18,13 @@
 package org.apache.cassandra.db.compaction.writers;
 
 
-import java.io.File;
 import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -39,29 +39,45 @@ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 public class DefaultCompactionWriter extends CompactionAwareWriter
 {
     protected static final Logger logger = LoggerFactory.getLogger(DefaultCompactionWriter.class);
+    private final int sstableLevel;
+
+    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables)
+    {
+        this(cfs, directories, txn, nonExpiredSSTables, false, 0);
+    }
+
+    @Deprecated
+    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean offline, boolean keepOriginals, int sstableLevel)
+    {
+        this(cfs, directories, txn, nonExpiredSSTables, keepOriginals, sstableLevel);
+    }
 
     @SuppressWarnings("resource")
-    public DefaultCompactionWriter(ColumnFamilyStore cfs, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean offline)
+    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean keepOriginals, int sstableLevel)
     {
-        super(cfs, txn, nonExpiredSSTables, offline);
-        logger.debug("Expected bloom filter size : {}", estimatedTotalKeys);
-        long expectedWriteSize = cfs.getExpectedCompactedFileSize(nonExpiredSSTables, txn.opType());
-        File sstableDirectory = cfs.directories.getLocationForDisk(getWriteDirectory(expectedWriteSize));
-        @SuppressWarnings("resource")
-        SSTableWriter writer = SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(sstableDirectory)),
-                                                    estimatedTotalKeys,
-                                                    minRepairedAt,
-                                                    cfs.metadata,
-                                                    new MetadataCollector(txn.originals(), cfs.metadata.comparator, 0),
-                                                    SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
-                                                    txn);
-        sstableWriter.switchWriter(writer);
+        super(cfs, directories, txn, nonExpiredSSTables, keepOriginals);
+        this.sstableLevel = sstableLevel;
     }
 
     @Override
-    public boolean append(UnfilteredRowIterator partition)
+    public boolean realAppend(UnfilteredRowIterator partition)
     {
         return sstableWriter.append(partition) != null;
+    }
+
+    @Override
+    public void switchCompactionLocation(Directories.DataDirectory directory)
+    {
+        @SuppressWarnings("resource")
+        SSTableWriter writer = SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(getDirectories().getLocationForDisk(directory))),
+                                                    estimatedTotalKeys,
+                                                    minRepairedAt,
+                                                    cfs.metadata,
+                                                    new MetadataCollector(txn.originals(), cfs.metadata.comparator, sstableLevel),
+                                                    SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
+                                                    cfs.indexManager.listIndexes(),
+                                                    txn);
+        sstableWriter.switchWriter(writer);
     }
 
     @Override

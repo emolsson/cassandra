@@ -35,13 +35,12 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.SSTableSimpleIterator;
+import org.apache.cassandra.io.sstable.format.RangeAwareSSTableWriter;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.messages.FileMessageHeader;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.BytesReadTracker;
@@ -63,8 +62,7 @@ public class StreamReader
     protected final SSTableFormat.Type format;
     protected final int sstableLevel;
     protected final SerializationHeader.Component header;
-
-    protected Descriptor desc;
+    protected final int fileSeqNum;
 
     public StreamReader(FileMessageHeader header, StreamSession session)
     {
@@ -77,6 +75,7 @@ public class StreamReader
         this.format = header.format;
         this.sstableLevel = header.sstableLevel;
         this.header = header.header;
+        this.fileSeqNum = header.sequenceNumber;
     }
 
     /**
@@ -84,38 +83,52 @@ public class StreamReader
      * @return SSTable transferred
      * @throws IOException if reading the remote sstable fails. Will throw an RTE if local write fails.
      */
-    @SuppressWarnings("resource")
-    public SSTableWriter read(ReadableByteChannel channel) throws IOException
+    @SuppressWarnings("resource") // channel needs to remain open, streams on top of it can't be closed
+    public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
     {
-        logger.debug("reading file from {}, repairedAt = {}, level = {}", session.peer, repairedAt, sstableLevel);
         long totalSize = totalSize();
 
         Pair<String, String> kscf = Schema.instance.getCF(cfId);
-        if (kscf == null)
+        ColumnFamilyStore cfs = null;
+        if (kscf != null)
+            cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
+
+        if (kscf == null || cfs == null)
         {
             // schema was dropped during streaming
             throw new IOException("CF " + cfId + " was dropped during streaming");
         }
-        ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
 
-        SSTableWriter writer = createWriter(cfs, totalSize, repairedAt, format);
+        logger.debug("[Stream #{}] Start receiving file #{} from {}, repairedAt = {}, size = {}, ks = '{}', table = '{}'.",
+                     session.planId(), fileSeqNum, session.peer, repairedAt, totalSize, cfs.keyspace.getName(),
+                     cfs.getColumnFamilyName());
 
         DataInputStream dis = new DataInputStream(new LZFInputStream(Channels.newInputStream(channel)));
         BytesReadTracker in = new BytesReadTracker(dis);
         StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata, in, inputVersion, header.toHeader(cfs.metadata));
+        SSTableMultiWriter writer = null;
         try
         {
+            writer = createWriter(cfs, totalSize, repairedAt, format);
             while (in.getBytesRead() < totalSize)
             {
-                writePartition(deserializer, writer, cfs);
+                writePartition(deserializer, writer);
                 // TODO move this to BytesReadTracker
-                session.progress(desc, ProgressInfo.Direction.IN, in.getBytesRead(), totalSize);
+                session.progress(writer.getFilename(), ProgressInfo.Direction.IN, in.getBytesRead(), totalSize);
             }
+            logger.debug("[Stream #{}] Finished receiving file #{} from {} readBytes = {}, totalSize = {}",
+                         session.planId(), fileSeqNum, session.peer, in.getBytesRead(), totalSize);
             return writer;
         }
         catch (Throwable e)
         {
-            writer.abort();
+            if (deserializer != null)
+                logger.warn("[Stream {}] Error while reading partition {} from stream on ks='{}' and table='{}'.",
+                            session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getColumnFamilyName());
+            if (writer != null)
+            {
+                writer.abort(e);
+            }
             drain(dis, in.getBytesRead());
             if (e instanceof IOException)
                 throw (IOException) e;
@@ -124,14 +137,15 @@ public class StreamReader
         }
     }
 
-    protected SSTableWriter createWriter(ColumnFamilyStore cfs, long totalSize, long repairedAt, SSTableFormat.Type format) throws IOException
+    protected SSTableMultiWriter createWriter(ColumnFamilyStore cfs, long totalSize, long repairedAt, SSTableFormat.Type format) throws IOException
     {
-        Directories.DataDirectory localDir = cfs.directories.getWriteableLocation(totalSize);
+        Directories.DataDirectory localDir = cfs.getDirectories().getWriteableLocation(totalSize);
         if (localDir == null)
             throw new IOException("Insufficient disk space to store " + totalSize + " bytes");
-        desc = Descriptor.fromFilename(cfs.getSSTablePath(cfs.directories.getLocationForDisk(localDir), format));
 
-        return SSTableWriter.create(desc, estimatedKeys, repairedAt, sstableLevel, header.toHeader(cfs.metadata), session.getTransaction(cfId));
+        RangeAwareSSTableWriter writer = new RangeAwareSSTableWriter(cfs, estimatedKeys, repairedAt, format, sstableLevel, totalSize, session.getTransaction(cfId), header);
+        StreamHook.instance.reportIncomingFile(cfs, writer, session, fileSeqNum);
+        return writer;
     }
 
     protected void drain(InputStream dis, long bytesRead) throws IOException
@@ -161,12 +175,10 @@ public class StreamReader
         return size;
     }
 
-    protected void writePartition(StreamDeserializer deserializer, SSTableWriter writer, ColumnFamilyStore cfs) throws IOException
+    protected void writePartition(StreamDeserializer deserializer, SSTableMultiWriter writer) throws IOException
     {
-        DecoratedKey key = deserializer.newPartition();
-        writer.append(deserializer);
+        writer.append(deserializer.newPartition());
         deserializer.checkForExceptions();
-        cfs.invalidateCachedPartition(key);
     }
 
     public static class StreamDeserializer extends UnmodifiableIterator<Unfiltered> implements UnfilteredRowIterator
@@ -191,13 +203,13 @@ public class StreamReader
             this.header = header;
         }
 
-        public DecoratedKey newPartition() throws IOException
+        public StreamDeserializer newPartition() throws IOException
         {
             key = metadata.decorateKey(ByteBufferUtil.readWithShortLength(in));
             partitionLevelDeletion = DeletionTime.serializer.deserialize(in);
             iterator = SSTableSimpleIterator.create(metadata, in, header, helper, partitionLevelDeletion);
             staticRow = iterator.readStaticRow();
-            return key;
+            return this;
         }
 
         public CFMetaData metadata()

@@ -153,9 +153,43 @@ public class SystemKeyspaceTest
     }
 
     @Test
-    public void testMigrateDataDirs() throws IOException
+    public void testMigrateEmptyDataDirs() throws IOException
     {
-        Path migrationSSTableRoot = Paths.get(System.getProperty(MIGRATION_SSTABLES_ROOT), "2.2");
+        File dataDir = Paths.get(DatabaseDescriptor.getAllDataFileLocations()[0]).toFile();
+        if (new File(dataDir, "Emptykeyspace1").exists())
+            FileUtils.deleteDirectory(new File(dataDir, "Emptykeyspace1"));
+        assertTrue(new File(dataDir, "Emptykeyspace1").mkdirs());
+        assertEquals(0, numLegacyFiles());
+        SystemKeyspace.migrateDataDirs();
+        assertEquals(0, numLegacyFiles());
+
+        assertTrue(new File(dataDir, "Emptykeyspace1/table1").mkdirs());
+        assertEquals(0, numLegacyFiles());
+        SystemKeyspace.migrateDataDirs();
+        assertEquals(0, numLegacyFiles());
+
+        assertTrue(new File(dataDir, "Emptykeyspace1/wrong_file").createNewFile());
+        assertEquals(0, numLegacyFiles());
+        SystemKeyspace.migrateDataDirs();
+        assertEquals(0, numLegacyFiles());
+
+    }
+
+    @Test
+    public void testMigrateDataDirs_2_1() throws IOException
+    {
+        testMigrateDataDirs("2.1");
+    }
+
+    @Test
+    public void testMigrateDataDirs_2_2() throws IOException
+    {
+        testMigrateDataDirs("2.2");
+    }
+
+    private void testMigrateDataDirs(String version) throws IOException
+    {
+        Path migrationSSTableRoot = Paths.get(System.getProperty(MIGRATION_SSTABLES_ROOT), version);
         Path dataDir = Paths.get(DatabaseDescriptor.getAllDataFileLocations()[0]);
 
         FileUtils.copyDirectory(migrationSSTableRoot.toFile(), dataDir.toFile());
@@ -174,17 +208,17 @@ public class SystemKeyspaceTest
         for (String dataDir : dirs)
         {
             File dir = new File(dataDir);
-            for (File ksdir : dir.listFiles((d, n) -> d.isDirectory()))
+            for (File ksdir : dir.listFiles((d, n) -> new File(d, n).isDirectory()))
             {
-                for (File cfdir : ksdir.listFiles((d, n) -> d.isDirectory()))
+                for (File cfdir : ksdir.listFiles((d, n) -> new File(d, n).isDirectory()))
                 {
-                    if (Descriptor.isLegacyFile(cfdir.getName()))
+                    if (Descriptor.isLegacyFile(cfdir))
                     {
                         ret++;
                     }
                     else
                     {
-                        File[] legacyFiles = cfdir.listFiles((d, n) -> Descriptor.isLegacyFile(n));
+                        File[] legacyFiles = cfdir.listFiles((d, n) -> Descriptor.isLegacyFile(new File(d, n)));
                         ret += legacyFiles.length;
                     }
                 }

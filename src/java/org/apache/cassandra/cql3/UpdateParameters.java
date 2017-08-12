@@ -23,11 +23,10 @@ import java.util.Map;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.ColumnFilter;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.context.CounterContext;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -46,8 +45,6 @@ public class UpdateParameters
 
     private final DeletionTime deletionTime;
 
-    private final SecondaryIndexManager indexManager;
-
     // For lists operation that require a read-before-write. Will be null otherwise.
     private final Map<DecoratedKey, Partition> prefetchedRows;
 
@@ -62,8 +59,7 @@ public class UpdateParameters
                             QueryOptions options,
                             long timestamp,
                             int ttl,
-                            Map<DecoratedKey, Partition> prefetchedRows,
-                            boolean validateIndexedColumns)
+                            Map<DecoratedKey, Partition> prefetchedRows)
     throws InvalidRequestException
     {
         this.metadata = metadata;
@@ -78,34 +74,14 @@ public class UpdateParameters
 
         this.prefetchedRows = prefetchedRows;
 
-        // Index column validation triggers a call to Keyspace.open() which we want to be able to avoid in some case (e.g. when using CQLSSTableWriter)
-        if (validateIndexedColumns)
-        {
-            SecondaryIndexManager manager = Keyspace.openAndGetStore(metadata).indexManager;
-            indexManager = manager.hasIndexes() ? manager : null;
-        }
-        else
-        {
-            indexManager = null;
-        }
-
         // We use MIN_VALUE internally to mean the absence of of timestamp (in Selection, in sstable stats, ...), so exclude
         // it to avoid potential confusion.
         if (timestamp == Long.MIN_VALUE)
             throw new InvalidRequestException(String.format("Out of bound timestamp, must be in [%d, %d]", Long.MIN_VALUE + 1, Long.MAX_VALUE));
     }
 
-    public void newPartition(DecoratedKey partitionKey) throws InvalidRequestException
-    {
-        if (indexManager != null)
-            indexManager.validate(partitionKey);
-    }
-
     public void newRow(Clustering clustering) throws InvalidRequestException
     {
-        if (indexManager != null)
-            indexManager.validate(clustering);
-
         if (metadata.isDense() && !metadata.isCompound())
         {
             // If it's a COMPACT STORAGE table with a single clustering column, the clustering value is
@@ -120,13 +96,13 @@ public class UpdateParameters
         if (clustering == Clustering.STATIC_CLUSTERING)
         {
             if (staticBuilder == null)
-                staticBuilder = BTreeBackedRow.unsortedBuilder(updatedColumns.statics, nowInSec);
+                staticBuilder = BTreeRow.unsortedBuilder(nowInSec);
             builder = staticBuilder;
         }
         else
         {
             if (regularBuilder == null)
-                regularBuilder = BTreeBackedRow.unsortedBuilder(updatedColumns.regulars, nowInSec);
+                regularBuilder = BTreeRow.unsortedBuilder(nowInSec);
             builder = regularBuilder;
         }
 
@@ -145,7 +121,14 @@ public class UpdateParameters
 
     public void addRowDeletion()
     {
-        builder.addRowDeletion(deletionTime);
+        // For compact tables, at the exclusion of the static row (of static compact tables), each row ever has a single column,
+        // the "compact" one. As such, deleting the row or deleting that single cell is equivalent. We favor the later however
+        // because that makes it easier when translating back to the old format layout (for thrift and pre-3.0 backward
+        // compatibility) as we don't have to special case for the row deletion. This is also in line with what we used to do pre-3.0.
+        if (metadata.isCompactTable() && builder.clustering() != Clustering.STATIC_CLUSTERING)
+            addTombstone(metadata.compactValueColumn());
+        else
+            builder.addRowDeletion(Row.Deletion.regular(deletionTime));
     }
 
     public void addTombstone(ColumnDefinition column) throws InvalidRequestException
@@ -165,9 +148,6 @@ public class UpdateParameters
 
     public void addCell(ColumnDefinition column, CellPath path, ByteBuffer value) throws InvalidRequestException
     {
-        if (indexManager != null)
-            indexManager.validate(column, value, path);
-
         Cell cell = ttl == LivenessInfo.NO_TTL
                   ? BufferCell.live(metadata, column, timestamp, value, path)
                   : BufferCell.expiring(column, timestamp, ttl, nowInSec, value, path);
@@ -211,9 +191,14 @@ public class UpdateParameters
         return deletionTime;
     }
 
-    public RangeTombstone makeRangeTombstone(CBuilder cbuilder)
+    public RangeTombstone makeRangeTombstone(ClusteringComparator comparator, Clustering clustering)
     {
-        return new RangeTombstone(cbuilder.buildSlice(), deletionTime);
+        return makeRangeTombstone(Slice.make(comparator, clustering));
+    }
+
+    public RangeTombstone makeRangeTombstone(Slice slice)
+    {
+        return new RangeTombstone(slice, deletionTime);
     }
 
     public Row getPrefetchedRow(DecoratedKey key, Clustering clustering)

@@ -23,34 +23,34 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Function;
 import com.google.common.collect.Iterables;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.helpers.MessageFormatter;
 
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.RowIterator;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.ClientWarn;
-import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.*;
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 
 /**
  * A <code>BATCH</code> statement parsed from a CQL query.
  */
 public class BatchStatement implements CQLStatement
 {
-    public static enum Type
+    public enum Type
     {
         LOGGED, UNLOGGED, COUNTER
     }
@@ -58,14 +58,27 @@ public class BatchStatement implements CQLStatement
     private final int boundTerms;
     public final Type type;
     private final List<ModificationStatement> statements;
-    private final PartitionColumns updatedColumns;
+
+    // Columns modified for each table (keyed by the table ID)
+    private final Map<UUID, PartitionColumns> updatedColumns;
+    // Columns on which there is conditions. Note that if there is any, then the batch can only be on a single partition (and thus table).
     private final PartitionColumns conditionColumns;
+
     private final boolean updatesRegularRows;
     private final boolean updatesStaticRow;
     private final Attributes attrs;
     private final boolean hasConditions;
     private static final Logger logger = LoggerFactory.getLogger(BatchStatement.class);
-    private static final String unloggedBatchWarning = "Unlogged batch covering {} partition{} detected against table{} {}. You should use a logged batch for atomicity, or asynchronous writes for performance.";
+
+    private static final String UNLOGGED_BATCH_WARNING = "Unlogged batch covering {} partition{} detected " +
+                                                         "against table{} {}. You should use a logged batch for " +
+                                                         "atomicity, or asynchronous writes for performance.";
+
+    private static final String LOGGED_BATCH_LOW_GCGS_WARNING = "Executing a LOGGED BATCH on table{} {}, configured with a " +
+                                                                "gc_grace_seconds of 0. The gc_grace_seconds is used to TTL " +
+                                                                "batchlog entries, so setting gc_grace_seconds too low on " +
+                                                                "tables involved in an atomic batch might cause batchlog " +
+                                                                "entries to expire before being replayed.";
 
     /**
      * Creates a new BatchStatement from a list of statements and a
@@ -83,14 +96,14 @@ public class BatchStatement implements CQLStatement
         this.attrs = attrs;
 
         boolean hasConditions = false;
-        PartitionColumns.Builder regularBuilder = PartitionColumns.builder();
+        MultiTableColumnsBuilder regularBuilder = new MultiTableColumnsBuilder();
         PartitionColumns.Builder conditionBuilder = PartitionColumns.builder();
         boolean updateRegular = false;
         boolean updateStatic = false;
 
         for (ModificationStatement stmt : statements)
         {
-            regularBuilder.addAll(stmt.updatedColumns());
+            regularBuilder.addAll(stmt.cfm, stmt.updatedColumns());
             updateRegular |= stmt.updatesRegularRows();
             if (stmt.hasConditions())
             {
@@ -137,7 +150,8 @@ public class BatchStatement implements CQLStatement
         {
             if (hasConditions)
                 throw new InvalidRequestException("Cannot provide custom timestamp for conditional BATCH");
-            if (type == Type.COUNTER)
+
+            if (isCounter())
                 throw new InvalidRequestException("Cannot provide custom timestamp for counter BATCH");
         }
 
@@ -152,10 +166,10 @@ public class BatchStatement implements CQLStatement
             if (timestampSet && statement.isTimestampSet())
                 throw new InvalidRequestException("Timestamp must be set either on BATCH or individual statements");
 
-            if (type == Type.COUNTER && !statement.isCounter())
+            if (isCounter() && !statement.isCounter())
                 throw new InvalidRequestException("Cannot include non-counter statement in a counter batch");
 
-            if (type == Type.LOGGED && statement.isCounter())
+            if (isLogged() && statement.isCounter())
                 throw new InvalidRequestException("Cannot include a counter statement in a logged batch");
 
             if (statement.isCounter())
@@ -181,6 +195,16 @@ public class BatchStatement implements CQLStatement
         }
     }
 
+    private boolean isCounter()
+    {
+        return type == Type.COUNTER;
+    }
+
+    private boolean isLogged()
+    {
+        return type == Type.LOGGED;
+    }
+
     // The batch itself will be validated in either Parsed#prepare() - for regular CQL3 batches,
     //   or in QueryProcessor.processBatch() - for native protocol batches.
     public void validate(ClientState state) throws InvalidRequestException
@@ -197,35 +221,33 @@ public class BatchStatement implements CQLStatement
     private Collection<? extends IMutation> getMutations(BatchQueryOptions options, boolean local, long now)
     throws RequestExecutionException, RequestValidationException
     {
-        Map<String, Map<ByteBuffer, IMutation>> mutations = new HashMap<>();
+        Set<String> tablesWithZeroGcGs = null;
+        UpdatesCollector collector = new UpdatesCollector(updatedColumns, updatedRows());
         for (int i = 0; i < statements.size(); i++)
         {
             ModificationStatement statement = statements.get(i);
+            if (isLogged() && statement.cfm.params.gcGraceSeconds == 0)
+            {
+                if (tablesWithZeroGcGs == null)
+                    tablesWithZeroGcGs = new HashSet<>();
+                tablesWithZeroGcGs.add(String.format("%s.%s", statement.cfm.ksName, statement.cfm.cfName));
+            }
             QueryOptions statementOptions = options.forStatement(i);
             long timestamp = attrs.getTimestamp(now, statementOptions);
-            addStatementMutations(statement, statementOptions, local, timestamp, mutations);
+            statement.addUpdates(collector, statementOptions, local, timestamp);
         }
-        return unzipMutations(mutations);
-    }
 
-    private Collection<? extends IMutation> unzipMutations(Map<String, Map<ByteBuffer, IMutation>> mutations)
-    {
+        if (tablesWithZeroGcGs != null)
+        {
+            String suffix = tablesWithZeroGcGs.size() == 1 ? "" : "s";
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, LOGGED_BATCH_LOW_GCGS_WARNING,
+                             suffix, tablesWithZeroGcGs);
+            ClientWarn.instance.warn(MessageFormatter.arrayFormat(LOGGED_BATCH_LOW_GCGS_WARNING, new Object[] { suffix, tablesWithZeroGcGs })
+                                                     .getMessage());
+        }
 
-        // The case where all statement where on the same keyspace is pretty common
-        if (mutations.size() == 1)
-            return mutations.values().iterator().next().values();
-
-
-        List<IMutation> ms = new ArrayList<>();
-        for (Map<ByteBuffer, IMutation> ksMap : mutations.values())
-            ms.addAll(ksMap.values());
-
-        return ms;
-    }
-
-    private PartitionColumns updatedColumns()
-    {
-        return updatedColumns;
+        collector.validateIndexedColumns();
+        return collector.toMutations();
     }
 
     private int updatedRows()
@@ -235,59 +257,10 @@ public class BatchStatement implements CQLStatement
         return statements.size();
     }
 
-    private void addStatementMutations(ModificationStatement statement,
-                                       QueryOptions options,
-                                       boolean local,
-                                       long now,
-                                       Map<String, Map<ByteBuffer, IMutation>> mutations)
-    throws RequestExecutionException, RequestValidationException
-    {
-        String ksName = statement.keyspace();
-        Map<ByteBuffer, IMutation> ksMap = mutations.get(ksName);
-        if (ksMap == null)
-        {
-            ksMap = new HashMap<>();
-            mutations.put(ksName, ksMap);
-        }
-
-        // The following does the same than statement.getMutations(), but we inline it here because
-        // we don't want to recreate mutations every time as this is particularly inefficient when applying
-        // multiple batch to the same partition (see #6737).
-        List<ByteBuffer> keys = statement.buildPartitionKeyNames(options);
-        CBuilder clustering = statement.createClustering(options);
-        UpdateParameters params = statement.makeUpdateParameters(keys, clustering, options, local, now);
-
-        for (ByteBuffer key : keys)
-        {
-            DecoratedKey dk = statement.cfm.decorateKey(key);
-            IMutation mutation = ksMap.get(dk.getKey());
-            Mutation mut;
-            if (mutation == null)
-            {
-                mut = new Mutation(ksName, dk);
-                mutation = statement.cfm.isCounter() ? new CounterMutation(mut, options.getConsistency()) : mut;
-                ksMap.put(dk.getKey(), mutation);
-            }
-            else
-            {
-                mut = statement.cfm.isCounter() ? ((CounterMutation) mutation).getMutation() : (Mutation) mutation;
-            }
-
-            PartitionUpdate upd = mut.get(statement.cfm);
-            if (upd == null)
-            {
-                upd = new PartitionUpdate(statement.cfm, dk, updatedColumns(), updatedRows());
-                mut.add(upd);
-            }
-
-            statement.addUpdateForKey(upd, clustering, params);
-        }
-    }
-
     /**
      * Checks batch size to ensure threshold is met. If not, a warning is logged.
      *
-     * @param cfs ColumnFamilies that will store the batch's mutations.
+     * @param updates - the batch mutations.
      */
     public static void verifyBatchSize(Iterable<PartitionUpdate> updates) throws InvalidRequestException
     {
@@ -315,31 +288,52 @@ public class BatchStatement implements CQLStatement
             {
                 logger.warn(format, tableNames, size, warnThreshold, size - warnThreshold, "");
             }
-            ClientWarn.warn(MessageFormatter.arrayFormat(format, new Object[] {tableNames, size, warnThreshold, size - warnThreshold, ""}).getMessage());
+            ClientWarn.instance.warn(MessageFormatter.arrayFormat(format, new Object[] {tableNames, size, warnThreshold, size - warnThreshold, ""}).getMessage());
         }
     }
 
     private void verifyBatchType(Iterable<PartitionUpdate> updates)
     {
-        if (type != Type.LOGGED && Iterables.size(updates) > 1)
+        if (!isLogged() && Iterables.size(updates) > 1)
         {
             Set<DecoratedKey> keySet = new HashSet<>();
             Set<String> tableNames = new HashSet<>();
 
+            Map<String, Collection<Range<Token>>> localTokensByKs = new HashMap<>();
+            boolean localPartitionsOnly = true;
             for (PartitionUpdate update : updates)
             {
                 keySet.add(update.partitionKey());
                 tableNames.add(String.format("%s.%s", update.metadata().ksName, update.metadata().cfName));
+
+                if (localPartitionsOnly)
+                    localPartitionsOnly &= isPartitionLocal(localTokensByKs, update);
             }
 
-            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, unloggedBatchWarning,
+            // CASSANDRA-9303: If we only have local mutations we do not warn
+            if (localPartitionsOnly)
+                return;
+
+
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, UNLOGGED_BATCH_WARNING,
                              keySet.size(), keySet.size() == 1 ? "" : "s",
                              tableNames.size() == 1 ? "" : "s", tableNames);
 
-            ClientWarn.warn(MessageFormatter.arrayFormat(unloggedBatchWarning, new Object[]{keySet.size(), keySet.size() == 1 ? "" : "s",
+            ClientWarn.instance.warn(MessageFormatter.arrayFormat(UNLOGGED_BATCH_WARNING, new Object[]{keySet.size(), keySet.size() == 1 ? "" : "s",
                                                     tableNames.size() == 1 ? "" : "s", tableNames}).getMessage());
-
         }
+    }
+
+    private boolean isPartitionLocal(Map<String, Collection<Range<Token>>> localTokensByKs, PartitionUpdate update)
+    {
+        Collection<Range<Token>> localRanges = localTokensByKs.get(update.metadata().ksName);
+        if (localRanges == null)
+        {
+            localRanges = StorageService.instance.getLocalRanges(update.metadata().ksName);
+            localTokensByKs.put(update.metadata().ksName, localRanges);
+        }
+
+        return Range.isInRanges(update.partitionKey().getToken(), localRanges);
     }
 
     public ResultMessage execute(QueryState queryState, QueryOptions options) throws RequestExecutionException, RequestValidationException
@@ -369,6 +363,9 @@ public class BatchStatement implements CQLStatement
 
     private void executeWithoutConditions(Collection<? extends IMutation> mutations, ConsistencyLevel cl) throws RequestExecutionException, RequestValidationException
     {
+        if (mutations.isEmpty())
+            return;
+
         // Extract each collection of updates from it's IMutation and then lazily concatenate all of them into a single Iterable.
         Iterable<PartitionUpdate> updates = Iterables.concat(Iterables.transform(mutations, new Function<IMutation, Collection<PartitionUpdate>>()
         {
@@ -381,7 +378,7 @@ public class BatchStatement implements CQLStatement
         verifyBatchSize(updates);
         verifyBatchType(updates);
 
-        boolean mutateAtomic = (type == Type.LOGGED && mutations.size() > 1);
+        boolean mutateAtomic = (isLogged() && mutations.size() > 1);
         StorageProxy.mutateWithTriggers(mutations, cl, mutateAtomic);
     }
 
@@ -433,17 +430,23 @@ public class BatchStatement implements CQLStatement
                 throw new InvalidRequestException("Batch with conditions cannot span multiple partitions");
             }
 
-            CBuilder cbuilder = statement.createClustering(statementOptions);
+            SortedSet<Clustering> clusterings = statement.createClustering(statementOptions);
+
+            checkFalse(clusterings.size() > 1,
+                       "IN on the clustering key columns is not supported with conditional updates");
+
+            Clustering clustering = Iterables.getOnlyElement(clusterings);
+
             if (statement.hasConditions())
             {
-                statement.addConditions(cbuilder.build(), casRequest, statementOptions);
+                statement.addConditions(clustering, casRequest, statementOptions);
                 // As soon as we have a ifNotExists, we set columnsWithConditions to null so that everything is in the resultSet
                 if (statement.hasIfNotExistCondition() || statement.hasIfExistCondition())
                     columnsWithConditions = null;
                 else if (columnsWithConditions != null)
                     Iterables.addAll(columnsWithConditions, statement.getColumnsWithConditions());
             }
-            casRequest.addRowUpdate(cbuilder, statement, statementOptions, timestamp);
+            casRequest.addRowUpdate(clustering, statement, statementOptions, timestamp);
         }
 
         return Pair.create(casRequest, columnsWithConditions);
@@ -461,14 +464,7 @@ public class BatchStatement implements CQLStatement
     private ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
     {
         for (IMutation mutation : getMutations(BatchQueryOptions.withoutPerStatementVariables(options), true, queryState.getTimestamp()))
-        {
-            assert mutation instanceof Mutation || mutation instanceof CounterMutation;
-
-            if (mutation instanceof Mutation)
-                ((Mutation) mutation).apply();
-            else if (mutation instanceof CounterMutation)
-                ((CounterMutation) mutation).apply();
-        }
+            mutation.apply();
         return null;
     }
 
@@ -485,11 +481,6 @@ public class BatchStatement implements CQLStatement
         {
             return new ResultMessage.Rows(ModificationStatement.buildCasResultSet(ksName, tableName, result, columnsWithConditions, true, options.forStatement(0)));
         }
-    }
-
-    public interface BatchVariables
-    {
-        public List<ByteBuffer> getVariablesForStatement(int statementInBatch);
     }
 
     public String toString()
@@ -550,10 +541,34 @@ public class BatchStatement implements CQLStatement
 
             // Use the CFMetadata of the first statement for partition key bind indexes.  If the statements affect
             // multiple tables, we won't send partition key bind indexes.
-            Short[] partitionKeyBindIndexes = haveMultipleCFs ? null
+            Short[] partitionKeyBindIndexes = (haveMultipleCFs || batchStatement.statements.isEmpty())? null
                                                               : boundNames.getPartitionKeyBindIndexes(batchStatement.statements.get(0).cfm);
 
             return new ParsedStatement.Prepared(batchStatement, boundNames, partitionKeyBindIndexes);
+        }
+    }
+
+    private static class MultiTableColumnsBuilder
+    {
+        private final Map<UUID, PartitionColumns.Builder> perTableBuilders = new HashMap<>();
+
+        public void addAll(CFMetaData table, PartitionColumns columns)
+        {
+            PartitionColumns.Builder builder = perTableBuilders.get(table.cfId);
+            if (builder == null)
+            {
+                builder = PartitionColumns.builder();
+                perTableBuilders.put(table.cfId, builder);
+            }
+            builder.addAll(columns);
+        }
+
+        public Map<UUID, PartitionColumns> build()
+        {
+            Map<UUID, PartitionColumns> m = new HashMap<>();
+            for (Map.Entry<UUID, PartitionColumns.Builder> p : perTableBuilders.entrySet())
+                m.put(p.getKey(), p.getValue().build());
+            return m;
         }
     }
 }

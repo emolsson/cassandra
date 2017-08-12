@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
@@ -75,7 +76,7 @@ public class SSTableUtils
         File cfDir = new File(tempdir, keyspaceName + File.separator + cfname);
         cfDir.mkdirs();
         cfDir.deleteOnExit();
-        File datafile = new File(new Descriptor(cfDir, keyspaceName, cfname, generation).filenameFor("Data.db"));
+        File datafile = new File(new Descriptor(cfDir, keyspaceName, cfname, generation).filenameFor(Component.DATA));
         if (!datafile.createNewFile())
             throw new IOException("unable to create file " + datafile);
         datafile.deleteOnExit();
@@ -164,7 +165,7 @@ public class SSTableUtils
             return this;
         }
 
-        public SSTableReader write(Set<String> keys) throws IOException
+        public Collection<SSTableReader> write(Set<String> keys) throws IOException
         {
             Map<String, PartitionUpdate> map = new HashMap<>();
             for (String key : keys)
@@ -176,11 +177,19 @@ public class SSTableUtils
             return write(map);
         }
 
-        public SSTableReader write(SortedMap<DecoratedKey, PartitionUpdate> sorted) throws IOException
+        public Collection<SSTableReader> write(SortedMap<DecoratedKey, PartitionUpdate> sorted) throws IOException
         {
+            PartitionColumns.Builder builder = PartitionColumns.builder();
+            for (PartitionUpdate update : sorted.values())
+                builder.addAll(update.columns());
             final Iterator<Map.Entry<DecoratedKey, PartitionUpdate>> iter = sorted.entrySet().iterator();
             return write(sorted.size(), new Appender()
             {
+                public SerializationHeader header()
+                {
+                    return new SerializationHeader(true, Schema.instance.getCFMetaData(ksname, cfname), builder.build(), EncodingStats.NO_STATS);
+                }
+
                 @Override
                 public boolean append(SSTableTxnWriter writer) throws IOException
                 {
@@ -192,7 +201,7 @@ public class SSTableUtils
             });
         }
 
-        public SSTableReader write(Map<String, PartitionUpdate> entries) throws IOException
+        public Collection<SSTableReader> write(Map<String, PartitionUpdate> entries) throws IOException
         {
             SortedMap<DecoratedKey, PartitionUpdate> sorted = new TreeMap<>();
             for (Map.Entry<String, PartitionUpdate> entry : entries.entrySet())
@@ -201,23 +210,28 @@ public class SSTableUtils
             return write(sorted);
         }
 
-        public SSTableReader write(int expectedSize, Appender appender) throws IOException
+        public Collection<SSTableReader> write(int expectedSize, Appender appender) throws IOException
         {
             File datafile = (dest == null) ? tempSSTableFile(ksname, cfname, generation) : new File(dest.filenameFor(Component.DATA));
-            SerializationHeader header = SerializationHeader.make(Schema.instance.getCFMetaData(ksname, cfname), Collections.EMPTY_LIST);
-            SSTableTxnWriter writer = SSTableTxnWriter.create(datafile.getAbsolutePath(), expectedSize, ActiveRepairService.UNREPAIRED_SSTABLE, 0, header);
+            CFMetaData cfm = Schema.instance.getCFMetaData(ksname, cfname);
+            ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(cfm.cfId);
+            SerializationHeader header = appender.header();
+            SSTableTxnWriter writer = SSTableTxnWriter.create(cfs, datafile.getAbsolutePath(), expectedSize, ActiveRepairService.UNREPAIRED_SSTABLE, 0, header);
             while (appender.append(writer)) { /* pass */ }
-            SSTableReader reader = writer.finish(true);
+            Collection<SSTableReader> readers = writer.finish(true);
+
             // mark all components for removal
             if (cleanup)
-                for (Component component : reader.components)
-                    new File(reader.descriptor.filenameFor(component)).deleteOnExit();
-            return reader;
+                for (SSTableReader reader: readers)
+                    for (Component component : reader.components)
+                        new File(reader.descriptor.filenameFor(component)).deleteOnExit();
+            return readers;
         }
     }
 
     public static abstract class Appender
     {
+        public abstract SerializationHeader header();
         /** Called with an open writer until it returns false. */
         public abstract boolean append(SSTableTxnWriter writer) throws IOException;
     }

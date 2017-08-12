@@ -17,11 +17,11 @@
  */
 package org.apache.cassandra.service.pager;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
@@ -30,6 +30,7 @@ abstract class AbstractQueryPager implements QueryPager
 {
     protected final ReadCommand command;
     protected final DataLimits limits;
+    protected final int protocolVersion;
 
     private int remaining;
 
@@ -41,96 +42,112 @@ abstract class AbstractQueryPager implements QueryPager
 
     private boolean exhausted;
 
-    protected AbstractQueryPager(ReadCommand command)
+    protected AbstractQueryPager(ReadCommand command, int protocolVersion)
     {
         this.command = command;
+        this.protocolVersion = protocolVersion;
         this.limits = command.limits();
 
         this.remaining = limits.count();
         this.remainingInPartition = limits.perPartitionCount();
     }
 
-    public ReadOrderGroup startOrderGroup()
+    public ReadExecutionController executionController()
     {
-        return command.startOrderGroup();
+        return command.executionController();
     }
 
     public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState) throws RequestValidationException, RequestExecutionException
     {
         if (isExhausted())
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
 
         pageSize = Math.min(pageSize, remaining);
-        return new PagerIterator(nextPageReadCommand(pageSize).execute(consistency, clientState), limits.forPaging(pageSize), command.nowInSec());
+        Pager pager = new Pager(limits.forPaging(pageSize), command.nowInSec());
+        return Transformation.apply(nextPageReadCommand(pageSize).execute(consistency, clientState), pager);
     }
 
-    public PartitionIterator fetchPageInternal(int pageSize, ReadOrderGroup orderGroup) throws RequestValidationException, RequestExecutionException
+    public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController) throws RequestValidationException, RequestExecutionException
     {
         if (isExhausted())
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
 
         pageSize = Math.min(pageSize, remaining);
-        return new PagerIterator(nextPageReadCommand(pageSize).executeInternal(orderGroup), limits.forPaging(pageSize), command.nowInSec());
+        Pager pager = new Pager(limits.forPaging(pageSize), command.nowInSec());
+        return Transformation.apply(nextPageReadCommand(pageSize).executeInternal(executionController), pager);
     }
 
-    private class PagerIterator extends CountingPartitionIterator
+    private class Pager extends Transformation<RowIterator>
     {
         private final DataLimits pageLimits;
-
+        private final DataLimits.Counter counter;
         private Row lastRow;
+        private boolean isFirstPartition = true;
 
-        private PagerIterator(PartitionIterator iter, DataLimits pageLimits, int nowInSec)
+        private Pager(DataLimits pageLimits, int nowInSec)
         {
-            super(iter, pageLimits, nowInSec);
+            this.counter = pageLimits.newCounter(nowInSec, true);
             this.pageLimits = pageLimits;
         }
 
         @Override
-        @SuppressWarnings("resource") // iter is closed by closing the result
-        public RowIterator next()
+        public RowIterator applyToPartition(RowIterator partition)
         {
-            RowIterator iter = super.next();
-            try
-            {
-                DecoratedKey key = iter.partitionKey();
-                if (lastKey == null || !lastKey.equals(key))
-                    remainingInPartition = limits.perPartitionCount();
+            DecoratedKey key = partition.partitionKey();
+            if (lastKey == null || !lastKey.equals(key))
+                remainingInPartition = limits.perPartitionCount();
+            lastKey = key;
 
-                lastKey = key;
-                return new RowPagerIterator(iter);
-            }
-            catch (RuntimeException e)
+            // If this is the first partition of this page, this could be the continuation of a partition we've started
+            // on the previous page. In which case, we could have the problem that the partition has no more "regular"
+            // rows (but the page size is such we didn't knew before) but it does has a static row. We should then skip
+            // the partition as returning it would means to the upper layer that the partition has "only" static columns,
+            // which is not the case (and we know the static results have been sent on the previous page).
+            if (isFirstPartition)
             {
-                iter.close();
-                throw e;
+                isFirstPartition = false;
+                if (isPreviouslyReturnedPartition(key) && !partition.hasNext())
+                {
+                    partition.close();
+                    return null;
+                }
             }
+
+            return Transformation.apply(counter.applyTo(partition), this);
         }
 
         @Override
-        public void close()
+        public void onClose()
         {
-            super.close();
             recordLast(lastKey, lastRow);
 
             int counted = counter.counted();
             remaining -= counted;
-            remainingInPartition -= counter.countedInCurrentPartition();
+            // If the clustering of the last row returned is a static one, it means that the partition was only
+            // containing data within the static columns. Therefore, there are not data remaining within the partition.
+            if (lastRow != null && lastRow.clustering() == Clustering.STATIC_CLUSTERING)
+            {
+                remainingInPartition = 0;
+            }
+            else
+            {
+                remainingInPartition -= counter.countedInCurrentPartition();
+            }
             exhausted = counted < pageLimits.count();
         }
 
-        private class RowPagerIterator extends WrappingRowIterator
+        public Row applyToStatic(Row row)
         {
-            RowPagerIterator(RowIterator iter)
-            {
-                super(iter);
-            }
+            if (!row.isEmpty())
+                lastRow = row;
+            return row;
+        }
 
-            @Override
-            public Row next()
-            {
-                lastRow = super.next();
-                return lastRow;
-            }
+        @Override
+        public Row applyToRow(Row row)
+        {
+            lastRow = row;
+            return row;
         }
     }
 
@@ -158,4 +175,5 @@ abstract class AbstractQueryPager implements QueryPager
 
     protected abstract ReadCommand nextPageReadCommand(int pageSize);
     protected abstract void recordLast(DecoratedKey key, Row row);
+    protected abstract boolean isPreviouslyReturnedPartition(DecoratedKey key);
 }

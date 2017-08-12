@@ -19,15 +19,8 @@ package org.apache.cassandra.io.sstable;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.*;
+import java.util.concurrent.*;
 
 import com.google.common.collect.Sets;
 import org.junit.Assert;
@@ -38,34 +31,32 @@ import org.junit.runner.RunWith;
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.cache.CachingOptions;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
-import org.apache.cassandra.db.BufferDecoratedKey;
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.ReadCommand;
-import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.index.SecondaryIndexSearcher;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LocalPartitioner.LocalToken;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.MmappedSegmentedFile;
+import org.apache.cassandra.io.util.MmappedRegions;
 import org.apache.cassandra.io.util.SegmentedFile;
+import org.apache.cassandra.schema.CachingParams;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class SSTableReaderTest
@@ -95,7 +86,7 @@ public class SSTableReaderTest
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARDLOWINDEXINTERVAL)
                                                 .minIndexInterval(8)
                                                 .maxIndexInterval(256)
-                                                .caching(CachingOptions.NONE));
+                                                .caching(CachingParams.CACHE_NOTHING));
     }
 
     @Test
@@ -142,40 +133,48 @@ public class SSTableReaderTest
     @Test
     public void testSpannedIndexPositions() throws IOException
     {
-        MmappedSegmentedFile.MAX_SEGMENT_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of segments
+        int originalMaxSegmentSize = MmappedRegions.MAX_SEGMENT_SIZE;
+        MmappedRegions.MAX_SEGMENT_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of segments
 
-        Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
-        partitioner = store.getPartitioner();
-
-        // insert a bunch of data and compact to a single sstable
-        CompactionManager.instance.disableAutoCompaction();
-        for (int j = 0; j < 100; j += 2)
+        try
         {
-            new RowUpdateBuilder(store.metadata, j, String.valueOf(j))
-            .clustering("0")
-            .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
-            .build()
-            .applyUnsafe();
+            Keyspace keyspace = Keyspace.open(KEYSPACE1);
+            ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
+            partitioner = store.getPartitioner();
+
+            // insert a bunch of data and compact to a single sstable
+            CompactionManager.instance.disableAutoCompaction();
+            for (int j = 0; j < 100; j += 2)
+            {
+                new RowUpdateBuilder(store.metadata, j, String.valueOf(j))
+                .clustering("0")
+                .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                .build()
+                .applyUnsafe();
+            }
+            store.forceBlockingFlush();
+            CompactionManager.instance.performMaximal(store, false);
+
+            // check that all our keys are found correctly
+            SSTableReader sstable = store.getLiveSSTables().iterator().next();
+            for (int j = 0; j < 100; j += 2)
+            {
+                DecoratedKey dk = Util.dk(String.valueOf(j));
+                FileDataInput file = sstable.getFileDataInput(sstable.getPosition(dk, SSTableReader.Operator.EQ).position);
+                DecoratedKey keyInDisk = sstable.decorateKey(ByteBufferUtil.readWithShortLength(file));
+                assert keyInDisk.equals(dk) : String.format("%s != %s in %s", keyInDisk, dk, file.getPath());
+            }
+
+            // check no false positives
+            for (int j = 1; j < 110; j += 2)
+            {
+                DecoratedKey dk = Util.dk(String.valueOf(j));
+                assert sstable.getPosition(dk, SSTableReader.Operator.EQ) == null;
+            }
         }
-        store.forceBlockingFlush();
-        CompactionManager.instance.performMaximal(store, false);
-
-        // check that all our keys are found correctly
-        SSTableReader sstable = store.getLiveSSTables().iterator().next();
-        for (int j = 0; j < 100; j += 2)
+        finally
         {
-            DecoratedKey dk = Util.dk(String.valueOf(j));
-            FileDataInput file = sstable.getFileDataInput(sstable.getPosition(dk, SSTableReader.Operator.EQ).position);
-            DecoratedKey keyInDisk = sstable.decorateKey(ByteBufferUtil.readWithShortLength(file));
-            assert keyInDisk.equals(dk) : String.format("%s != %s in %s", keyInDisk, dk, file.getPath());
-        }
-
-        // check no false positives
-        for (int j = 1; j < 110; j += 2)
-        {
-            DecoratedKey dk = Util.dk(String.valueOf(j));
-            assert sstable.getPosition(dk, SSTableReader.Operator.EQ) == null;
+            MmappedRegions.MAX_SEGMENT_SIZE = originalMaxSegmentSize;
         }
     }
 
@@ -342,7 +341,7 @@ public class SSTableReaderTest
 
         DecoratedKey firstKey = null, lastKey = null;
         long timestamp = System.currentTimeMillis();
-        for (int i = 0; i < store.metadata.getMinIndexInterval(); i++)
+        for (int i = 0; i < store.metadata.params.minIndexInterval; i++)
         {
             DecoratedKey key = Util.dk(String.valueOf(i));
             if (firstKey == null)
@@ -388,19 +387,23 @@ public class SSTableReaderTest
 
         store.forceBlockingFlush();
 
-        ColumnFamilyStore indexCfs = store.indexManager.getIndexForColumn(store.metadata.getColumnDefinition(bytes("birthdate"))).getIndexCfs();
-        assert indexCfs.isIndex();
-        SSTableReader sstable = indexCfs.getLiveSSTables().iterator().next();
-        assert sstable.first.getToken() instanceof LocalToken;
-
-        try(SegmentedFile.Builder ibuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode(), false);
-            SegmentedFile.Builder dbuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getDiskAccessMode(), sstable.compression))
+        for(ColumnFamilyStore indexCfs : store.indexManager.getAllIndexColumnFamilyStores())
         {
-            sstable.saveSummary(ibuilder, dbuilder);
+            assert indexCfs.isIndex();
+            SSTableReader sstable = indexCfs.getLiveSSTables().iterator().next();
+            assert sstable.first.getToken() instanceof LocalToken;
+
+            try (SegmentedFile.Builder ibuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode(),
+                                                                           false);
+                 SegmentedFile.Builder dbuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getDiskAccessMode(),
+                                                                           sstable.compression))
+            {
+                sstable.saveSummary(ibuilder, dbuilder);
+            }
+            SSTableReader reopened = SSTableReader.open(sstable.descriptor);
+            assert reopened.first.getToken() instanceof LocalToken;
+            reopened.selfRef().release();
         }
-        SSTableReader reopened = SSTableReader.open(sstable.descriptor);
-        assert reopened.first.getToken() instanceof LocalToken;
-        reopened.selfRef().release();
     }
 
     /** see CASSANDRA-5407 */
@@ -537,6 +540,55 @@ public class SSTableReaderTest
         assertEquals(sstable.estimatedKeys(), replacement.estimatedKeys(), 1);
     }
 
+    @Test
+    public void testIndexSummaryUpsampleAndReload() throws Exception
+    {
+        int originalMaxSegmentSize = MmappedRegions.MAX_SEGMENT_SIZE;
+        MmappedRegions.MAX_SEGMENT_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of segments
+
+        try
+        {
+            testIndexSummaryUpsampleAndReload0();
+        }
+        finally
+        {
+            MmappedRegions.MAX_SEGMENT_SIZE = originalMaxSegmentSize;
+        }
+    }
+
+    private void testIndexSummaryUpsampleAndReload0() throws Exception
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        final ColumnFamilyStore store = keyspace.getColumnFamilyStore("StandardLowIndexInterval"); // index interval of 8, no key caching
+        CompactionManager.instance.disableAutoCompaction();
+
+        final int NUM_PARTITIONS = 512;
+        for (int j = 0; j < NUM_PARTITIONS; j++)
+        {
+            new RowUpdateBuilder(store.metadata, j, String.format("%3d", j))
+            .clustering("0")
+            .add("val", String.format("%3d", j))
+            .build()
+            .applyUnsafe();
+
+        }
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store, false);
+
+        Collection<SSTableReader> sstables = store.getLiveSSTables();
+        assert sstables.size() == 1;
+        final SSTableReader sstable = sstables.iterator().next();
+
+        try (LifecycleTransaction txn = store.getTracker().tryModify(Arrays.asList(sstable), OperationType.UNKNOWN))
+        {
+            SSTableReader replacement = sstable.cloneWithNewSummarySamplingLevel(store, sstable.getIndexSummarySamplingLevel() + 1);
+            txn.update(replacement, true);
+            txn.finish();
+        }
+        SSTableReader reopen = SSTableReader.open(sstable.descriptor);
+        assert reopen.getIndexSummarySamplingLevel() == sstable.getIndexSummarySamplingLevel() + 1;
+    }
+
     private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS)
     {
         assert "Indexed1".equals(indexedCFS.name);
@@ -545,16 +597,18 @@ public class SSTableReaderTest
         for (ColumnFamilyStore cfs : indexedCFS.concatWithIndexes())
             clearAndLoad(cfs);
 
-        ByteBuffer bBB = bytes("birthdate");
 
         // query using index to see if sstable for secondary index opens
         ReadCommand rc = Util.cmd(indexedCFS).fromKeyIncl("k1").toKeyIncl("k3")
                                              .columns("birthdate")
                                              .filterOn("birthdate", Operator.EQ, 1L)
                                              .build();
-        List<SecondaryIndexSearcher> searchers = indexedCFS.indexManager.getIndexSearchersFor(rc);
-        assertEquals(searchers.size(), 1);
-        assertEquals(1, Util.getAll(rc).size());
+        Index.Searcher searcher = indexedCFS.indexManager.getBestIndexFor(rc).searcherFor(rc);
+        assertNotNull(searcher);
+        try (ReadExecutionController executionController = ReadExecutionController.forCommand(rc))
+        {
+            assertEquals(1, Util.size(UnfilteredPartitionIterators.filter(searcher.search(executionController), rc.nowInSec())));
+        }
     }
 
     private List<Range<Token>> makeRanges(Token left, Token right)

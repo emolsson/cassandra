@@ -28,7 +28,6 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData.SpeculativeRetry.RetryType;
 import org.apache.cassandra.config.ReadRepairDecision;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -42,10 +41,10 @@ import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.metrics.ReadRepairMetrics;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.SpeculativeRetryParam;
 import org.apache.cassandra.service.StorageProxy.LocalReadRunnable;
 import org.apache.cassandra.tracing.TraceState;
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Sends a read request to the replicas needed to satisfy a given ConsistencyLevel.
@@ -70,6 +69,15 @@ public abstract class AbstractReadExecutor
         this.targetReplicas = targetReplicas;
         this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
         this.traceState = Tracing.instance.get();
+
+        // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
+        // knows how to produce older digest but the reverse is not true.
+        // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
+        // we stop being compatible with pre-3.0 nodes.
+        int digestVersion = MessagingService.current_version;
+        for (InetAddress replica : targetReplicas)
+            digestVersion = Math.min(digestVersion, MessagingService.instance().getVersion(replica));
+        command.setDigestVersion(digestVersion);
     }
 
     protected void makeDataRequests(Iterable<InetAddress> endpoints)
@@ -85,7 +93,6 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
-        MessageOut<ReadCommand> message = null;
         boolean hasLocalEndpoint = false;
 
         for (InetAddress endpoint : endpoints)
@@ -99,8 +106,7 @@ public abstract class AbstractReadExecutor
             if (traceState != null)
                 traceState.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
             logger.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
-            if (message == null)
-                message = readCommand.createMessage();
+            MessageOut<ReadCommand> message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
         }
 
@@ -159,10 +165,10 @@ public abstract class AbstractReadExecutor
         }
 
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().cfId);
-        RetryType retryType = cfs.metadata.getSpeculativeRetry().type;
+        SpeculativeRetryParam retry = cfs.metadata.params.speculativeRetry;
 
         // Speculative retry is disabled *OR* there are simply no extra replicas to speculate.
-        if (retryType == RetryType.NONE || consistencyLevel.blockFor(keyspace) == allReplicas.size())
+        if (retry.equals(SpeculativeRetryParam.NONE) || consistencyLevel.blockFor(keyspace) == allReplicas.size())
             return new NeverSpeculatingReadExecutor(keyspace, command, consistencyLevel, targetReplicas);
 
         if (targetReplicas.size() == allReplicas.size())
@@ -190,7 +196,7 @@ public abstract class AbstractReadExecutor
         }
         targetReplicas.add(extraReplica);
 
-        if (retryType == RetryType.ALWAYS)
+        if (retry.equals(SpeculativeRetryParam.ALWAYS))
             return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas);
         else // PERCENTILE or CUSTOM.
             return new SpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas);
@@ -278,7 +284,8 @@ public abstract class AbstractReadExecutor
                 if (traceState != null)
                     traceState.trace("speculating read retry on {}", extraReplica);
                 logger.trace("speculating read retry on {}", extraReplica);
-                MessagingService.instance().sendRRWithFailure(retryCommand.createMessage(), extraReplica, handler);
+                int version = MessagingService.instance().getVersion(extraReplica);
+                MessagingService.instance().sendRRWithFailure(retryCommand.createMessage(version), extraReplica, handler);
                 speculated = true;
 
                 cfs.metric.speculativeRetries.inc();

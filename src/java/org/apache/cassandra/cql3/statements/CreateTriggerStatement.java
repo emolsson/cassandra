@@ -59,7 +59,7 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
     public void validate(ClientState state) throws RequestValidationException
     {
         CFMetaData cfm = ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
-        if (cfm.isMaterializedView())
+        if (cfm.isView())
             throw new InvalidRequestException("Cannot CREATE TRIGGER against a materialized view");
 
         try
@@ -72,7 +72,7 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         }
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws ConfigurationException, InvalidRequestException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws ConfigurationException, InvalidRequestException
     {
         CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily()).copy();
         Triggers triggers = cfm.getTriggers();
@@ -80,7 +80,7 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         if (triggers.get(triggerName).isPresent())
         {
             if (ifNotExists)
-                return false;
+                return null;
             else
                 throw new InvalidRequestException(String.format("Trigger %s already exists", triggerName));
         }
@@ -88,11 +88,6 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         cfm.triggers(triggers.with(TriggerMetadata.create(triggerName, triggerClass)));
         logger.info("Adding trigger with name {} and class {}", triggerName, triggerClass);
         MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
-        return true;
-    }
-
-    public Event.SchemaChange changeEvent()
-    {
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 }

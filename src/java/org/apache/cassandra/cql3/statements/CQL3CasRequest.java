@@ -22,11 +22,15 @@ import java.util.*;
 
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
-import org.apache.cassandra.cql3.*;
+
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.FilteredPartition;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.CASRequest;
 import org.apache.cassandra.utils.Pair;
@@ -67,9 +71,9 @@ public class CQL3CasRequest implements CASRequest
         this.updatesStaticRow = updatesStaticRow;
     }
 
-    public void addRowUpdate(CBuilder cbuilder, ModificationStatement stmt, QueryOptions options, long timestamp)
+    public void addRowUpdate(Clustering clustering, ModificationStatement stmt, QueryOptions options, long timestamp)
     {
-        updates.add(new RowUpdate(cbuilder, stmt, options, timestamp));
+        updates.add(new RowUpdate(clustering, stmt, options, timestamp));
     }
 
     public void addNotExist(Clustering clustering) throws InvalidRequestException
@@ -170,6 +174,8 @@ public class CQL3CasRequest implements CASRequest
         for (RowUpdate upd : updates)
             upd.applyUpdates(current, update);
 
+        Keyspace.openAndGetStore(cfm).indexManager.validate(update);
+
         if (isBatch)
             BatchStatement.verifyBatchSize(Collections.singleton(update));
 
@@ -184,14 +190,14 @@ public class CQL3CasRequest implements CASRequest
      */
     private class RowUpdate
     {
-        private final CBuilder cbuilder;
+        private final Clustering clustering;
         private final ModificationStatement stmt;
         private final QueryOptions options;
         private final long timestamp;
 
-        private RowUpdate(CBuilder cbuilder, ModificationStatement stmt, QueryOptions options, long timestamp)
+        private RowUpdate(Clustering clustering, ModificationStatement stmt, QueryOptions options, long timestamp)
         {
-            this.cbuilder = cbuilder;
+            this.clustering = clustering;
             this.stmt = stmt;
             this.options = options;
             this.timestamp = timestamp;
@@ -200,8 +206,8 @@ public class CQL3CasRequest implements CASRequest
         public void applyUpdates(FilteredPartition current, PartitionUpdate updates) throws InvalidRequestException
         {
             Map<DecoratedKey, Partition> map = stmt.requiresRead() ? Collections.<DecoratedKey, Partition>singletonMap(key, current) : null;
-            UpdateParameters params = new UpdateParameters(cfm, updates.columns(), options, timestamp, stmt.getTimeToLive(options), map, true);
-            stmt.addUpdateForKey(updates, cbuilder, params);
+            UpdateParameters params = new UpdateParameters(cfm, updates.columns(), options, timestamp, stmt.getTimeToLive(options), map);
+            stmt.addUpdateForKey(updates, clustering, params);
         }
     }
 

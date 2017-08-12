@@ -24,7 +24,6 @@ import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.cache.InstrumentingCache;
 import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -54,20 +53,17 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     @VisibleForTesting
     public static boolean disableEarlyOpeningForTests = false;
 
-    private final ColumnFamilyStore cfs;
     private final long preemptiveOpenInterval;
     private final long maxAge;
     private long repairedAt = -1;
     // the set of final readers we will expose on commit
     private final LifecycleTransaction transaction; // the readers we are rewriting (updated as they are replaced)
     private final List<SSTableReader> preparedForCommit = new ArrayList<>();
-    private final Map<Descriptor, Integer> fileDescriptors = new HashMap<>(); // the file descriptors for each reader descriptor we are rewriting
 
     private long currentlyOpenedEarlyAt; // the position (in MB) in the target file we last (re)opened at
 
     private final List<SSTableWriter> writers = new ArrayList<>();
-    private final boolean isOffline; // true for operations that are performed without Cassandra running (prevents updates of Tracker)
-    private boolean keepOriginals; // true if we do not want to obsolete the originals
+    private final boolean keepOriginals; // true if we do not want to obsolete the originals
 
     private SSTableWriter writer;
     private Map<DecoratedKey, RowIndexEntry> cachedKeys = new HashMap<>();
@@ -75,33 +71,40 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     // for testing (TODO: remove when have byteman setup)
     private boolean throwEarly, throwLate;
 
-    public SSTableRewriter(ColumnFamilyStore cfs, LifecycleTransaction transaction, long maxAge, boolean isOffline)
+    @Deprecated
+    public SSTableRewriter(LifecycleTransaction transaction, long maxAge, boolean isOffline)
     {
-        this(cfs, transaction, maxAge, isOffline, true);
+        this(transaction, maxAge, isOffline, true);
     }
-
-    public SSTableRewriter(ColumnFamilyStore cfs, LifecycleTransaction transaction, long maxAge, boolean isOffline, boolean shouldOpenEarly)
+    @Deprecated
+    public SSTableRewriter(LifecycleTransaction transaction, long maxAge, boolean isOffline, boolean shouldOpenEarly)
     {
-        this(cfs, transaction, maxAge, isOffline, calculateOpenInterval(shouldOpenEarly));
+        this(transaction, maxAge, calculateOpenInterval(shouldOpenEarly), false);
     }
 
     @VisibleForTesting
-    public SSTableRewriter(ColumnFamilyStore cfs, LifecycleTransaction transaction, long maxAge, boolean isOffline, long preemptiveOpenInterval)
+    public SSTableRewriter(LifecycleTransaction transaction, long maxAge, long preemptiveOpenInterval, boolean keepOriginals)
     {
         this.transaction = transaction;
-        for (SSTableReader sstable : this.transaction.originals())
-            fileDescriptors.put(sstable.descriptor, CLibrary.getfd(sstable.getFilename()));
-        this.cfs = cfs;
         this.maxAge = maxAge;
-        this.isOffline = isOffline;
-        this.keepOriginals = false;
+        this.keepOriginals = keepOriginals;
         this.preemptiveOpenInterval = preemptiveOpenInterval;
     }
 
-    public SSTableRewriter keepOriginals(boolean val)
+    @Deprecated
+    public static SSTableRewriter constructKeepingOriginals(LifecycleTransaction transaction, boolean keepOriginals, long maxAge, boolean isOffline)
     {
-        keepOriginals = val;
-        return this;
+        return constructKeepingOriginals(transaction, keepOriginals, maxAge);
+    }
+
+    public static SSTableRewriter constructKeepingOriginals(LifecycleTransaction transaction, boolean keepOriginals, long maxAge)
+    {
+        return new SSTableRewriter(transaction, maxAge, calculateOpenInterval(true), keepOriginals);
+    }
+
+    public static SSTableRewriter constructWithoutEarlyOpening(LifecycleTransaction transaction, boolean keepOriginals, long maxAge)
+    {
+        return new SSTableRewriter(transaction, maxAge, calculateOpenInterval(false), keepOriginals);
     }
 
     private static long calculateOpenInterval(boolean shouldOpenEarly)
@@ -123,7 +126,7 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         DecoratedKey key = partition.partitionKey();
         maybeReopenEarly(key);
         RowIndexEntry index = writer.append(partition);
-        if (!isOffline && index != null)
+        if (!transaction.isOffline() && index != null)
         {
             boolean save = false;
             for (SSTableReader reader : transaction.originals())
@@ -159,12 +162,12 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     {
         if (writer.getFilePointer() - currentlyOpenedEarlyAt > preemptiveOpenInterval)
         {
-            if (isOffline)
+            if (transaction.isOffline())
             {
                 for (SSTableReader reader : transaction.originals())
                 {
                     RowIndexEntry index = reader.getPosition(key, SSTableReader.Operator.GE);
-                    CLibrary.trySkipCache(fileDescriptors.get(reader.descriptor), 0, index == null ? 0 : index.position, reader.getFilename());
+                    CLibrary.trySkipCache(reader.getFilename(), 0, index == null ? 0 : index.position);
                 }
             }
             else
@@ -215,14 +218,14 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
      */
     private void moveStarts(SSTableReader newReader, DecoratedKey lowerbound)
     {
-        if (isOffline)
+        if (transaction.isOffline())
             return;
         if (preemptiveOpenInterval == Long.MAX_VALUE)
             return;
 
         final List<DecoratedKey> invalidateKeys = new ArrayList<>();
         invalidateKeys.addAll(cachedKeys.keySet());
-        newReader.setupKeyCache();
+        newReader.setupOnline();
         for (Map.Entry<DecoratedKey, RowIndexEntry> cacheKey : cachedKeys.entrySet())
             newReader.cacheKey(cacheKey.getKey(), cacheKey.getValue());
 

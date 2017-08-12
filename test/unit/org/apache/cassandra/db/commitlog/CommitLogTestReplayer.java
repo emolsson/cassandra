@@ -29,6 +29,7 @@ import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.rows.SerializationHelper;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.NIODataInputStream;
+import org.apache.cassandra.io.util.RebufferingInputStream;
 
 /**
  * Utility class for tests needing to examine the commitlog contents.
@@ -39,28 +40,28 @@ public class CommitLogTestReplayer extends CommitLogReplayer
     {
         CommitLog.instance.sync(true);
 
-        CommitLogTestReplayer replayer = new CommitLogTestReplayer(processor);
+        CommitLogTestReplayer replayer = new CommitLogTestReplayer(CommitLog.instance, processor);
         File commitLogDir = new File(DatabaseDescriptor.getCommitLogLocation());
         replayer.recover(commitLogDir.listFiles());
     }
 
     final private Predicate<Mutation> processor;
 
-    public CommitLogTestReplayer(Predicate<Mutation> processor)
+    public CommitLogTestReplayer(CommitLog log, Predicate<Mutation> processor)
     {
-        this(ReplayPosition.NONE, processor);
+        this(log, ReplayPosition.NONE, processor);
     }
 
-    public CommitLogTestReplayer(ReplayPosition discardedPos, Predicate<Mutation> processor)
+    public CommitLogTestReplayer(CommitLog log, ReplayPosition discardedPos, Predicate<Mutation> processor)
     {
-        super(discardedPos, null, ReplayFilter.create());
+        super(log, discardedPos, null, ReplayFilter.create());
         this.processor = processor;
     }
 
     @Override
     void replayMutation(byte[] inputBuffer, int size, final long entryLocation, final CommitLogDescriptor desc)
     {
-        NIODataInputStream bufIn = new DataInputBuffer(inputBuffer, 0, size);
+        RebufferingInputStream bufIn = new DataInputBuffer(inputBuffer, 0, size);
         Mutation mutation;
         try
         {

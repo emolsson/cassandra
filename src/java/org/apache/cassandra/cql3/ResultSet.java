@@ -269,6 +269,11 @@ public class ResultSet
             return names == null ? columnCount : names.size();
         }
 
+        /**
+         * Adds the specified column which will not be serialized.
+         *
+         * @param name the column
+         */
         public void addNonSerializedColumn(ColumnSpecification name)
         {
             // See comment above. Because columnCount doesn't account the newly added name, it
@@ -325,7 +330,7 @@ public class ResultSet
 
                 PagingState state = null;
                 if (flags.contains(Flag.HAS_MORE_PAGES))
-                    state = PagingState.deserialize(CBUtil.readValue(body));
+                    state = PagingState.deserialize(CBUtil.readValue(body), version);
 
                 if (flags.contains(Flag.NO_METADATA))
                     return new ResultMetadata(flags, null, columnCount, state);
@@ -365,7 +370,7 @@ public class ResultSet
                 dest.writeInt(m.columnCount);
 
                 if (hasMorePages)
-                    CBUtil.writeValue(m.pagingState.serialize(), dest);
+                    CBUtil.writeValue(m.pagingState.serialize(version), dest);
 
                 if (!noMetadata)
                 {
@@ -397,7 +402,7 @@ public class ResultSet
 
                 int size = 8;
                 if (hasMorePages)
-                    size += CBUtil.sizeOfValue(m.pagingState.serialize());
+                    size += CBUtil.sizeOfValue(m.pagingState.serializedSize(version));
 
                 if (!noMetadata)
                 {

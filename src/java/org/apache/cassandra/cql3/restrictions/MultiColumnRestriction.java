@@ -22,13 +22,14 @@ import java.util.*;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.Term.Terminal;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndex;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.SecondaryIndexManager;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
@@ -66,7 +67,7 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
     }
 
     @Override
-    public Collection<ColumnDefinition> getColumnDefs()
+    public List<ColumnDefinition> getColumnDefs()
     {
         return columnDefs;
     }
@@ -74,9 +75,14 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
     @Override
     public final Restriction mergeWith(Restriction otherRestriction) throws InvalidRequestException
     {
-            checkTrue(otherRestriction.isMultiColumn(),
-                      "Mixing single column relations and multi column relations on clustering columns is not allowed");
-            return doMergeWith(otherRestriction);
+        // We want to allow query like: (b,c) > (?, ?) AND b < ?
+        if (!otherRestriction.isMultiColumn()
+                && ((SingleColumnRestriction) otherRestriction).canBeConvertedToMultiColumnRestriction())
+        {
+            return doMergeWith(((SingleColumnRestriction) otherRestriction).toMultiColumnRestriction());
+        }
+
+        return doMergeWith(otherRestriction);
     }
 
     protected abstract Restriction doMergeWith(Restriction otherRestriction) throws InvalidRequestException;
@@ -106,23 +112,20 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
     @Override
     public final boolean hasSupportingIndex(SecondaryIndexManager indexManager)
     {
-        for (ColumnDefinition columnDef : columnDefs)
-        {
-            SecondaryIndex index = indexManager.getIndexForColumn(columnDef);
-            if (index != null && isSupportedBy(index))
-                return true;
-        }
+        for (Index index : indexManager.listIndexes())
+           if (isSupportedBy(index))
+               return true;
         return false;
     }
 
     /**
      * Check if this type of restriction is supported for by the specified index.
-     * @param index the Secondary index
+     * @param index the secondary index
      *
      * @return <code>true</code> this type of restriction is supported by the specified index,
      * <code>false</code> otherwise.
      */
-    protected abstract boolean isSupportedBy(SecondaryIndex index);
+    protected abstract boolean isSupportedBy(Index index);
 
     public static class EQRestriction extends MultiColumnRestriction
     {
@@ -154,9 +157,12 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
-            return index.supportsOperator(Operator.EQ);
+            for(ColumnDefinition column : columnDefs)
+                if (index.supportsExpression(column, Operator.EQ))
+                    return true;
+            return false;
         }
 
         @Override
@@ -221,9 +227,12 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
-            return index.supportsOperator(Operator.IN);
+            for (ColumnDefinition column: columnDefs)
+                if (index.supportsExpression(column, Operator.IN))
+                    return true;
+            return false;
         }
 
         @Override
@@ -329,7 +338,7 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
             this(columnDefs, TermSlice.newInstance(bound, inclusive, term));
         }
 
-        private SliceRestriction(List<ColumnDefinition> columnDefs, TermSlice slice)
+        SliceRestriction(List<ColumnDefinition> columnDefs, TermSlice slice)
         {
             super(columnDefs);
             this.slice = slice;
@@ -350,26 +359,77 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
         @Override
         public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options)
         {
-            List<ByteBuffer> vals = componentBounds(bound, options);
+            boolean reversed = getFirstColumn().isReversedType();
 
-            for (int i = 0, m = vals.size(); i < m; i++)
+            EnumMap<Bound, List<ByteBuffer>> componentBounds = new EnumMap<Bound, List<ByteBuffer>>(Bound.class);
+            componentBounds.put(Bound.START, componentBounds(Bound.START, options));
+            componentBounds.put(Bound.END, componentBounds(Bound.END, options));
+
+            List<List<ByteBuffer>> toAdd = new ArrayList<>();
+            List<ByteBuffer> values = new ArrayList<>();
+
+            for (int i = 0, m = columnDefs.size(); i < m; i++)
             {
-                ByteBuffer v = checkNotNull(vals.get(i), "Invalid null value in condition for column %s", columnDefs.get(i).name);
-                builder.addElementToAll(v);
+                ColumnDefinition column = columnDefs.get(i);
+                Bound b = reverseBoundIfNeeded(column, bound);
+
+                // For mixed order columns, we need to create additional slices when 2 columns are in reverse order
+                if (reversed != column.isReversedType())
+                {
+                    reversed = column.isReversedType();
+                    // As we are switching direction we need to add the current composite
+                    toAdd.add(values);
+
+                    // The new bound side has no value for this component.  just stop
+                    if (!hasComponent(b, i, componentBounds))
+                        continue;
+
+                    // The other side has still some components. We need to end the slice that we have just open.
+                    if (hasComponent(b.reverse(), i, componentBounds))
+                        toAdd.add(values);
+
+                    // We need to rebuild where we are in this bound side
+                    values = new ArrayList<ByteBuffer>();
+
+                    List<ByteBuffer> vals = componentBounds.get(b);
+
+                    int n = Math.min(i, vals.size());
+                    for (int j = 0; j < n; j++)
+                    {
+                        ByteBuffer v = checkNotNull(vals.get(j),
+                                                    "Invalid null value in condition for column %s",
+                                                    columnDefs.get(j).name);
+                        values.add(v);
+                    }
+                }
+
+                if (!hasComponent(b, i, componentBounds))
+                    continue;
+
+                ByteBuffer v = checkNotNull(componentBounds.get(b).get(i), "Invalid null value in condition for column %s", columnDefs.get(i).name);
+                values.add(v);
             }
-            return builder;
+            toAdd.add(values);
+
+            if (bound.isEnd())
+                Collections.reverse(toAdd);
+
+            return builder.addAllElementsToAll(toAdd);
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
-            return slice.isSupportedBy(index);
+            for(ColumnDefinition def : columnDefs)
+                if (slice.isSupportedBy(def, index))
+                    return true;
+            return false;
         }
 
         @Override
-        public boolean hasBound(Bound b)
+        public boolean hasBound(Bound bound)
         {
-            return slice.hasBound(b);
+            return slice.hasBound(bound);
         }
 
         @Override
@@ -379,9 +439,9 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        public boolean isInclusive(Bound b)
+        public boolean isInclusive(Bound bound)
         {
-            return slice.isInclusive(b);
+            return slice.isInclusive(bound);
         }
 
         @Override
@@ -391,25 +451,25 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
                       "Column \"%s\" cannot be restricted by both an equality and an inequality relation",
                       getColumnsInCommons(otherRestriction));
 
-            SliceRestriction otherSlice = (SliceRestriction) otherRestriction;
-
             if (!getFirstColumn().equals(otherRestriction.getFirstColumn()))
             {
                 ColumnDefinition column = getFirstColumn().position() > otherRestriction.getFirstColumn().position()
                         ? getFirstColumn() : otherRestriction.getFirstColumn();
 
-                throw invalidRequest("Column \"%s\" cannot be restricted by two tuple-notation inequalities not starting with the same column",
+                throw invalidRequest("Column \"%s\" cannot be restricted by two inequalities not starting with the same column",
                                      column.name);
             }
 
-            checkFalse(hasBound(Bound.START) && otherSlice.hasBound(Bound.START),
+            checkFalse(hasBound(Bound.START) && otherRestriction.hasBound(Bound.START),
                        "More than one restriction was found for the start bound on %s",
                        getColumnsInCommons(otherRestriction));
-            checkFalse(hasBound(Bound.END) && otherSlice.hasBound(Bound.END),
+            checkFalse(hasBound(Bound.END) && otherRestriction.hasBound(Bound.END),
                        "More than one restriction was found for the end bound on %s",
                        getColumnsInCommons(otherRestriction));
 
+            SliceRestriction otherSlice = (SliceRestriction) otherRestriction;
             List<ColumnDefinition> newColumnDefs = columnDefs.size() >= otherSlice.columnDefs.size() ?  columnDefs : otherSlice.columnDefs;
+
             return new SliceRestriction(newColumnDefs, slice.merge(otherSlice.slice));
         }
 
@@ -437,8 +497,77 @@ public abstract class MultiColumnRestriction extends AbstractRestriction
          */
         private List<ByteBuffer> componentBounds(Bound b, QueryOptions options) throws InvalidRequestException
         {
-            Tuples.Value value = (Tuples.Value) slice.bound(b).bind(options);
-            return value.getElements();
+            if (!slice.hasBound(b))
+                return Collections.emptyList();
+
+            Terminal terminal = slice.bound(b).bind(options);
+
+            if (terminal instanceof Tuples.Value)
+            {
+                return ((Tuples.Value) terminal).getElements();
+            }
+
+            return Collections.singletonList(terminal.get(options.getProtocolVersion()));
+        }
+
+        private boolean hasComponent(Bound b, int index, EnumMap<Bound, List<ByteBuffer>> componentBounds)
+        {
+            return componentBounds.get(b).size() > index;
+        }
+    }
+
+    public static class NotNullRestriction extends MultiColumnRestriction
+    {
+        public NotNullRestriction(List<ColumnDefinition> columnDefs)
+        {
+            super(columnDefs);
+            assert columnDefs.size() == 1;
+        }
+
+        @Override
+        public Iterable<Function> getFunctions()
+        {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isNotNull()
+        {
+            return true;
+        }
+
+        @Override
+        public String toString()
+        {
+            return "IS NOT NULL";
+        }
+
+        @Override
+        public Restriction doMergeWith(Restriction otherRestriction) throws InvalidRequestException
+        {
+            throw invalidRequest("%s cannot be restricted by a relation if it includes an IS NOT NULL clause",
+                                 getColumnsInCommons(otherRestriction));
+        }
+
+        @Override
+        protected boolean isSupportedBy(Index index)
+        {
+            for(ColumnDefinition column : columnDefs)
+                if (index.supportsExpression(column, Operator.IS_NOT))
+                    return true;
+            return false;
+        }
+
+        @Override
+        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
+        {
+            throw new UnsupportedOperationException("Cannot use IS NOT NULL restriction for slicing");
+        }
+
+        @Override
+        public final void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexMananger, QueryOptions options) throws InvalidRequestException
+        {
+            throw new UnsupportedOperationException("Secondary indexes do not support IS NOT NULL restrictions");
         }
     }
 }

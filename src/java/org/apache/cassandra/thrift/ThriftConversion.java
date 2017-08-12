@@ -23,26 +23,25 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 
-import org.apache.cassandra.io.compress.ICompressor;
-import org.apache.cassandra.cache.CachingOptions;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.CompactTables;
 import org.apache.cassandra.db.LegacyLayout;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.io.compress.CompressionParameters;
+import org.apache.cassandra.index.TargetParser;
+import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.locator.LocalStrategy;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -158,7 +157,7 @@ public class ThriftConversion
         Map<String, String> replicationMap = new HashMap<>();
         if (ksd.strategy_options != null)
             replicationMap.putAll(ksd.strategy_options);
-        replicationMap.put(KeyspaceParams.Replication.CLASS, cls.getName());
+        replicationMap.put(ReplicationParams.CLASS, cls.getName());
 
         return KeyspaceMetadata.create(ksd.name, KeyspaceParams.create(ksd.durable_writes, replicationMap), Tables.of(cfDefs));
     }
@@ -166,7 +165,7 @@ public class ThriftConversion
     public static KsDef toThrift(KeyspaceMetadata ksm)
     {
         List<CfDef> cfDefs = new ArrayList<>();
-        for (CFMetaData cfm : ksm.tables)
+        for (CFMetaData cfm : ksm.tables) // do not include views
             if (cfm.isThriftCompatible()) // Don't expose CF that cannot be correctly handle by thrift; see CASSANDRA-4377 for further details
                 cfDefs.add(toThrift(cfm));
 
@@ -242,7 +241,7 @@ public class ThriftConversion
             // historical reasons)
             boolean hasKeyAlias = cf_def.isSetKey_alias() && keyValidator != null && !(keyValidator instanceof CompositeType);
             if (hasKeyAlias)
-                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, null));
+                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, 0));
 
             // Now add any CQL metadata that we want to copy, skipping the keyAlias if there was one
             for (ColumnDefinition def : previousCQLMetadata)
@@ -266,6 +265,7 @@ public class ThriftConversion
 
             // If it's a thrift table creation, adds the default CQL metadata for the new table
             if (isCreation)
+            {
                 addDefaultCQLMetadata(defs,
                                       cf_def.keyspace,
                                       cf_def.name,
@@ -273,28 +273,41 @@ public class ThriftConversion
                                       rawComparator,
                                       subComparator,
                                       defaultValidator);
+            }
 
-            // We do not allow Thrift materialized views, so we always set it to false
-            boolean isMaterializedView = false;
+            // We do not allow Thrift views, so we always set it to false
+            boolean isView = false;
 
-            CFMetaData newCFMD = CFMetaData.create(cf_def.keyspace, cf_def.name, cfId, isDense, isCompound, isSuper, isCounter, isMaterializedView, defs, DatabaseDescriptor.getPartitioner());
+            CFMetaData newCFMD = CFMetaData.create(cf_def.keyspace,
+                                                   cf_def.name,
+                                                   cfId,
+                                                   isDense,
+                                                   isCompound,
+                                                   isSuper,
+                                                   isCounter,
+                                                   isView,
+                                                   defs,
+                                                   DatabaseDescriptor.getPartitioner());
+
+            // Convert any secondary indexes defined in the thrift column_metadata
+            newCFMD.indexes(indexDefsFromThrift(newCFMD,
+                                                cf_def.keyspace,
+                                                cf_def.name,
+                                                rawComparator,
+                                                subComparator,
+                                                cf_def.column_metadata));
 
             if (cf_def.isSetGc_grace_seconds())
                 newCFMD.gcGraceSeconds(cf_def.gc_grace_seconds);
-            if (cf_def.isSetMin_compaction_threshold())
-                newCFMD.minCompactionThreshold(cf_def.min_compaction_threshold);
-            if (cf_def.isSetMax_compaction_threshold())
-                newCFMD.maxCompactionThreshold(cf_def.max_compaction_threshold);
-            if (cf_def.isSetCompaction_strategy())
-                newCFMD.compactionStrategyClass(CFMetaData.createCompactionStrategy(cf_def.compaction_strategy));
-            if (cf_def.isSetCompaction_strategy_options())
-                newCFMD.compactionStrategyOptions(new HashMap<>(cf_def.compaction_strategy_options));
+
+            newCFMD.compaction(compactionParamsFromThrift(cf_def));
+
             if (cf_def.isSetBloom_filter_fp_chance())
                 newCFMD.bloomFilterFpChance(cf_def.bloom_filter_fp_chance);
             if (cf_def.isSetMemtable_flush_period_in_ms())
                 newCFMD.memtableFlushPeriod(cf_def.memtable_flush_period_in_ms);
             if (cf_def.isSetCaching() || cf_def.isSetCells_per_row_to_cache())
-                newCFMD.caching(CachingOptions.fromThrift(cf_def.caching, cf_def.cells_per_row_to_cache));
+                newCFMD.caching(cachingFromThrift(cf_def.caching, cf_def.cells_per_row_to_cache));
             if (cf_def.isSetRead_repair_chance())
                 newCFMD.readRepairChance(cf_def.read_repair_chance);
             if (cf_def.isSetDefault_time_to_live())
@@ -306,12 +319,15 @@ public class ThriftConversion
             if (cf_def.isSetMax_index_interval())
                 newCFMD.maxIndexInterval(cf_def.max_index_interval);
             if (cf_def.isSetSpeculative_retry())
-                newCFMD.speculativeRetry(CFMetaData.SpeculativeRetry.fromString(cf_def.speculative_retry));
+                newCFMD.speculativeRetry(SpeculativeRetryParam.fromString(cf_def.speculative_retry));
             if (cf_def.isSetTriggers())
                 newCFMD.triggers(triggerDefinitionsFromThrift(cf_def.triggers));
+            if (cf_def.isSetComment())
+                newCFMD.comment(cf_def.comment);
+            if (cf_def.isSetCompression_options())
+                newCFMD.compression(compressionParametersFromThrift(cf_def.compression_options));
 
-            return newCFMD.comment(cf_def.comment)
-                          .compressionParameters(compressionParametersFromThrift(cf_def.compression_options));
+            return newCFMD;
         }
         catch (SyntaxException | MarshalException e)
         {
@@ -319,9 +335,28 @@ public class ThriftConversion
         }
     }
 
-    private static CompressionParameters compressionParametersFromThrift(Map<String, String> compression_options)
+    @SuppressWarnings("unchecked")
+    private static CompactionParams compactionParamsFromThrift(CfDef cf_def)
     {
-        CompressionParameters compressionParameter = CompressionParameters.fromMap(compression_options);
+        Class<? extends AbstractCompactionStrategy> klass =
+            CFMetaData.createCompactionStrategy(cf_def.compaction_strategy);
+        Map<String, String> options = new HashMap<>(cf_def.compaction_strategy_options);
+
+        int minThreshold = cf_def.min_compaction_threshold;
+        int maxThreshold = cf_def.max_compaction_threshold;
+
+        if (CompactionParams.supportsThresholdParams(klass))
+        {
+            options.putIfAbsent(CompactionParams.Option.MIN_THRESHOLD.toString(), Integer.toString(minThreshold));
+            options.putIfAbsent(CompactionParams.Option.MAX_THRESHOLD.toString(), Integer.toString(maxThreshold));
+        }
+
+        return CompactionParams.create(klass, options);
+    }
+
+    private static CompressionParams compressionParametersFromThrift(Map<String, String> compression_options)
+    {
+        CompressionParams compressionParameter = CompressionParams.fromMap(compression_options);
         compressionParameter.validate();
         return compressionParameter;
     }
@@ -345,14 +380,14 @@ public class ThriftConversion
             }
             else
             {
-                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, null));
+                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, 0));
             }
         }
 
         if (subComparator != null)
         {
             // SuperColumn tables: we use a special map to hold dynamic values within a given super column
-            defs.add(ColumnDefinition.clusteringKeyDef(ks, cf, names.defaultClusteringName(), comparator, 0));
+            defs.add(ColumnDefinition.clusteringDef(ks, cf, names.defaultClusteringName(), comparator, 0));
             defs.add(ColumnDefinition.regularDef(ks, cf, CompactTables.SUPER_COLUMN_MAP_COLUMN_STR, MapType.getInstance(subComparator, defaultValidator, true)));
         }
         else
@@ -362,7 +397,7 @@ public class ThriftConversion
                                            : Collections.<AbstractType<?>>singletonList(comparator);
 
             for (int i = 0; i < subTypes.size(); i++)
-                defs.add(ColumnDefinition.clusteringKeyDef(ks, cf, names.defaultClusteringName(), subTypes.get(i), i));
+                defs.add(ColumnDefinition.clusteringDef(ks, cf, names.defaultClusteringName(), subTypes.get(i), i));
 
             defs.add(ColumnDefinition.regularDef(ks, cf, names.defaultCompactValueName(), defaultValidator));
         }
@@ -375,19 +410,19 @@ public class ThriftConversion
         if (!cf_def.isSetComment())
             cf_def.setComment("");
         if (!cf_def.isSetMin_compaction_threshold())
-            cf_def.setMin_compaction_threshold(CFMetaData.DEFAULT_MIN_COMPACTION_THRESHOLD);
+            cf_def.setMin_compaction_threshold(CompactionParams.DEFAULT_MIN_THRESHOLD);
         if (!cf_def.isSetMax_compaction_threshold())
-            cf_def.setMax_compaction_threshold(CFMetaData.DEFAULT_MAX_COMPACTION_THRESHOLD);
-        if (cf_def.compaction_strategy == null)
-            cf_def.compaction_strategy = CFMetaData.DEFAULT_COMPACTION_STRATEGY_CLASS.getSimpleName();
-        if (cf_def.compaction_strategy_options == null)
-            cf_def.compaction_strategy_options = Collections.emptyMap();
+            cf_def.setMax_compaction_threshold(CompactionParams.DEFAULT_MAX_THRESHOLD);
+        if (!cf_def.isSetCompaction_strategy())
+            cf_def.setCompaction_strategy(CompactionParams.DEFAULT.klass().getSimpleName());
+        if (!cf_def.isSetCompaction_strategy_options())
+            cf_def.setCompaction_strategy_options(Collections.emptyMap());
         if (!cf_def.isSetCompression_options())
-            cf_def.setCompression_options(Collections.singletonMap(CompressionParameters.SSTABLE_COMPRESSION, CFMetaData.DEFAULT_COMPRESSOR));
+            cf_def.setCompression_options(Collections.singletonMap(CompressionParams.SSTABLE_COMPRESSION, CompressionParams.DEFAULT.klass().getCanonicalName()));
         if (!cf_def.isSetDefault_time_to_live())
-            cf_def.setDefault_time_to_live(CFMetaData.DEFAULT_DEFAULT_TIME_TO_LIVE);
+            cf_def.setDefault_time_to_live(TableParams.DEFAULT_DEFAULT_TIME_TO_LIVE);
         if (!cf_def.isSetDclocal_read_repair_chance())
-            cf_def.setDclocal_read_repair_chance(CFMetaData.DEFAULT_DCLOCAL_READ_REPAIR_CHANCE);
+            cf_def.setDclocal_read_repair_chance(TableParams.DEFAULT_DCLOCAL_READ_REPAIR_CHANCE);
 
         // if index_interval was set, use that for the min_index_interval default
         if (!cf_def.isSetMin_index_interval())
@@ -395,13 +430,13 @@ public class ThriftConversion
             if (cf_def.isSetIndex_interval())
                 cf_def.setMin_index_interval(cf_def.getIndex_interval());
             else
-                cf_def.setMin_index_interval(CFMetaData.DEFAULT_MIN_INDEX_INTERVAL);
+                cf_def.setMin_index_interval(TableParams.DEFAULT_MIN_INDEX_INTERVAL);
         }
 
         if (!cf_def.isSetMax_index_interval())
         {
             // ensure the max is at least as large as the min
-            cf_def.setMax_index_interval(Math.max(cf_def.min_index_interval, CFMetaData.DEFAULT_MAX_INDEX_INTERVAL));
+            cf_def.setMax_index_interval(Math.max(cf_def.min_index_interval, TableParams.DEFAULT_MAX_INDEX_INTERVAL));
         }
     }
 
@@ -420,29 +455,29 @@ public class ThriftConversion
             def.setComparator_type(LegacyLayout.makeLegacyComparator(cfm).toString());
         }
 
-        def.setComment(Strings.nullToEmpty(cfm.getComment()));
-        def.setRead_repair_chance(cfm.getReadRepairChance());
-        def.setDclocal_read_repair_chance(cfm.getDcLocalReadRepairChance());
-        def.setGc_grace_seconds(cfm.getGcGraceSeconds());
+        def.setComment(cfm.params.comment);
+        def.setRead_repair_chance(cfm.params.readRepairChance);
+        def.setDclocal_read_repair_chance(cfm.params.dcLocalReadRepairChance);
+        def.setGc_grace_seconds(cfm.params.gcGraceSeconds);
         def.setDefault_validation_class(cfm.makeLegacyDefaultValidator().toString());
         def.setKey_validation_class(cfm.getKeyValidator().toString());
-        def.setMin_compaction_threshold(cfm.getMinCompactionThreshold());
-        def.setMax_compaction_threshold(cfm.getMaxCompactionThreshold());
+        def.setMin_compaction_threshold(cfm.params.compaction.minCompactionThreshold());
+        def.setMax_compaction_threshold(cfm.params.compaction.maxCompactionThreshold());
         // We only return the alias if only one is set since thrift don't know about multiple key aliases
         if (cfm.partitionKeyColumns().size() == 1)
             def.setKey_alias(cfm.partitionKeyColumns().get(0).name.bytes);
         def.setColumn_metadata(columnDefinitionsToThrift(cfm, cfm.allColumns()));
-        def.setCompaction_strategy(cfm.compactionStrategyClass.getName());
-        def.setCompaction_strategy_options(new HashMap<>(cfm.compactionStrategyOptions));
-        def.setCompression_options(compressionParametersToThrift(cfm.compressionParameters));
-        def.setBloom_filter_fp_chance(cfm.getBloomFilterFpChance());
-        def.setMin_index_interval(cfm.getMinIndexInterval());
-        def.setMax_index_interval(cfm.getMaxIndexInterval());
-        def.setMemtable_flush_period_in_ms(cfm.getMemtableFlushPeriod());
-        def.setCaching(cfm.getCaching().toThriftCaching());
-        def.setCells_per_row_to_cache(cfm.getCaching().toThriftCellsPerRow());
-        def.setDefault_time_to_live(cfm.getDefaultTimeToLive());
-        def.setSpeculative_retry(cfm.getSpeculativeRetry().toString());
+        def.setCompaction_strategy(cfm.params.compaction.klass().getName());
+        def.setCompaction_strategy_options(cfm.params.compaction.options());
+        def.setCompression_options(compressionParametersToThrift(cfm.params.compression));
+        def.setBloom_filter_fp_chance(cfm.params.bloomFilterFpChance);
+        def.setMin_index_interval(cfm.params.minIndexInterval);
+        def.setMax_index_interval(cfm.params.maxIndexInterval);
+        def.setMemtable_flush_period_in_ms(cfm.params.memtableFlushPeriodInMs);
+        def.setCaching(toThrift(cfm.params.caching));
+        def.setCells_per_row_to_cache(toThriftCellsPerRow(cfm.params.caching));
+        def.setDefault_time_to_live(cfm.params.defaultTimeToLive);
+        def.setSpeculative_retry(cfm.params.speculativeRetry.toString());
         def.setTriggers(triggerDefinitionsToThrift(cfm.getTriggers()));
 
         return def;
@@ -474,10 +509,7 @@ public class ThriftConversion
                                     cfName,
                                     ColumnIdentifier.getInterned(ByteBufferUtil.clone(thriftColumnDef.name), comparator),
                                     TypeParser.parse(thriftColumnDef.validation_class),
-                                    thriftColumnDef.index_type == null ? null : org.apache.cassandra.config.IndexType.valueOf(thriftColumnDef.index_type.name()),
-                                    thriftColumnDef.index_options,
-                                    thriftColumnDef.index_name,
-                                    null,
+                                    ColumnDefinition.NO_POSITION,
                                     kind);
     }
 
@@ -498,16 +530,88 @@ public class ThriftConversion
         return defs;
     }
 
+    private static Indexes indexDefsFromThrift(CFMetaData cfm,
+                                               String ksName,
+                                               String cfName,
+                                               AbstractType<?> thriftComparator,
+                                               AbstractType<?> thriftSubComparator,
+                                               List<ColumnDef> thriftDefs)
+    {
+        if (thriftDefs == null)
+            return Indexes.none();
+
+        Set<String> indexNames = new HashSet<>();
+        Indexes.Builder indexes = Indexes.builder();
+        for (ColumnDef def : thriftDefs)
+        {
+            if (def.isSetIndex_type())
+            {
+                ColumnDefinition column = fromThrift(ksName, cfName, thriftComparator, thriftSubComparator, def);
+
+                String indexName = def.getIndex_name();
+                // add a generated index name if none was supplied
+                if (Strings.isNullOrEmpty(indexName))
+                    indexName = Indexes.getAvailableIndexName(ksName, cfName, column.name.toString());
+
+                if (indexNames.contains(indexName))
+                    throw new ConfigurationException("Duplicate index name " + indexName);
+
+                indexNames.add(indexName);
+
+                Map<String, String> indexOptions = def.getIndex_options();
+                if (indexOptions != null && indexOptions.containsKey(IndexTarget.TARGET_OPTION_NAME))
+                        throw new ConfigurationException("Reserved index option 'target' cannot be used");
+
+                IndexMetadata.Kind kind = IndexMetadata.Kind.valueOf(def.index_type.name());
+
+                indexes.add(IndexMetadata.fromLegacyMetadata(cfm, column, indexName, kind, indexOptions));
+            }
+        }
+        return indexes.build();
+    }
+
     @VisibleForTesting
-    public static ColumnDef toThrift(ColumnDefinition column)
+    public static ColumnDef toThrift(CFMetaData cfMetaData, ColumnDefinition column)
     {
         ColumnDef cd = new ColumnDef();
 
         cd.setName(ByteBufferUtil.clone(column.name.bytes));
         cd.setValidation_class(column.type.toString());
-        cd.setIndex_type(column.getIndexType() == null ? null : org.apache.cassandra.thrift.IndexType.valueOf(column.getIndexType().name()));
-        cd.setIndex_name(column.getIndexName());
-        cd.setIndex_options(column.getIndexOptions() == null ? null : Maps.newHashMap(column.getIndexOptions()));
+
+        // we include the index in the ColumnDef iff its targets are compatible with
+        // pre-3.0 indexes AND it is the only index defined on the given column, that is:
+        //   * it is the only index on the column (i.e. with this column as its target)
+        //   * it has only a single target, which matches the pattern for pre-3.0 indexes
+        //     i.e. keys/values/entries/full, with exactly 1 argument that matches the
+        //     column name OR a simple column name (for indexes on non-collection columns)
+        // n.b. it's a guess that using a pre-compiled regex and checking the group is
+        // cheaper than compiling a new regex for each column, but as this isn't on
+        // any hot path this hasn't been verified yet.
+        IndexMetadata matchedIndex = null;
+        for (IndexMetadata index : cfMetaData.getIndexes())
+        {
+            Pair<ColumnDefinition, IndexTarget.Type> target  = TargetParser.parse(cfMetaData, index);
+            if (target.left.equals(column))
+            {
+                // we already found an index for this column, we've no option but to
+                // ignore both of them (and any others we've yet to find)
+                if (matchedIndex != null)
+                    return cd;
+
+                matchedIndex = index;
+            }
+        }
+
+        if (matchedIndex != null)
+        {
+            cd.setIndex_type(org.apache.cassandra.thrift.IndexType.valueOf(matchedIndex.kind.name()));
+            cd.setIndex_name(matchedIndex.name);
+            Map<String, String> filteredOptions = Maps.filterKeys(matchedIndex.options,
+                                                                  s -> !IndexTarget.TARGET_OPTION_NAME.equals(s));
+            cd.setIndex_options(filteredOptions.isEmpty()
+                                ? null
+                                : Maps.newHashMap(filteredOptions));
+        }
 
         return cd;
     }
@@ -517,7 +621,7 @@ public class ThriftConversion
         List<ColumnDef> thriftDefs = new ArrayList<>(columns.size());
         for (ColumnDefinition def : columns)
             if (def.isPartOfCellName(metadata.isCQLTable(), metadata.isSuper()))
-                thriftDefs.add(ThriftConversion.toThrift(def));
+                thriftDefs.add(ThriftConversion.toThrift(metadata, def));
         return thriftDefs;
     }
 
@@ -543,15 +647,80 @@ public class ThriftConversion
     }
 
     @SuppressWarnings("deprecation")
-    public static Map<String, String> compressionParametersToThrift(CompressionParameters parameters)
+    public static Map<String, String> compressionParametersToThrift(CompressionParams parameters)
     {
         if (!parameters.isEnabled())
             return Collections.emptyMap();
 
         Map<String, String> options = new HashMap<>(parameters.getOtherOptions());
         Class<? extends ICompressor> klass = parameters.getSstableCompressor().getClass();
-        options.put(CompressionParameters.SSTABLE_COMPRESSION, klass.getName());
-        options.put(CompressionParameters.CHUNK_LENGTH_KB, parameters.chunkLengthInKB());
+        options.put(CompressionParams.SSTABLE_COMPRESSION, klass.getName());
+        options.put(CompressionParams.CHUNK_LENGTH_KB, parameters.chunkLengthInKB());
         return options;
+    }
+
+    private static String toThrift(CachingParams caching)
+    {
+        if (caching.cacheRows() && caching.cacheKeys())
+            return "ALL";
+
+        if (caching.cacheRows())
+            return "ROWS_ONLY";
+
+        if (caching.cacheKeys())
+            return "KEYS_ONLY";
+
+        return "NONE";
+    }
+
+    private static CachingParams cachingFromTrhfit(String caching)
+    {
+        switch (caching.toUpperCase())
+        {
+            case "ALL":
+                return CachingParams.CACHE_EVERYTHING;
+            case "ROWS_ONLY":
+                return new CachingParams(false, Integer.MAX_VALUE);
+            case "KEYS_ONLY":
+                return CachingParams.CACHE_KEYS;
+            case "NONE":
+                return CachingParams.CACHE_NOTHING;
+            default:
+                throw new ConfigurationException(String.format("Invalid value %s for caching parameter", caching));
+        }
+    }
+
+    private static String toThriftCellsPerRow(CachingParams caching)
+    {
+        return caching.cacheAllRows()
+             ? "ALL"
+             : String.valueOf(caching.rowsPerPartitionToCache());
+    }
+
+    private static int fromThriftCellsPerRow(String value)
+    {
+        return "ALL".equals(value)
+             ? Integer.MAX_VALUE
+             : Integer.parseInt(value);
+    }
+
+    public static CachingParams cachingFromThrift(String caching, String cellsPerRow)
+    {
+        boolean cacheKeys = true;
+        int rowsPerPartitionToCache = 0;
+
+        // if we get a caching string from thrift it is legacy, "ALL", "KEYS_ONLY" etc
+        if (caching != null)
+        {
+            CachingParams parsed = cachingFromTrhfit(caching);
+            cacheKeys = parsed.cacheKeys();
+            rowsPerPartitionToCache = parsed.rowsPerPartitionToCache();
+        }
+
+        // if we get cells_per_row from thrift, it is either "ALL" or "<number of cells to cache>".
+        if (cellsPerRow != null && rowsPerPartitionToCache > 0)
+            rowsPerPartitionToCache = fromThriftCellsPerRow(cellsPerRow);
+
+        return new CachingParams(cacheKeys, rowsPerPartitionToCache);
     }
 }

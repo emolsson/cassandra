@@ -26,9 +26,10 @@ import java.net.UnknownHostException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.server.RMIServerSocketFactory;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 import javax.management.StandardMBean;
@@ -40,6 +41,9 @@ import com.addthis.metrics3.reporter.config.ReporterConfig;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistryListener;
 import com.codahale.metrics.SharedMetricRegistries;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.slf4j.Logger;
@@ -50,10 +54,12 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.batchlog.LegacyBatchlogMigrator;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.StartupException;
 import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.hints.LegacyHintsMigrator;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.util.FileUtils;
@@ -125,7 +131,7 @@ public class CassandraDaemon
     private static final CassandraDaemon instance = new CassandraDaemon();
 
     public Server thriftServer;
-    public Server nativeServer;
+    private NativeTransportService nativeTransportService;
 
     private final boolean runManaged;
     protected final StartupChecks startupChecks;
@@ -216,6 +222,7 @@ public class CassandraDaemon
          */
         LegacySchemaMigrator.migrate();
 
+        // Populate token metadata before flushing, for token-aware sstable partitioning (#6696)
         StorageService.instance.populateTokenMetadata();
 
         // load schema from disk
@@ -228,11 +235,12 @@ public class CassandraDaemon
             if (keyspaceName.equals(SystemKeyspace.NAME))
                 continue;
 
-            for (CFMetaData cfm : Schema.instance.getTables(keyspaceName))
+            for (CFMetaData cfm : Schema.instance.getTablesAndViews(keyspaceName))
                 ColumnFamilyStore.scrubDataDirectories(cfm);
         }
 
         Keyspace.setInitialized();
+
         // initialize keyspaces
         for (String keyspaceName : Schema.instance.getKeyspaces())
         {
@@ -248,11 +256,16 @@ public class CassandraDaemon
             }
         }
 
-        if (CacheService.instance.keyCache.size() > 0)
-            logger.info("completed pre-loading ({} keys) key cache.", CacheService.instance.keyCache.size());
 
-        if (CacheService.instance.rowCache.size() > 0)
-            logger.info("completed pre-loading ({} keys) row cache.", CacheService.instance.rowCache.size());
+        try
+        {
+            loadRowAndKeyCacheAsync().get();
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            logger.warn("Error loading key or row cache", t);
+        }
 
         try
         {
@@ -274,6 +287,15 @@ public class CassandraDaemon
             throw new RuntimeException(e);
         }
 
+        // Re-populate token metadata after commit log recover (new peers might be loaded onto system keyspace #10293)
+        StorageService.instance.populateTokenMetadata();
+
+        // migrate any legacy (pre-3.0) hints from system.hints table into the new store
+        new LegacyHintsMigrator(DatabaseDescriptor.getHintsDirectory(), DatabaseDescriptor.getMaxHintsFileSize()).migrate();
+
+        // migrate any legacy (pre-3.0) batch entries from system.batchlog to system.batches (new table format)
+        LegacyBatchlogMigrator.migrate();
+
         // enable auto compaction
         for (Keyspace keyspace : Keyspace.all())
         {
@@ -287,39 +309,22 @@ public class CassandraDaemon
             }
         }
 
-        Runnable indexRebuild = new Runnable()
+        Runnable viewRebuild = new Runnable()
         {
             @Override
             public void run()
             {
                 for (Keyspace keyspace : Keyspace.all())
                 {
-                    for (ColumnFamilyStore cf: keyspace.getColumnFamilyStores())
-                    {
-                        cf.materializedViewManager.buildAllViews();
-                    }
+                    keyspace.viewManager.buildAllViews();
                 }
             }
         };
 
-        ScheduledExecutors.optionalTasks.schedule(indexRebuild, StorageService.RING_DELAY, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.optionalTasks.schedule(viewRebuild, StorageService.RING_DELAY, TimeUnit.MILLISECONDS);
 
 
         SystemKeyspace.finishStartup();
-
-        // start server internals
-        StorageService.instance.registerDaemon(this);
-        try
-        {
-            StorageService.instance.initServer();
-        }
-        catch (ConfigurationException e)
-        {
-            System.err.println(e.getMessage() + "\nFatal configuration error; unable to start server.  See log for stacktrace.");
-            exitOrFail(1, "Fatal configuration error", e);
-        }
-
-        Mx4jTool.maybeLoad();
 
         // Metrics
         String metricsReporterConfigFile = System.getProperty("cassandra.metricsReporterConfigFile");
@@ -336,6 +341,20 @@ public class CassandraDaemon
                 logger.warn("Failed to load metrics-reporter-config, metric sinks will not be activated", e);
             }
         }
+
+        // start server internals
+        StorageService.instance.registerDaemon(this);
+        try
+        {
+            StorageService.instance.initServer();
+        }
+        catch (ConfigurationException e)
+        {
+            System.err.println(e.getMessage() + "\nFatal configuration error; unable to start server.  See log for stacktrace.");
+            exitOrFail(1, "Fatal configuration error", e);
+        }
+
+        Mx4jTool.maybeLoad();
 
         if (!FBUtilities.getBroadcastAddress().equals(InetAddress.getLoopbackAddress()))
             waitForGossipToSettle();
@@ -357,10 +376,30 @@ public class CassandraDaemon
         thriftServer = new ThriftServer(rpcAddr, rpcPort, listenBacklog);
 
         // Native transport
-        InetAddress nativeAddr = DatabaseDescriptor.getRpcAddress();
-        int nativePort = DatabaseDescriptor.getNativeTransportPort();
-        nativeServer = new org.apache.cassandra.transport.Server(nativeAddr, nativePort);
+        nativeTransportService = new NativeTransportService();
 
+        completeSetup();
+    }
+
+    /*
+     * Asynchronously load the row and key cache in one off threads and return a compound future of the result.
+     * Error handling is pushed into the cache load since cache loads are allowed to fail and are handled by logging.
+     */
+    private ListenableFuture<?> loadRowAndKeyCacheAsync()
+    {
+        final ListenableFuture<Integer> keyCacheLoad = CacheService.instance.keyCache.loadSavedAsync();
+
+        final ListenableFuture<Integer> rowCacheLoad = CacheService.instance.rowCache.loadSavedAsync();
+
+        @SuppressWarnings("unchecked")
+        ListenableFuture<List<Integer>> retval = Futures.successfulAsList(keyCacheLoad, rowCacheLoad);
+
+        return retval;
+    }
+
+    @VisibleForTesting
+    public void completeSetup()
+    {
         setupCompleted = true;
     }
 
@@ -381,14 +420,16 @@ public class CassandraDaemon
 	        {
 	            logger.info("Could not resolve local host");
 	        }
-	
+
 	        logger.info("JVM vendor/version: {}/{}", System.getProperty("java.vm.name"), System.getProperty("java.version"));
 	        logger.info("Heap size: {}/{}", Runtime.getRuntime().totalMemory(), Runtime.getRuntime().maxMemory());
-	
+
 	        for(MemoryPoolMXBean pool: ManagementFactory.getMemoryPoolMXBeans())
 	            logger.info("{} {}: {}", pool.getName(), pool.getType(), pool.getPeakUsage());
-	
+
 	        logger.info("Classpath: {}", System.getProperty("java.class.path"));
+
+            logger.info("JVM Arguments: {}", ManagementFactory.getRuntimeMXBean().getInputArguments());
     	}
     }
 
@@ -417,7 +458,8 @@ public class CassandraDaemon
         String nativeFlag = System.getProperty("cassandra.start_native_transport");
         if ((nativeFlag != null && Boolean.parseBoolean(nativeFlag)) || (nativeFlag == null && DatabaseDescriptor.startNativeTransport()))
         {
-            nativeServer.start();
+            startNativeTransport();
+            StorageService.instance.setRpcReady(true);
         }
         else
             logger.info("Not starting native transport as requested. Use JMX (StorageService->startNativeTransport()) or nodetool (enablebinary) to start it");
@@ -439,9 +481,12 @@ public class CassandraDaemon
         // On linux, this doesn't entirely shut down Cassandra, just the RPC server.
         // jsvc takes care of taking the rest down
         logger.info("Cassandra shutting down...");
-        thriftServer.stop();
-        nativeServer.stop();
-
+        if (thriftServer != null)
+            thriftServer.stop();
+        if (nativeTransportService != null)
+            nativeTransportService.destroy();
+        StorageService.instance.setRpcReady(false);
+        
         // On windows, we need to stop the entire system as prunsrv doesn't have the jsvc hooks
         // We rely on the shutdown hook to drain the node
         if (FBUtilities.isWindows())
@@ -473,17 +518,18 @@ public class CassandraDaemon
      */
     public void activate()
     {
-        String pidFile = System.getProperty("cassandra-pidfile");
-
-        if (FBUtilities.isWindows())
-        {
-            // We need to adjust the system timer on windows from the default 15ms down to the minimum of 1ms as this
-            // impacts timer intervals, thread scheduling, driver interrupts, etc.
-            WindowsTimer.startTimerPeriod(DatabaseDescriptor.getWindowsTimerInterval());
-        }
-
+        // Do not put any references to DatabaseDescriptor above the forceStaticInitialization call.
         try
         {
+            try
+            {
+                DatabaseDescriptor.forceStaticInitialization();
+            }
+            catch (ExceptionInInitializerError e)
+            {
+                throw e.getCause();
+            }
+
             try
             {
                 MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
@@ -495,13 +541,16 @@ public class CassandraDaemon
                 //Allow the server to start even if the bean can't be registered
             }
 
-            try {
-                DatabaseDescriptor.forceStaticInitialization();
-            } catch (ExceptionInInitializerError e) {
-                throw e.getCause();
+            if (FBUtilities.isWindows())
+            {
+                // We need to adjust the system timer on windows from the default 15ms down to the minimum of 1ms as this
+                // impacts timer intervals, thread scheduling, driver interrupts, etc.
+                WindowsTimer.startTimerPeriod(DatabaseDescriptor.getWindowsTimerInterval());
             }
 
             setup();
+
+            String pidFile = System.getProperty("cassandra-pidfile");
 
             if (pidFile != null)
             {
@@ -542,6 +591,26 @@ public class CassandraDaemon
         }
     }
 
+    public void startNativeTransport()
+    {
+        if (nativeTransportService == null)
+            throw new IllegalStateException("setup() must be called first for CassandraDaemon");
+        else
+            nativeTransportService.start();
+    }
+
+    public void stopNativeTransport()
+    {
+        if (nativeTransportService != null)
+            nativeTransportService.stop();
+    }
+
+    public boolean isNativeTransportRunning()
+    {
+        return nativeTransportService != null ? nativeTransportService.isRunning() : false;
+    }
+
+
     /**
      * A convenience method to stop and destroy the daemon in one shot.
      */
@@ -550,7 +619,8 @@ public class CassandraDaemon
         stop();
         destroy();
         // completely shut down cassandra
-        if(!runManaged) {
+        if(!runManaged)
+        {
             System.exit(0);
         }
     }
@@ -610,21 +680,24 @@ public class CassandraDaemon
         instance.activate();
     }
 
-    private void exitOrFail(int code, String message) {
+    private void exitOrFail(int code, String message)
+    {
         exitOrFail(code, message, null);
     }
 
-    private void exitOrFail(int code, String message, Throwable cause) {
-            if(runManaged) {
-                RuntimeException t = cause!=null ? new RuntimeException(message, cause) : new RuntimeException(message);
-                throw t;
-            }
-            else {
-                logger.error(message, cause);
-                System.exit(code);
-            }
-
+    private void exitOrFail(int code, String message, Throwable cause)
+    {
+        if (runManaged)
+        {
+            RuntimeException t = cause!=null ? new RuntimeException(message, cause) : new RuntimeException(message);
+            throw t;
         }
+        else
+        {
+            logger.error(message, cause);
+            System.exit(code);
+        }
+    }
 
     static class NativeAccess implements NativeAccessMBean
     {

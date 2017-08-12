@@ -158,8 +158,15 @@ public interface StorageServiceMBean extends NotificationEmitter
     /** Retrieve this hosts unique ID */
     public String getLocalHostId();
 
-    /** Retrieve the mapping of endpoint to host ID */
+    /** {@link StorageServiceMBean#getEndpointToHostId} */
+    @Deprecated
     public Map<String, String> getHostIdMap();
+
+    /** Retrieve the mapping of endpoint to host ID */
+    public Map<String, String> getEndpointToHostId();
+
+    /** Retrieve the mapping of host ID to endpoint */
+    public Map<String, String> getHostIdToEndpoint();
 
     /** Human-readable load value */
     public String getLoadString();
@@ -187,31 +194,34 @@ public interface StorageServiceMBean extends NotificationEmitter
     public List<InetAddress> getNaturalEndpoints(String keyspaceName, ByteBuffer key);
 
     /**
-     * Takes the snapshot for the given keyspaces. A snapshot name must be specified.
-     *
-     * @param tag the tag given to the snapshot; may not be null or empty
-     * @param keyspaceNames the name of the keyspaces to snapshot; empty means "all."
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
      */
+    @Deprecated
     public void takeSnapshot(String tag, String... keyspaceNames) throws IOException;
 
     /**
-     * Takes the snapshot of a specific column family. A snapshot name must be specified.
-     *
-     * @param keyspaceName the keyspace which holds the specified column family
-     * @param tableName the table to snapshot
-     * @param tag the tag given to the snapshot; may not be null or empty
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
      */
+    @Deprecated
     public void takeTableSnapshot(String keyspaceName, String tableName, String tag) throws IOException;
+
+    /**
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
+     */
+    @Deprecated
+    public void takeMultipleTableSnapshot(String tag, String... tableList) throws IOException;
 
     /**
      * Takes the snapshot of a multiple column family from different keyspaces. A snapshot name must be specified.
      * 
      * @param tag
      *            the tag given to the snapshot; may not be null or empty
-     * @param tableList
-     *            list of tables from different keyspace in the form of ks1.cf1 ks2.cf2
+     * @param options
+     *            Map of options (skipFlush is the only supported option for now)
+     * @param entities
+     *            list of keyspaces / tables in the form of empty | ks1 ks2 ... | ks1.cf1,ks2.cf2,...
      */
-    public void takeMultipleTableSnapshot(String tag, String... tableList) throws IOException;
+    public void takeSnapshot(String tag, Map<String, String> options, String... entities) throws IOException;
 
     /**
      * Remove the snapshot with the given name from the given keyspaces.
@@ -232,10 +242,16 @@ public interface StorageServiceMBean extends NotificationEmitter
     public long trueSnapshotsSize();
 
     /**
+     * Forces refresh of values stored in system.size_estimates of all column families.
+     */
+    public void refreshSizeEstimates() throws ExecutionException;
+
+    /**
      * Forces major compaction of a single keyspace
      */
     public void forceKeyspaceCompaction(boolean splitOutput, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException;
 
+    public int relocateSSTables(String keyspace, String ... cfnames) throws IOException, ExecutionException, InterruptedException;
     /**
      * Trigger a cleanup of keys on a single keyspace
      */
@@ -287,8 +303,11 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     public int repairAsync(String keyspace, Map<String, String> options);
 
+    /**
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
+     */
     @Deprecated
-    public int forceRepairAsync(String keyspace, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts,  boolean primaryRange, boolean repairedAt, String... tableNames) throws IOException;
+    public int forceRepairAsync(String keyspace, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts,  boolean primaryRange, boolean fullRepair, String... tableNames) throws IOException;
 
     /**
      * Invoke repair asynchronously.
@@ -297,28 +316,41 @@ public interface StorageServiceMBean extends NotificationEmitter
      *   type: "repair"
      *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
      *
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
+     *
      * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
      * @return Repair command number, or 0 if nothing to repair
      */
     @Deprecated
     public int forceRepairAsync(String keyspace, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean primaryRange, boolean fullRepair, String... tableNames);
 
+    /**
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
+     */
     @Deprecated
-    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts, boolean repairedAt, String... tableNames) throws IOException;
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts, boolean fullRepair, String... tableNames) throws IOException;
 
     /**
      * Same as forceRepairAsync, but handles a specified range
+     *
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
      *
      * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
      */
     @Deprecated
     public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean fullRepair, String... tableNames);
 
+    /**
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
+     */
     @Deprecated
     public int forceRepairAsync(String keyspace, boolean isSequential, boolean isLocal, boolean primaryRange, boolean fullRepair, String... tableNames);
 
+    /**
+     * @deprecated use {@link #repairAsync(String keyspace, Map options)} instead.
+     */
     @Deprecated
-    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, boolean isLocal, boolean repairedAt, String... tableNames);
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, boolean isLocal, boolean fullRepair, String... tableNames);
 
     public void forceTerminateAllRepairSessions();
 
@@ -356,7 +388,7 @@ public interface StorageServiceMBean extends NotificationEmitter
      * If classQualifer is not empty but level is empty/null, it will set the level to null for the defined classQualifer<br>
      * If level cannot be parsed, then the level will be defaulted to DEBUG<br>
      * <br>
-     * The logback configuration should have < jmxConfigurator /> set
+     * The logback configuration should have {@code < jmxConfigurator />} set
      * 
      * @param classQualifier The logger's classQualifer
      * @param level The log level
@@ -395,7 +427,7 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     /**
      * given a list of tokens (representing the nodes in the cluster), returns
-     *   a mapping from "token -> %age of cluster owned by that token"
+     *   a mapping from {@code "token -> %age of cluster owned by that token"}
      */
     public Map<InetAddress, Float> getOwnership();
 
@@ -454,8 +486,35 @@ public interface StorageServiceMBean extends NotificationEmitter
     public void joinRing() throws IOException;
     public boolean isJoined();
 
+    public void setRpcTimeout(long value);
+    public long getRpcTimeout();
+
+    public void setReadRpcTimeout(long value);
+    public long getReadRpcTimeout();
+
+    public void setRangeRpcTimeout(long value);
+    public long getRangeRpcTimeout();
+
+    public void setWriteRpcTimeout(long value);
+    public long getWriteRpcTimeout();
+
+    public void setCounterWriteRpcTimeout(long value);
+    public long getCounterWriteRpcTimeout();
+
+    public void setCasContentionTimeout(long value);
+    public long getCasContentionTimeout();
+
+    public void setTruncateRpcTimeout(long value);
+    public long getTruncateRpcTimeout();
+
+    public void setStreamingSocketTimeout(int value);
+    public int getStreamingSocketTimeout();
+
     public void setStreamThroughputMbPerSec(int value);
     public int getStreamThroughputMbPerSec();
+
+    public void setInterDCStreamThroughputMbPerSec(int value);
+    public int getInterDCStreamThroughputMbPerSec();
 
     public int getCompactionThroughputMbPerSec();
     public void setCompactionThroughputMbPerSec(int value);
@@ -487,7 +546,7 @@ public interface StorageServiceMBean extends NotificationEmitter
      * Load new SSTables to the given keyspace/table
      *
      * @param ksName The parent keyspace name
-     * @param cfName The ColumnFamily name where SSTables belong
+     * @param tableName The ColumnFamily name where SSTables belong
      */
     public void loadNewSSTables(String ksName, String tableName);
 

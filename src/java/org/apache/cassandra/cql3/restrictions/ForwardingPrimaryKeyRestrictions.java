@@ -18,17 +18,19 @@
 package org.apache.cassandra.cql3.restrictions;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.List;
+import java.util.NavigableSet;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.SecondaryIndexManager;
 
 /**
  * A <code>PrimaryKeyRestrictions</code> which forwards all its method calls to another 
@@ -50,7 +52,7 @@ abstract class ForwardingPrimaryKeyRestrictions implements PrimaryKeyRestriction
     }
 
     @Override
-    public Collection<ColumnDefinition> getColumnDefs()
+    public List<ColumnDefinition> getColumnDefs()
     {
         return getDelegate().getColumnDefs();
     }
@@ -152,6 +154,12 @@ abstract class ForwardingPrimaryKeyRestrictions implements PrimaryKeyRestriction
     }
 
     @Override
+    public boolean isLIKE()
+    {
+        return getDelegate().isLIKE();
+    }
+
+    @Override
     public boolean isIN()
     {
         return getDelegate().isIN();
@@ -161,6 +169,12 @@ abstract class ForwardingPrimaryKeyRestrictions implements PrimaryKeyRestriction
     public boolean isContains()
     {
         return getDelegate().isContains();
+    }
+
+    @Override
+    public boolean isNotNull()
+    {
+        return getDelegate().isNotNull();
     }
 
     @Override

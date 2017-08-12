@@ -18,13 +18,18 @@
 
 package org.apache.cassandra.io.sstable;
 
-import org.apache.cassandra.db.RowIndexEntry;
+import java.util.Collection;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
 /**
@@ -35,15 +40,15 @@ import org.apache.cassandra.utils.concurrent.Transactional;
 public class SSTableTxnWriter extends Transactional.AbstractTransactional implements Transactional
 {
     private final LifecycleTransaction txn;
-    private final SSTableWriter writer;
+    private final SSTableMultiWriter writer;
 
-    public SSTableTxnWriter(LifecycleTransaction txn, SSTableWriter writer)
+    public SSTableTxnWriter(LifecycleTransaction txn, SSTableMultiWriter writer)
     {
         this.txn = txn;
         this.writer = writer;
     }
 
-    public RowIndexEntry append(UnfilteredRowIterator iterator)
+    public boolean append(UnfilteredRowIterator iterator)
     {
         return writer.append(iterator);
     }
@@ -60,7 +65,7 @@ public class SSTableTxnWriter extends Transactional.AbstractTransactional implem
 
     protected Throwable doCommit(Throwable accumulate)
     {
-        return txn.commit(writer.commit(accumulate));
+        return writer.commit(txn.commit(accumulate));
     }
 
     protected Throwable doAbort(Throwable accumulate)
@@ -74,28 +79,53 @@ public class SSTableTxnWriter extends Transactional.AbstractTransactional implem
         txn.prepareToCommit();
     }
 
-    public SSTableReader finish(boolean openResult)
+    @Override
+    protected Throwable doPostCleanup(Throwable accumulate)
+    {
+        txn.close();
+        writer.close();
+        return super.doPostCleanup(accumulate);
+    }
+
+    public Collection<SSTableReader> finish(boolean openResult)
     {
         writer.setOpenResult(openResult);
         finish();
         return writer.finished();
     }
 
-    public static SSTableTxnWriter create(Descriptor descriptor, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header)
+    @SuppressWarnings("resource") // log and writer closed during postCleanup
+    public static SSTableTxnWriter create(ColumnFamilyStore cfs, Descriptor descriptor, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header)
     {
-        LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.WRITE, descriptor.directory);
-        SSTableWriter writer = SSTableWriter.create(descriptor, keyCount, repairedAt, sstableLevel, header, txn);
+        LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.WRITE);
+        SSTableMultiWriter writer = cfs.createSSTableMultiWriter(descriptor, keyCount, repairedAt, sstableLevel, header, txn);
         return new SSTableTxnWriter(txn, writer);
     }
 
-    public static SSTableTxnWriter create(String filename, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header)
+    @SuppressWarnings("resource") // log and writer closed during postCleanup
+    public static SSTableTxnWriter create(CFMetaData cfm,
+                                          Descriptor descriptor,
+                                          long keyCount,
+                                          long repairedAt,
+                                          int sstableLevel,
+                                          SerializationHeader header,
+                                          Collection<Index> indexes)
     {
-        Descriptor desc = Descriptor.fromFilename(filename);
-        return create(desc, keyCount, repairedAt, sstableLevel, header);
+        // if the column family store does not exist, we create a new default SSTableMultiWriter to use:
+        LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.WRITE);
+        MetadataCollector collector = new MetadataCollector(cfm.comparator).sstableLevel(sstableLevel);
+        SSTableMultiWriter writer = SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfm, collector, header, indexes, txn);
+        return new SSTableTxnWriter(txn, writer);
     }
 
-    public static SSTableTxnWriter create(String filename, long keyCount, long repairedAt, SerializationHeader header)
+    public static SSTableTxnWriter create(ColumnFamilyStore cfs, String filename, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header)
     {
-        return create(filename, keyCount, repairedAt, 0, header);
+        Descriptor desc = Descriptor.fromFilename(filename);
+        return create(cfs, desc, keyCount, repairedAt, sstableLevel, header);
+    }
+
+    public static SSTableTxnWriter create(ColumnFamilyStore cfs, String filename, long keyCount, long repairedAt, SerializationHeader header)
+    {
+        return create(cfs, filename, keyCount, repairedAt, 0, header);
     }
 }

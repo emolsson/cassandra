@@ -53,6 +53,7 @@ import org.apache.cassandra.UpdateBuilder;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
@@ -162,10 +163,10 @@ public class AntiCompactionTest
 
     private SSTableReader writeFile(ColumnFamilyStore cfs, int count)
     {
-        File dir = cfs.directories.getDirectoryForNewSSTables();
+        File dir = cfs.getDirectories().getDirectoryForNewSSTables();
         String filename = cfs.getSSTablePath(dir);
 
-        try (SSTableTxnWriter writer = SSTableTxnWriter.create(filename, 0, 0, new SerializationHeader(cfm, cfm.partitionColumns(), EncodingStats.NO_STATS)))
+        try (SSTableTxnWriter writer = SSTableTxnWriter.create(cfs, filename, 0, 0, new SerializationHeader(true, cfm, cfm.partitionColumns(), EncodingStats.NO_STATS)))
         {
             for (int i = 0; i < count; i++)
             {
@@ -175,7 +176,10 @@ public class AntiCompactionTest
                 writer.append(builder.build().unfilteredIterator());
 
             }
-            return writer.finish(true);
+            Collection<SSTableReader> sstables = writer.finish(true);
+            assertNotNull(sstables);
+            assertEquals(1, sstables.size());
+            return sstables.iterator().next();
         }
     }
 
@@ -209,7 +213,6 @@ public class AntiCompactionTest
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF);
-        store.setCompactionStrategyClass(compactionStrategy);
         store.disableAutoCompaction();
 
         for (int table = 0; table < 10; table++)
@@ -299,14 +302,14 @@ public class AntiCompactionTest
         Collection<SSTableReader> sstables = getUnrepairedSSTables(store);
         assertEquals(store.getLiveSSTables().size(), sstables.size());
 
-        Range<Token> range = new Range<Token>(new BytesToken("-10".getBytes()), new BytesToken("-1".getBytes()));
+        Range<Token> range = new Range<Token>(new BytesToken("-1".getBytes()), new BytesToken("-10".getBytes()));
         List<Range<Token>> ranges = Arrays.asList(range);
 
 
         try (LifecycleTransaction txn = store.getTracker().tryModify(sstables, OperationType.ANTICOMPACTION);
              Refs<SSTableReader> refs = Refs.ref(sstables))
         {
-            CompactionManager.instance.performAnticompaction(store, ranges, refs, txn, 0);
+            CompactionManager.instance.performAnticompaction(store, ranges, refs, txn, 1);
         }
 
         assertThat(store.getLiveSSTables().size(), is(10));

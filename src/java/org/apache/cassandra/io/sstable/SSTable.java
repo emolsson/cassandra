@@ -23,7 +23,6 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Sets;
@@ -116,7 +115,7 @@ public abstract class SSTable
         if (components.contains(Component.SUMMARY))
             FileUtils.delete(desc.filenameFor(Component.SUMMARY));
 
-        logger.debug("Deleted {}", desc);
+        logger.trace("Deleted {}", desc);
         return true;
     }
 
@@ -161,7 +160,6 @@ public abstract class SSTable
         return descriptor.ksname;
     }
 
-    @VisibleForTesting
     public List<String> getAllFilePaths()
     {
         List<String> ret = new ArrayList<>();
@@ -221,9 +219,17 @@ public abstract class SSTable
         Set<Component> components = Sets.newHashSetWithExpectedSize(knownTypes.size());
         for (Component.Type componentType : knownTypes)
         {
-            Component component = new Component(componentType);
-            if (new File(desc.filenameFor(component)).exists())
-                components.add(component);
+            if (componentType == Component.Type.DIGEST)
+            {
+                if (desc.digestComponent != null && new File(desc.filenameFor(desc.digestComponent)).exists())
+                    components.add(desc.digestComponent);
+            }
+            else
+            {
+                Component component = new Component(componentType);
+                if (new File(desc.filenameFor(component)).exists())
+                    components.add(component);
+            }
         }
         return components;
     }
@@ -237,7 +243,7 @@ public abstract class SSTable
         while (ifile.getFilePointer() < BYTES_CAP && keys < SAMPLES_CAP)
         {
             ByteBufferUtil.skipShortLength(ifile);
-            RowIndexEntry.Serializer.skip(ifile);
+            RowIndexEntry.Serializer.skip(ifile, descriptor.version);
             keys++;
         }
         assert keys > 0 && ifile.getFilePointer() > 0 && ifile.length() > 0 : "Unexpected empty index file: " + ifile;

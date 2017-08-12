@@ -25,28 +25,35 @@ import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.IndexHelper;
+import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class ColumnIndex
 {
+    public final long partitionHeaderLength;
     public final List<IndexHelper.IndexInfo> columnsIndex;
 
-    private static final ColumnIndex EMPTY = new ColumnIndex(Collections.<IndexHelper.IndexInfo>emptyList());
+    private static final ColumnIndex EMPTY = new ColumnIndex(-1, Collections.<IndexHelper.IndexInfo>emptyList());
 
-    private ColumnIndex(List<IndexHelper.IndexInfo> columnsIndex)
+    private ColumnIndex(long partitionHeaderLength, List<IndexHelper.IndexInfo> columnsIndex)
     {
         assert columnsIndex != null;
 
+        this.partitionHeaderLength = partitionHeaderLength;
         this.columnsIndex = columnsIndex;
     }
 
-    public static ColumnIndex writeAndBuildIndex(UnfilteredRowIterator iterator, SequentialWriter output, SerializationHeader header, Version version) throws IOException
+    public static ColumnIndex writeAndBuildIndex(UnfilteredRowIterator iterator,
+                                                 SequentialWriter output,
+                                                 SerializationHeader header,
+                                                 Collection<SSTableFlushObserver> observers,
+                                                 Version version) throws IOException
     {
         assert !iterator.isEmpty() && version.storeRows();
 
-        Builder builder = new Builder(iterator, output, header, version.correspondingMessagingVersion());
+        Builder builder = new Builder(iterator, output, header, observers, version.correspondingMessagingVersion());
         return builder.build();
     }
 
@@ -67,42 +74,48 @@ public class ColumnIndex
         private final SerializationHeader header;
         private final int version;
 
-        private final ColumnIndex result;
+        private final List<IndexHelper.IndexInfo> columnsIndex = new ArrayList<>();
         private final long initialPosition;
+        private long headerLength = -1;
+
         private long startPosition = -1;
 
         private int written;
+        private long previousRowStart;
 
         private ClusteringPrefix firstClustering;
         private ClusteringPrefix lastClustering;
 
         private DeletionTime openMarker;
 
+        private final Collection<SSTableFlushObserver> observers;
+
         public Builder(UnfilteredRowIterator iterator,
                        SequentialWriter writer,
                        SerializationHeader header,
+                       Collection<SSTableFlushObserver> observers,
                        int version)
         {
             this.iterator = iterator;
             this.writer = writer;
             this.header = header;
             this.version = version;
-
-            this.result = new ColumnIndex(new ArrayList<IndexHelper.IndexInfo>());
-            this.initialPosition = writer.getFilePointer();
+            this.observers = observers == null ? Collections.emptyList() : observers;
+            this.initialPosition = writer.position();
         }
 
         private void writePartitionHeader(UnfilteredRowIterator iterator) throws IOException
         {
-            ByteBufferUtil.writeWithShortLength(iterator.partitionKey().getKey(), writer.stream);
-            DeletionTime.serializer.serialize(iterator.partitionLevelDeletion(), writer.stream);
+            ByteBufferUtil.writeWithShortLength(iterator.partitionKey().getKey(), writer);
+            DeletionTime.serializer.serialize(iterator.partitionLevelDeletion(), writer);
             if (header.hasStatic())
-                UnfilteredSerializer.serializer.serialize(iterator.staticRow(), header, writer.stream, version);
+                UnfilteredSerializer.serializer.serializeStaticRow(iterator.staticRow(), header, writer, version);
         }
 
         public ColumnIndex build() throws IOException
         {
             writePartitionHeader(iterator);
+            this.headerLength = writer.position() - initialPosition;
 
             while (iterator.hasNext())
                 add(iterator.next());
@@ -112,7 +125,7 @@ public class ColumnIndex
 
         private long currentPosition()
         {
-            return writer.getFilePointer() - initialPosition;
+            return writer.position() - initialPosition;
         }
 
         private void addIndexBlock()
@@ -122,21 +135,29 @@ public class ColumnIndex
                                                                          startPosition,
                                                                          currentPosition() - startPosition,
                                                                          openMarker);
-            result.columnsIndex.add(cIndexInfo);
+            columnsIndex.add(cIndexInfo);
             firstClustering = null;
         }
 
         private void add(Unfiltered unfiltered) throws IOException
         {
+            long pos = currentPosition();
+
             if (firstClustering == null)
             {
                 // Beginning of an index block. Remember the start and position
                 firstClustering = unfiltered.clustering();
-                startPosition = currentPosition();
+                startPosition = pos;
             }
 
-            UnfilteredSerializer.serializer.serialize(unfiltered, header, writer.stream, version);
+            UnfilteredSerializer.serializer.serialize(unfiltered, header, writer, pos - previousRowStart, version);
+
+            // notify observers about each new row
+            if (!observers.isEmpty())
+                observers.forEach((o) -> o.nextUnfilteredCluster(unfiltered));
+
             lastClustering = unfiltered.clustering();
+            previousRowStart = pos;
             ++written;
 
             if (unfiltered.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
@@ -153,7 +174,7 @@ public class ColumnIndex
 
         private ColumnIndex close() throws IOException
         {
-            UnfilteredSerializer.serializer.writeEndOfPartition(writer.stream);
+            UnfilteredSerializer.serializer.writeEndOfPartition(writer);
 
             // It's possible we add no rows, just a top level deletion
             if (written == 0)
@@ -164,8 +185,8 @@ public class ColumnIndex
                 addIndexBlock();
 
             // we should always have at least one computed index block, but we only write it out if there is more than that.
-            assert result.columnsIndex.size() > 0;
-            return result;
+            assert columnsIndex.size() > 0 && headerLength >= 0;
+            return new ColumnIndex(headerLength, columnsIndex);
         }
     }
 }

@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
@@ -35,7 +36,6 @@ import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -55,7 +55,7 @@ public abstract class Lists
         return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((ListType)column.type).getElementsType());
     }
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         private final List<Term.Raw> elements;
 
@@ -113,10 +113,9 @@ public abstract class Lists
             return AssignmentTestable.TestResult.testAll(keyspace, valueSpec, elements);
         }
 
-        @Override
-        public String toString()
+        public String getText()
         {
-            return elements.toString();
+            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "[", "]"));
         }
     }
 
@@ -210,12 +209,6 @@ public abstract class Lists
                     throw new InvalidRequestException("null is not supported inside collections");
                 if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     return UNSET_VALUE;
-
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (bytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    bytes.remaining()));
 
                 buffers.add(bytes);
             }
@@ -365,19 +358,9 @@ public abstract class Lists
 
             CellPath elementPath = existingRow.getComplexColumnData(column).getCellByIndex(idx).path();
             if (value == null)
-            {
-                params.addTombstone(column);
-            }
+                params.addTombstone(column, elementPath);
             else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER)
-            {
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    value.remaining()));
-
                 params.addCell(column, elementPath, value);
-            }
         }
     }
 

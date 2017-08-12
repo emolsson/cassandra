@@ -444,7 +444,7 @@ public class SelectOrderedPartitionerTest extends CQLTester
     @Test
     public void testTruncateWithCaching() throws Throwable
     {
-        createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int,) WITH CACHING = ALL;");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int) WITH CACHING = { 'keys': 'ALL', 'rows_per_partition': 'ALL' };");
 
         for (int i = 0; i < 3; i++)
             execute("INSERT INTO %s (k, v1, v2) VALUES (?, ?, ?)", i, i, i * 2);
@@ -477,5 +477,15 @@ public class SelectOrderedPartitionerTest extends CQLTester
                    row(-1));
 
         assertInvalid("SELECT * FROM %s WHERE k >= -1 AND k < 1");
+    }
+
+    @Test
+    public void testTokenFunctionWithInvalidColumnNames() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY ((a, b), c))");
+        assertInvalidMessage("Undefined name e in where clause ('token(a, e) = token(0, 0)')", "SELECT * FROM %s WHERE token(a, e) = token(0, 0)");
+        assertInvalidMessage("Undefined name e in where clause ('token(a, e) > token(0, 1)')", "SELECT * FROM %s WHERE token(a, e) > token(0, 1)");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('token(a, e) = token(0, 0)')", "SELECT b AS e FROM %s WHERE token(a, e) = token(0, 0)");
+        assertInvalidMessage("Aliases aren't allowed in the where clause ('token(a, e) > token(0, 1)')", "SELECT b AS e FROM %s WHERE token(a, e) > token(0, 1)");
     }
 }

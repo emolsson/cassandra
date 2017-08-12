@@ -137,8 +137,8 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
         awaitResults();
 
         PartitionIterator result = blockfor == 1 ? resolver.getData() : resolver.resolve();
-        if (logger.isDebugEnabled())
-            logger.debug("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+        if (logger.isTraceEnabled())
+            logger.trace("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
         return result;
     }
 
@@ -192,7 +192,8 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
                                                            result,
                                                            Collections.<String, byte[]>emptyMap(),
                                                            MessagingService.Verb.INTERNAL_RESPONSE,
-                                                           MessagingService.current_version);
+                                                           MessagingService.current_version,
+                                                           MessageIn.createTimestamp());
         response(message);
     }
 
@@ -238,9 +239,11 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
                 final DataResolver repairResolver = new DataResolver(keyspace, command, consistencyLevel, endpoints.size());
                 AsyncRepairCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
 
-                MessageOut<ReadCommand> message = command.createMessage();
                 for (InetAddress endpoint : endpoints)
+                {
+                    MessageOut<ReadCommand> message = command.createMessage(MessagingService.instance().getVersion(endpoint));
                     MessagingService.instance().sendRR(message, endpoint, repairHandler);
+                }
             }
         }
     }

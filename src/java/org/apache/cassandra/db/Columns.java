@@ -23,16 +23,23 @@ import java.util.function.Predicate;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 
-import com.google.common.collect.AbstractIterator;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterators;
 
+import net.nicoulaj.compilecommand.annotations.DontInline;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.BTreeSearchIterator;
+import org.apache.cassandra.utils.btree.BTreeRemoval;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
  * An immutable and sorted list of (non-PK) columns for a given table.
@@ -40,22 +47,29 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * Note that in practice, it will either store only static columns, or only regular ones. When
  * we need both type of columns, we use a {@link PartitionColumns} object.
  */
-public class Columns implements Iterable<ColumnDefinition>
+public class Columns extends AbstractCollection<ColumnDefinition> implements Collection<ColumnDefinition>
 {
     public static final Serializer serializer = new Serializer();
-    public static final Columns NONE = new Columns(new ColumnDefinition[0], 0);
+    public static final Columns NONE = new Columns(BTree.empty(), 0);
+    public static final ColumnDefinition FIRST_COMPLEX =
+        new ColumnDefinition("",
+                             "",
+                             ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
+                             SetType.getInstance(UTF8Type.instance, true),
+                             ColumnDefinition.NO_POSITION,
+                             ColumnDefinition.Kind.REGULAR);
 
-    public final ColumnDefinition[] columns;
-    public final int complexIdx; // Index of the first complex column
+    private final Object[] columns;
+    private final int complexIdx; // Index of the first complex column
 
-    private Columns(ColumnDefinition[] columns, int complexIdx)
+    private Columns(Object[] columns, int complexIdx)
     {
-        assert complexIdx <= columns.length;
+        assert complexIdx <= BTree.size(columns);
         this.columns = columns;
         this.complexIdx = complexIdx;
     }
 
-    private Columns(ColumnDefinition[] columns)
+    private Columns(Object[] columns)
     {
         this(columns, findFirstComplexIdx(columns));
     }
@@ -69,30 +83,28 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public static Columns of(ColumnDefinition c)
     {
-        ColumnDefinition[] columns = new ColumnDefinition[]{ c };
-        return new Columns(columns, c.isComplex() ? 0 : 1);
+        return new Columns(BTree.singleton(c), c.isComplex() ? 0 : 1);
     }
 
     /**
      * Returns a new {@code Columns} object holing the same columns than the provided set.
      *
-     * @param param s the set from which to create the new {@code Columns}.
-     *
+     * @param s the set from which to create the new {@code Columns}.
      * @return the newly created {@code Columns} containing the columns from {@code s}.
      */
-    public static Columns from(Set<ColumnDefinition> s)
+    public static Columns from(Collection<ColumnDefinition> s)
     {
-        ColumnDefinition[] columns = s.toArray(new ColumnDefinition[s.size()]);
-        Arrays.sort(columns);
-        return new Columns(columns, findFirstComplexIdx(columns));
+        Object[] tree = BTree.<ColumnDefinition>builder(Comparator.naturalOrder()).addAll(s).build();
+        return new Columns(tree, findFirstComplexIdx(tree));
     }
 
-    private static int findFirstComplexIdx(ColumnDefinition[] columns)
+    private static int findFirstComplexIdx(Object[] tree)
     {
-        for (int i = 0; i < columns.length; i++)
-            if (columns[i].isComplex())
-                return i;
-        return columns.length;
+        // have fast path for common no-complex case
+        int size = BTree.size(tree);
+        if (!BTree.isEmpty(tree) && BTree.<ColumnDefinition>findByIndex(tree, size - 1).isSimple())
+            return size;
+        return BTree.ceilIndex(tree, Comparator.naturalOrder(), FIRST_COMPLEX);
     }
 
     /**
@@ -102,7 +114,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public boolean isEmpty()
     {
-        return columns.length == 0;
+        return BTree.isEmpty(columns);
     }
 
     /**
@@ -122,7 +134,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public int complexColumnCount()
     {
-        return columns.length - complexIdx;
+        return BTree.size(columns) - complexIdx;
     }
 
     /**
@@ -130,9 +142,9 @@ public class Columns implements Iterable<ColumnDefinition>
      *
      * @return the total number of columns in this object.
      */
-    public int columnCount()
+    public int size()
     {
-        return columns.length;
+        return BTree.size(columns);
     }
 
     /**
@@ -152,7 +164,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public boolean hasComplex()
     {
-        return complexIdx < columns.length;
+        return complexIdx < BTree.size(columns);
     }
 
     /**
@@ -165,7 +177,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public ColumnDefinition getSimple(int i)
     {
-        return columns[i];
+        return BTree.findByIndex(columns, i);
     }
 
     /**
@@ -178,7 +190,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public ColumnDefinition getComplex(int i)
     {
-        return columns[complexIdx + i];
+        return BTree.findByIndex(columns, complexIdx + i);
     }
 
     /**
@@ -186,19 +198,13 @@ public class Columns implements Iterable<ColumnDefinition>
      * the provided column).
      *
      * @param c the simple column for which to return the index of.
-     * @param from the index to start the search from.
      *
      * @return the index for simple column {@code c} if it is contains in this
-     * object (starting from index {@code from}), {@code -1} otherwise.
+     * object
      */
-    public int simpleIdx(ColumnDefinition c, int from)
+    public int simpleIdx(ColumnDefinition c)
     {
-        assert !c.isComplex();
-        for (int i = from; i < complexIdx; i++)
-            // We know we only use "interned" ColumnIdentifier so == is ok.
-            if (columns[i].name == c.name)
-                return i;
-        return -1;
+        return BTree.findIndex(columns, Comparator.naturalOrder(), c);
     }
 
     /**
@@ -206,19 +212,13 @@ public class Columns implements Iterable<ColumnDefinition>
      * the provided column).
      *
      * @param c the complex column for which to return the index of.
-     * @param from the index to start the search from.
      *
      * @return the index for complex column {@code c} if it is contains in this
-     * object (starting from index {@code from}), {@code -1} otherwise.
+     * object
      */
-    public int complexIdx(ColumnDefinition c, int from)
+    public int complexIdx(ColumnDefinition c)
     {
-        assert c.isComplex();
-        for (int i = complexIdx + from; i < columns.length; i++)
-            // We know we only use "interned" ColumnIdentifier so == is ok.
-            if (columns[i].name == c.name)
-                return i - complexIdx;
-        return -1;
+        return BTree.findIndex(columns, Comparator.naturalOrder(), c) - complexIdx;
     }
 
     /**
@@ -230,30 +230,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public boolean contains(ColumnDefinition c)
     {
-        return c.isComplex() ? complexIdx(c, 0) >= 0 : simpleIdx(c, 0) >= 0;
-    }
-
-    /**
-     * Whether or not there is some counter columns within those columns.
-     *
-     * @return whether or not there is some counter columns within those columns.
-     */
-    public boolean hasCounters()
-    {
-        for (int i = 0; i < complexIdx; i++)
-        {
-            if (columns[i].type.isCounter())
-                return true;
-        }
-
-        for (int i = complexIdx; i < columns.length; i++)
-        {
-            // We only support counter in maps because that's all we need for now (and we need it for the sake of thrift super columns of counter)
-            if (columns[i].type instanceof MapType && (((MapType)columns[i].type).valueComparator().isCounter()))
-                return true;
-        }
-
-        return false;
+        return BTree.findIndex(columns, Comparator.naturalOrder(), c) >= 0;
     }
 
     /**
@@ -273,60 +250,14 @@ public class Columns implements Iterable<ColumnDefinition>
         if (this == NONE)
             return other;
 
-        int i = 0, j = 0;
-        int size = 0;
-        while (i < columns.length && j < other.columns.length)
-        {
-            ++size;
-            int cmp = columns[i].compareTo(other.columns[j]);
-            if (cmp == 0)
-            {
-                ++i;
-                ++j;
-            }
-            else if (cmp < 0)
-            {
-                ++i;
-            }
-            else
-            {
-                ++j;
-            }
-        }
+        Object[] tree = BTree.<ColumnDefinition>merge(this.columns, other.columns, Comparator.naturalOrder(),
+                                                      UpdateFunction.noOp());
+        if (tree == this.columns)
+            return this;
+        if (tree == other.columns)
+            return other;
 
-        // If every element was always counted on both array, we have the same
-        // arrays for the first min elements
-        if (i == size && j == size)
-        {
-            // We've exited because of either c1 or c2 (or both). The array that
-            // made us stop is thus a subset of the 2nd one, return that array.
-            return i == columns.length ? other : this;
-        }
-
-        size += i == columns.length ? other.columns.length - j : columns.length - i;
-        ColumnDefinition[] result = new ColumnDefinition[size];
-        i = 0;
-        j = 0;
-        for (int k = 0; k < size; k++)
-        {
-            int cmp = i >= columns.length ? 1
-                    : (j >= other.columns.length ? -1 : columns[i].compareTo(other.columns[j]));
-            if (cmp == 0)
-            {
-                result[k] = columns[i];
-                ++i;
-                ++j;
-            }
-            else if (cmp < 0)
-            {
-                result[k] = columns[i++];
-            }
-            else
-            {
-                result[k] = other.columns[j++];
-            }
-        }
-        return new Columns(result, findFirstComplexIdx(result));
+        return new Columns(tree, findFirstComplexIdx(tree));
     }
 
     /**
@@ -336,25 +267,17 @@ public class Columns implements Iterable<ColumnDefinition>
      *
      * @return whether all the columns of {@code other} are contained by this object.
      */
-    public boolean contains(Columns other)
+    public boolean containsAll(Collection<?> other)
     {
-        if (other.columns.length > columns.length)
+        if (other == this)
+            return true;
+        if (other.size() > this.size())
             return false;
 
-        int j = 0;
-        int cmp = 0;
-        for (ColumnDefinition def : other.columns)
-        {
-            while (j < columns.length && (cmp = columns[j].compareTo(def)) < 0)
-                j++;
-
-            if (j >= columns.length || cmp > 0)
+        BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = BTree.slice(columns, Comparator.naturalOrder(), BTree.Dir.ASC);
+        for (Object def : other)
+            if (iter.next((ColumnDefinition) def) == null)
                 return false;
-
-            // cmp == 0, we've found the definition. Ce can bump j once more since
-            // we know we won't need to compare that element again
-            j++;
-        }
         return true;
     }
 
@@ -365,7 +288,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public Iterator<ColumnDefinition> simpleColumns()
     {
-        return new ColumnIterator(0, complexIdx);
+        return BTree.iterator(columns, 0, complexIdx - 1, BTree.Dir.ASC);
     }
 
     /**
@@ -375,7 +298,7 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public Iterator<ColumnDefinition> complexColumns()
     {
-        return new ColumnIterator(complexIdx, columns.length);
+        return BTree.iterator(columns, complexIdx, BTree.size(columns) - 1, BTree.Dir.ASC);
     }
 
     /**
@@ -383,9 +306,9 @@ public class Columns implements Iterable<ColumnDefinition>
      *
      * @return an iterator over all the columns of this object.
      */
-    public Iterator<ColumnDefinition> iterator()
+    public BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iterator()
     {
-        return Iterators.forArray(columns);
+        return BTree.<ColumnDefinition, ColumnDefinition>slice(columns, Comparator.naturalOrder(), BTree.Dir.ASC);
     }
 
     /**
@@ -399,23 +322,13 @@ public class Columns implements Iterable<ColumnDefinition>
     {
         // In wildcard selection, we want to return all columns in alphabetical order,
         // irregarding of whether they are complex or not
-        return new AbstractIterator<ColumnDefinition>()
-        {
-            private int regular;
-            private int complex = complexIdx;
-
-            protected ColumnDefinition computeNext()
-            {
-                if (complex >= columns.length)
-                    return regular >= complexIdx ? endOfData() : columns[regular++];
-                if (regular >= complexIdx)
-                    return columns[complex++];
-
-                return columns[regular].name.compareTo(columns[complex].name) < 0
-                     ? columns[regular++]
-                     : columns[complex++];
-            }
-        };
+        return Iterators.<ColumnDefinition>
+                         mergeSorted(ImmutableList.of(simpleColumns(), complexColumns()),
+                                     (s, c) ->
+                                     {
+                                         assert !s.kind.isPrimaryKeyKind();
+                                         return s.name.bytes.compareTo(c.name.bytes);
+                                     });
     }
 
     /**
@@ -428,15 +341,10 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public Columns without(ColumnDefinition column)
     {
-        int idx = column.isComplex() ? complexIdx(column, 0) : simpleIdx(column, 0);
-        if (idx < 0)
+        if (!contains(column))
             return this;
 
-        int realIdx = column.isComplex() ? complexIdx + idx : idx;
-
-        ColumnDefinition[] newColumns = new ColumnDefinition[columns.length - 1];
-        System.arraycopy(columns, 0, newColumns, 0, realIdx);
-        System.arraycopy(columns, realIdx + 1, newColumns, realIdx, newColumns.length - realIdx);
+        Object[] newColumns = BTreeRemoval.<ColumnDefinition>remove(columns, Comparator.naturalOrder(), column);
         return new Columns(newColumns);
     }
 
@@ -448,24 +356,8 @@ public class Columns implements Iterable<ColumnDefinition>
      */
     public Predicate<ColumnDefinition> inOrderInclusionTester()
     {
-        return new Predicate<ColumnDefinition>()
-        {
-            private int i = 0;
-
-            public boolean test(ColumnDefinition column)
-            {
-                while (i < columns.length)
-                {
-                    int cmp = column.compareTo(columns[i]);
-                    if (cmp < 0)
-                        return false;
-                    i++;
-                    if (cmp == 0)
-                        return true;
-                }
-                return false;
-            }
-        };
+        SearchIterator<ColumnDefinition, ColumnDefinition> iter = BTree.slice(columns, Comparator.naturalOrder(), BTree.Dir.ASC);
+        return column -> iter.next(column) != null;
     }
 
     public void digest(MessageDigest digest)
@@ -477,63 +369,46 @@ public class Columns implements Iterable<ColumnDefinition>
     @Override
     public boolean equals(Object other)
     {
+        if (other == this)
+            return true;
         if (!(other instanceof Columns))
             return false;
 
         Columns that = (Columns)other;
-        return this.complexIdx == that.complexIdx && Arrays.equals(this.columns, that.columns);
+        return this.complexIdx == that.complexIdx && BTree.equals(this.columns, that.columns);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(complexIdx, Arrays.hashCode(columns));
+        return Objects.hash(complexIdx, BTree.hashCode(columns));
     }
 
     @Override
     public String toString()
     {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder("[");
         boolean first = true;
         for (ColumnDefinition def : this)
         {
             if (first) first = false; else sb.append(" ");
             sb.append(def.name);
         }
-        return sb.toString();
-    }
-
-    private class ColumnIterator extends AbstractIterator<ColumnDefinition>
-    {
-        private final int to;
-        private int idx;
-
-        private ColumnIterator(int from, int to)
-        {
-            this.idx = from;
-            this.to = to;
-        }
-
-        protected ColumnDefinition computeNext()
-        {
-            if (idx >= to)
-                return endOfData();
-            return columns[idx++];
-        }
+        return sb.append("]").toString();
     }
 
     public static class Serializer
     {
         public void serialize(Columns columns, DataOutputPlus out) throws IOException
         {
-            out.writeVInt(columns.columnCount());
+            out.writeUnsignedVInt(columns.size());
             for (ColumnDefinition column : columns)
                 ByteBufferUtil.writeWithVIntLength(column.name.bytes, out);
         }
 
         public long serializedSize(Columns columns)
         {
-            long size = TypeSizes.sizeofVInt(columns.columnCount());
+            long size = TypeSizes.sizeofUnsignedVInt(columns.size());
             for (ColumnDefinition column : columns)
                 size += ByteBufferUtil.serializedSizeWithVIntLength(column.name.bytes);
             return size;
@@ -541,8 +416,9 @@ public class Columns implements Iterable<ColumnDefinition>
 
         public Columns deserialize(DataInputPlus in, CFMetaData metadata) throws IOException
         {
-            int length = (int)in.readVInt();
-            ColumnDefinition[] columns = new ColumnDefinition[length];
+            int length = (int)in.readUnsignedVInt();
+            BTree.Builder<ColumnDefinition> builder = BTree.builder(Comparator.naturalOrder());
+            builder.auto(false);
             for (int i = 0; i < length; i++)
             {
                 ByteBuffer name = ByteBufferUtil.readWithVIntLength(in);
@@ -556,9 +432,223 @@ public class Columns implements Iterable<ColumnDefinition>
                     if (column == null)
                         throw new RuntimeException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
                 }
-                columns[i] = column;
+                builder.add(column);
             }
-            return new Columns(columns);
+            return new Columns(builder.build());
         }
+
+        /**
+         * If both ends have a pre-shared superset of the columns we are serializing, we can send them much
+         * more efficiently. Both ends must provide the identically same set of columns.
+         */
+        public void serializeSubset(Collection<ColumnDefinition> columns, Columns superset, DataOutputPlus out) throws IOException
+        {
+            /**
+             * We weight this towards small sets, and sets where the majority of items are present, since
+             * we expect this to mostly be used for serializing result sets.
+             *
+             * For supersets with fewer than 64 columns, we encode a bitmap of *missing* columns,
+             * which equates to a zero (single byte) when all columns are present, and otherwise
+             * a positive integer that can typically be vint encoded efficiently.
+             *
+             * If we have 64 or more columns, we cannot neatly perform a bitmap encoding, so we just switch
+             * to a vint encoded set of deltas, either adding or subtracting (whichever is most efficient).
+             * We indicate this switch by sending our bitmap with every bit set, i.e. -1L
+             */
+            int columnCount = columns.size();
+            int supersetCount = superset.size();
+            if (columnCount == supersetCount)
+            {
+                out.writeUnsignedVInt(0);
+            }
+            else if (supersetCount < 64)
+            {
+                out.writeUnsignedVInt(encodeBitmap(columns, superset, supersetCount));
+            }
+            else
+            {
+                serializeLargeSubset(columns, columnCount, superset, supersetCount, out);
+            }
+        }
+
+        public long serializedSubsetSize(Collection<ColumnDefinition> columns, Columns superset)
+        {
+            int columnCount = columns.size();
+            int supersetCount = superset.size();
+            if (columnCount == supersetCount)
+            {
+                return TypeSizes.sizeofUnsignedVInt(0);
+            }
+            else if (supersetCount < 64)
+            {
+                return TypeSizes.sizeofUnsignedVInt(encodeBitmap(columns, superset, supersetCount));
+            }
+            else
+            {
+                return serializeLargeSubsetSize(columns, columnCount, superset, supersetCount);
+            }
+        }
+
+        public Columns deserializeSubset(Columns superset, DataInputPlus in) throws IOException
+        {
+            long encoded = in.readUnsignedVInt();
+            if (encoded == 0L)
+            {
+                return superset;
+            }
+            else if (superset.size() >= 64)
+            {
+                return deserializeLargeSubset(in, superset, (int) encoded);
+            }
+            else
+            {
+                BTree.Builder<ColumnDefinition> builder = BTree.builder(Comparator.naturalOrder());
+                int firstComplexIdx = 0;
+                for (ColumnDefinition column : superset)
+                {
+                    if ((encoded & 1) == 0)
+                    {
+                        builder.add(column);
+                        if (column.isSimple())
+                            ++firstComplexIdx;
+                    }
+                    encoded >>>= 1;
+                }
+                return new Columns(builder.build(), firstComplexIdx);
+            }
+        }
+
+        // encodes a 1 bit for every *missing* column, on the assumption presence is more common,
+        // and because this is consistent with encoding 0 to represent all present
+        private static long encodeBitmap(Collection<ColumnDefinition> columns, Columns superset, int supersetCount)
+        {
+            long bitmap = 0L;
+            BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = superset.iterator();
+            // the index we would encounter next if all columns are present
+            int expectIndex = 0;
+            for (ColumnDefinition column : columns)
+            {
+                if (iter.next(column) == null)
+                    throw new IllegalStateException(columns + " is not a subset of " + superset);
+
+                int currentIndex = iter.indexOfCurrent();
+                int count = currentIndex - expectIndex;
+                // (1L << count) - 1 gives us count bits set at the bottom of the register
+                // so << expectIndex moves these bits to start at expectIndex, which is where our missing portion
+                // begins (assuming count > 0; if not, we're adding 0 bits, so it's a no-op)
+                bitmap |= ((1L << count) - 1) << expectIndex;
+                expectIndex = currentIndex + 1;
+            }
+            int count = supersetCount - expectIndex;
+            bitmap |= ((1L << count) - 1) << expectIndex;
+            return bitmap;
+        }
+
+        @DontInline
+        private void serializeLargeSubset(Collection<ColumnDefinition> columns, int columnCount, Columns superset, int supersetCount, DataOutputPlus out) throws IOException
+        {
+            // write flag indicating we're in lengthy mode
+            out.writeUnsignedVInt(supersetCount - columnCount);
+            BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = superset.iterator();
+            if (columnCount < supersetCount / 2)
+            {
+                // write present columns
+                for (ColumnDefinition column : columns)
+                {
+                    if (iter.next(column) == null)
+                        throw new IllegalStateException();
+                    out.writeUnsignedVInt(iter.indexOfCurrent());
+                }
+            }
+            else
+            {
+                // write missing columns
+                int prev = -1;
+                for (ColumnDefinition column : columns)
+                {
+                    if (iter.next(column) == null)
+                        throw new IllegalStateException();
+                    int cur = iter.indexOfCurrent();
+                    while (++prev != cur)
+                        out.writeUnsignedVInt(prev);
+                }
+                while (++prev != supersetCount)
+                    out.writeUnsignedVInt(prev);
+            }
+        }
+
+        @DontInline
+        private Columns deserializeLargeSubset(DataInputPlus in, Columns superset, int delta) throws IOException
+        {
+            int supersetCount = superset.size();
+            int columnCount = supersetCount - delta;
+
+            BTree.Builder<ColumnDefinition> builder = BTree.builder(Comparator.naturalOrder());
+            if (columnCount < supersetCount / 2)
+            {
+                for (int i = 0 ; i < columnCount ; i++)
+                {
+                    int idx = (int) in.readUnsignedVInt();
+                    builder.add(BTree.findByIndex(superset.columns, idx));
+                }
+            }
+            else
+            {
+                Iterator<ColumnDefinition> iter = superset.iterator();
+                int idx = 0;
+                int skipped = 0;
+                while (true)
+                {
+                    int nextMissingIndex = skipped < delta ? (int)in.readUnsignedVInt() : supersetCount;
+                    while (idx < nextMissingIndex)
+                    {
+                        ColumnDefinition def = iter.next();
+                        builder.add(def);
+                        idx++;
+                    }
+                    if (idx == supersetCount)
+                        break;
+                    iter.next();
+                    idx++;
+                    skipped++;
+                }
+            }
+            return new Columns(builder.build());
+        }
+
+        @DontInline
+        private int serializeLargeSubsetSize(Collection<ColumnDefinition> columns, int columnCount, Columns superset, int supersetCount)
+        {
+            // write flag indicating we're in lengthy mode
+            int size = TypeSizes.sizeofUnsignedVInt(supersetCount - columnCount);
+            BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = superset.iterator();
+            if (columnCount < supersetCount / 2)
+            {
+                // write present columns
+                for (ColumnDefinition column : columns)
+                {
+                    if (iter.next(column) == null)
+                        throw new IllegalStateException();
+                    size += TypeSizes.sizeofUnsignedVInt(iter.indexOfCurrent());
+                }
+            }
+            else
+            {
+                // write missing columns
+                int prev = -1;
+                for (ColumnDefinition column : columns)
+                {
+                    if (iter.next(column) == null)
+                        throw new IllegalStateException();
+                    int cur = iter.indexOfCurrent();
+                    while (++prev != cur)
+                        size += TypeSizes.sizeofUnsignedVInt(prev);
+                }
+                while (++prev != supersetCount)
+                    size += TypeSizes.sizeofUnsignedVInt(prev);
+            }
+            return size;
+        }
+
     }
 }

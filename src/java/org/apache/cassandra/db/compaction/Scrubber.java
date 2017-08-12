@@ -35,7 +35,6 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.UUIDGen;
@@ -58,11 +57,6 @@ public class Scrubber implements Closeable
     private final ScrubInfo scrubInfo;
     private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
 
-    private final boolean isOffline;
-
-    private SSTableReader newSstable;
-    private SSTableReader newInOrderSstable;
-
     private int goodRows;
     private int badRows;
     private int emptyRows;
@@ -83,9 +77,9 @@ public class Scrubber implements Closeable
     };
     private final SortedSet<Partition> outOfOrder = new TreeSet<>(partitionComparator);
 
-    public Scrubber(ColumnFamilyStore cfs, LifecycleTransaction transaction, boolean skipCorrupted, boolean isOffline, boolean checkData) throws IOException
+    public Scrubber(ColumnFamilyStore cfs, LifecycleTransaction transaction, boolean skipCorrupted, boolean checkData) throws IOException
     {
-        this(cfs, transaction, skipCorrupted, new OutputHandler.LogOutput(), isOffline, checkData);
+        this(cfs, transaction, skipCorrupted, new OutputHandler.LogOutput(), checkData);
     }
 
     @SuppressWarnings("resource")
@@ -93,7 +87,6 @@ public class Scrubber implements Closeable
                     LifecycleTransaction transaction,
                     boolean skipCorrupted,
                     OutputHandler outputHandler,
-                    boolean isOffline,
                     boolean checkData) throws IOException
     {
         this.cfs = cfs;
@@ -101,18 +94,14 @@ public class Scrubber implements Closeable
         this.sstable = transaction.onlyOne();
         this.outputHandler = outputHandler;
         this.skipCorrupted = skipCorrupted;
-        this.isOffline = isOffline;
         this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata,
                                                                                                         sstable.descriptor.version,
                                                                                                         sstable.header);
 
         List<SSTableReader> toScrub = Collections.singletonList(sstable);
 
-        // Calculate the expected compacted filesize
-        this.destination = cfs.directories.getWriteableLocationAsFile(cfs.getExpectedCompactedFileSize(toScrub, OperationType.SCRUB));
-        if (destination == null)
-            throw new IOException("disk full");
-
+        int locIndex = CompactionStrategyManager.getCompactionStrategyIndex(cfs, cfs.getDirectories(), sstable);
+        this.destination = cfs.getDirectories().getLocationForDisk(cfs.getDirectories().getWriteableLocations()[locIndex]);
         this.isCommutative = cfs.metadata.isCounter();
 
         boolean hasIndexFile = (new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX))).exists();
@@ -124,14 +113,14 @@ public class Scrubber implements Closeable
         }
         this.checkData = checkData && !this.isIndex; //LocalByPartitionerType does not support validation
         this.expectedBloomFilterSize = Math.max(
-            cfs.metadata.getMinIndexInterval(),
+            cfs.metadata.params.minIndexInterval,
             hasIndexFile ? SSTableReader.getApproximateKeyCount(toScrub) : 0);
 
         // loop through each row, deserializing to check for damage.
         // we'll also loop through the index at the same time, using the position from the index to recover if the
         // row header (key or data size) is corrupt. (This means our position in the index file will be one row
         // "ahead" of the data file.)
-        this.dataFile = isOffline
+        this.dataFile = transaction.isOffline()
                         ? sstable.openDataReader()
                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
 
@@ -152,9 +141,10 @@ public class Scrubber implements Closeable
 
     public void scrub()
     {
+        List<SSTableReader> finished = new ArrayList<>();
+        boolean completed = false;
         outputHandler.output(String.format("Scrubbing %s (%s bytes)", sstable, dataFile.length()));
-        int nowInSec = FBUtilities.nowInSeconds();
-        try (SSTableRewriter writer = new SSTableRewriter(cfs, transaction, sstable.maxDataAge, isOffline).keepOriginals(isOffline))
+        try (SSTableRewriter writer = SSTableRewriter.constructKeepingOriginals(transaction, false, sstable.maxDataAge))
         {
             nextIndexKey = indexAvailable() ? ByteBufferUtil.readWithShortLength(indexFile) : null;
             if (indexAvailable())
@@ -296,6 +286,7 @@ public class Scrubber implements Closeable
             {
                 // out of order rows, but no bad rows found - we can keep our repairedAt time
                 long repairedAt = badRows > 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt;
+                SSTableReader newInOrderSstable;
                 try (SSTableWriter inOrderWriter = CompactionManager.createWriter(cfs, destination, expectedBloomFilterSize, repairedAt, sstable, transaction))
                 {
                     for (Partition partition : outOfOrder)
@@ -303,20 +294,25 @@ public class Scrubber implements Closeable
                     newInOrderSstable = inOrderWriter.finish(-1, sstable.maxDataAge, true);
                 }
                 transaction.update(newInOrderSstable, false);
+                finished.add(newInOrderSstable);
                 outputHandler.warn(String.format("%d out of order rows found while scrubbing %s; Those have been written (in order) to a new sstable (%s)", outOfOrder.size(), sstable, newInOrderSstable));
             }
 
             // finish obsoletes the old sstable
-            List<SSTableReader> finished = writer.setRepairedAt(badRows > 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt).finish();
-            if (!finished.isEmpty())
-                newSstable = finished.get(0);
+            finished.addAll(writer.setRepairedAt(badRows > 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt).finish());
+            completed = true;
         }
         catch (IOException e)
         {
             throw Throwables.propagate(e);
         }
+        finally
+        {
+            if (transaction.isOffline())
+                finished.forEach(sstable -> sstable.selfRef().release());
+        }
 
-        if (newSstable == null)
+        if (completed)
         {
             if (badRows > 0)
                 outputHandler.warn("No valid rows found while scrubbing " + sstable + "; it is marked for deletion now. If you want to attempt manual recovery, you can find a copy in the pre-scrub snapshot");
@@ -381,17 +377,7 @@ public class Scrubber implements Closeable
     {
         // TODO bitch if the row is too large?  if it is there's not much we can do ...
         outputHandler.warn(String.format("Out of order row detected (%s found after %s)", key, prevKey));
-        outOfOrder.add(ArrayBackedPartition.create(iterator));
-    }
-
-    public SSTableReader getNewSSTable()
-    {
-        return newSstable;
-    }
-
-    public SSTableReader getNewInOrderSSTable()
-    {
-        return newInOrderSstable;
+        outOfOrder.add(ImmutableBTreePartition.create(iterator));
     }
 
     private void throwIfFatal(Throwable th)

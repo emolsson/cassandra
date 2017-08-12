@@ -337,8 +337,8 @@ public class UnfilteredRowIteratorsMergeTest
         else
         {
             Row row = (Row) list.get(index);
-            if (row.deletion() != null && row.deletion().supersedes(def))
-                def = row.deletion();
+            if (row.deletion().supersedes(def))
+                def = row.deletion().time();
         }
 
         if (index >= list.size())
@@ -364,14 +364,14 @@ public class UnfilteredRowIteratorsMergeTest
 
     private static Clustering clusteringFor(int i)
     {
-        return new Clustering(Int32Type.instance.decompose(i));
+        return Clustering.make(Int32Type.instance.decompose(i));
     }
 
     static Row emptyRowAt(int pos, Function<Integer, Integer> timeGenerator)
     {
         final Clustering clustering = clusteringFor(pos);
         final LivenessInfo live = LivenessInfo.create(metadata, timeGenerator.apply(pos), nowInSec);
-        return BTreeBackedRow.noCellLiveRow(clustering, live);
+        return BTreeRow.noCellLiveRow(clustering, live);
     }
 
     private void dumpList(List<Unfiltered> list)

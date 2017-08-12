@@ -19,13 +19,15 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.List;
+import java.util.Objects;
 
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
+
 
 /**
  * A range tombstone is a tombstone that covers a slice/range of rows.
@@ -197,6 +199,12 @@ public class RangeTombstone
             public RangeTombstone.Bound deserialize(DataInputPlus in, int version, List<AbstractType<?>> types) throws IOException
             {
                 Kind kind = Kind.values()[in.readByte()];
+                return deserializeValues(in, kind, version, types);
+            }
+
+            public RangeTombstone.Bound deserializeValues(DataInputPlus in, Kind kind, int version,
+                    List<AbstractType<?>> types) throws IOException
+            {
                 int size = in.readUnsignedShort();
                 if (size == 0)
                     return kind.isStart() ? BOTTOM : TOP;

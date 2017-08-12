@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Supplier;
 
+import com.google.common.collect.ImmutableMap;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -33,13 +34,13 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.IndexType;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.lifecycle.TransactionLogs;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -47,9 +48,9 @@ import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.locator.OldNetworkTopologyStrategy;
 import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.Util.throwAssert;
 import static org.apache.cassandra.cql3.CQLTester.assertRows;
 import static org.apache.cassandra.cql3.CQLTester.row;
 import static org.junit.Assert.assertEquals;
@@ -99,14 +100,14 @@ public class DefsTest
         for (int i = 0; i < 5; i++)
         {
             ByteBuffer name = ByteBuffer.wrap(new byte[] { (byte)i });
-            cfm.addColumnDefinition(ColumnDefinition.regularDef(cfm, name, BytesType.instance).setIndex(Integer.toString(i), IndexType.KEYS, null));
+            cfm.addColumnDefinition(ColumnDefinition.regularDef(cfm, name, BytesType.instance));
         }
 
         cfm.comment("No comment")
            .readRepairChance(0.5)
            .gcGraceSeconds(100000)
-           .minCompactionThreshold(500)
-           .maxCompactionThreshold(500);
+           .compaction(CompactionParams.scts(ImmutableMap.of("min_threshold", "500",
+                                                             "max_threshold", "500")));
 
         // we'll be adding this one later. make sure it's not already there.
         assertNull(cfm.getColumnDefinition(ByteBuffer.wrap(new byte[]{ 5 })));
@@ -114,13 +115,11 @@ public class DefsTest
         CFMetaData cfNew = cfm.copy();
 
         // add one.
-        ColumnDefinition addIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 5 }), BytesType.instance)
-                                                       .setIndex("5", IndexType.KEYS, null);
+        ColumnDefinition addIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 5 }), BytesType.instance);
         cfNew.addColumnDefinition(addIndexDef);
 
         // remove one.
-        ColumnDefinition removeIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 0 }), BytesType.instance)
-                                                          .setIndex("0", IndexType.KEYS, null);
+        ColumnDefinition removeIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 0 }), BytesType.instance);
         assertTrue(cfNew.removeColumnDefinition(removeIndexDef));
 
         cfm.apply(cfNew);
@@ -155,22 +154,6 @@ public class DefsTest
         catch (ConfigurationException expected)
         {
         }
-    }
-
-    @Test
-    public void addNewCfWithNullComment() throws ConfigurationException
-    {
-        final String ks = KEYSPACE1;
-        final String cf = "BrandNewCfWithNull";
-        KeyspaceMetadata original = Schema.instance.getKSMetaData(ks);
-
-        CFMetaData newCf = addTestTable(original.name, cf, null);
-
-        assertFalse(Schema.instance.getKSMetaData(ks).tables.get(newCf.cfName).isPresent());
-        MigrationManager.announceNewColumnFamily(newCf);
-
-        assertTrue(Schema.instance.getKSMetaData(ks).tables.get(newCf.cfName).isPresent());
-        assertEquals(newCf, Schema.instance.getKSMetaData(ks).tables.get(newCf.cfName).get());
     }
 
     @Test
@@ -220,7 +203,7 @@ public class DefsTest
         ColumnFamilyStore store = Keyspace.open(cfm.ksName).getColumnFamilyStore(cfm.cfName);
         assertNotNull(store);
         store.forceBlockingFlush();
-        assertTrue(store.directories.sstableLister().list().size() > 0);
+        assertTrue(store.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().size() > 0);
 
         MigrationManager.announceColumnFamilyDrop(ks.name, cfm.cfName);
 
@@ -242,7 +225,7 @@ public class DefsTest
 
         // verify that the files are gone.
         Supplier<Object> lambda = () -> {
-            for (File file : store.directories.sstableLister().listFiles())
+            for (File file : store.getDirectories().sstableLister(Directories.OnTxnErr.THROW).listFiles())
             {
                 if (file.getPath().endsWith("Data.db") && !new File(file.getPath().replace("Data.db", "Compacted")).exists())
                     return false;
@@ -291,7 +274,7 @@ public class DefsTest
         ColumnFamilyStore cfs = Keyspace.open(cfm.ksName).getColumnFamilyStore(cfm.cfName);
         assertNotNull(cfs);
         cfs.forceBlockingFlush();
-        assertTrue(!cfs.directories.sstableLister().list().isEmpty());
+        assertTrue(!cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().isEmpty());
 
         MigrationManager.announceKeyspaceDrop(ks.name);
 
@@ -402,7 +385,7 @@ public class DefsTest
         }
 
         Map<String, String> replicationMap = new HashMap<>();
-        replicationMap.put(KeyspaceParams.Replication.CLASS, OldNetworkTopologyStrategy.class.getName());
+        replicationMap.put(ReplicationParams.CLASS, OldNetworkTopologyStrategy.class.getName());
         replicationMap.put("replication_factor", "1");
 
         KeyspaceMetadata newKs = KeyspaceMetadata.create(cf.ksName, KeyspaceParams.create(true, replicationMap));
@@ -517,26 +500,33 @@ public class DefsTest
         // persist keyspace definition in the system keyspace
         SchemaKeyspace.makeCreateKeyspaceMutation(Schema.instance.getKSMetaData(KEYSPACE6), FBUtilities.timestampMicros()).applyUnsafe();
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE6).getColumnFamilyStore(TABLE1i);
+        String indexName = "birthdate_key_index";
 
         // insert some data.  save the sstable descriptor so we can make sure it's marked for delete after the drop
-        QueryProcessor.executeInternal(String.format("INSERT INTO %s.%s (key, c1, birthdate, notbirthdate) VALUES (?, ?, ?, ?)",
-                                                     KEYSPACE6, TABLE1i),
+        QueryProcessor.executeInternal(String.format(
+                                                    "INSERT INTO %s.%s (key, c1, birthdate, notbirthdate) VALUES (?, ?, ?, ?)",
+                                                    KEYSPACE6,
+                                                    TABLE1i),
                                        "key0", "col0", 1L, 1L);
 
         cfs.forceBlockingFlush();
-        ColumnFamilyStore indexedCfs = cfs.indexManager.getIndexForColumn(cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes("birthdate"))).getIndexCfs();
-        Descriptor desc = indexedCfs.getLiveSSTables().iterator().next().descriptor;
+        ColumnFamilyStore indexCfs = cfs.indexManager.getIndexByName(indexName)
+                                                     .getBackingTable()
+                                                     .orElseThrow(throwAssert("Cannot access index cfs"));
+        Descriptor desc = indexCfs.getLiveSSTables().iterator().next().descriptor;
 
         // drop the index
         CFMetaData meta = cfs.metadata.copy();
-        ColumnDefinition cdOld = cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes("birthdate"));
-        ColumnDefinition cdNew = ColumnDefinition.regularDef(meta, cdOld.name.bytes, cdOld.type);
-        meta.addOrReplaceColumnDefinition(cdNew);
+        IndexMetadata existing = cfs.metadata.getIndexes()
+                                             .get(indexName)
+                                             .orElseThrow(throwAssert("Index not found"));
+
+        meta.indexes(meta.getIndexes().without(existing.name));
         MigrationManager.announceColumnFamilyUpdate(meta, false);
 
         // check
-        assertTrue(cfs.indexManager.getIndexes().isEmpty());
-        TransactionLogs.waitForDeletions();
+        assertTrue(cfs.indexManager.listIndexes().isEmpty());
+        LifecycleTransaction.waitForDeletions();
         assertFalse(new File(desc.filenameFor(Component.DATA)).exists());
     }
 

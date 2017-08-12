@@ -35,9 +35,9 @@ public class RangeNamesQueryPager extends AbstractQueryPager
 {
     private volatile DecoratedKey lastReturnedKey;
 
-    public RangeNamesQueryPager(PartitionRangeReadCommand command, PagingState state)
+    public RangeNamesQueryPager(PartitionRangeReadCommand command, PagingState state, int protocolVersion)
     {
-        super(command);
+        super(command, protocolVersion);
         assert command.isNamesQuery();
 
         if (state != null)
@@ -67,6 +67,12 @@ public class RangeNamesQueryPager extends AbstractQueryPager
     protected void recordLast(DecoratedKey key, Row last)
     {
         lastReturnedKey = key;
+    }
+
+    protected boolean isPreviouslyReturnedPartition(DecoratedKey key)
+    {
+        // Note that lastReturnedKey can be null, but key cannot.
+        return key.equals(lastReturnedKey);
     }
 
     private AbstractBounds<PartitionPosition> makeExcludingKeyBounds(PartitionPosition lastReturnedKey)

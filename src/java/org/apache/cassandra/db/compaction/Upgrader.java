@@ -23,7 +23,6 @@ import java.util.*;
 import com.google.common.base.Throwables;
 import com.google.common.collect.Sets;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -61,7 +60,7 @@ public class Upgrader
         this.controller = new UpgradeController(cfs);
 
         this.strategyManager = cfs.getCompactionStrategyManager();
-        long estimatedTotalKeys = Math.max(cfs.metadata.getMinIndexInterval(), SSTableReader.getApproximateKeyCount(Arrays.asList(this.sstable)));
+        long estimatedTotalKeys = Math.max(cfs.metadata.params.minIndexInterval, SSTableReader.getApproximateKeyCount(Arrays.asList(this.sstable)));
         long estimatedSSTables = Math.max(1, SSTableReader.getTotalBytes(Arrays.asList(this.sstable)) / strategyManager.getMaxSSTableBytes());
         this.estimatedRows = (long) Math.ceil((double) estimatedTotalKeys / estimatedSSTables);
     }
@@ -69,15 +68,6 @@ public class Upgrader
     private SSTableWriter createCompactionWriter(long repairedAt)
     {
         MetadataCollector sstableMetadataCollector = new MetadataCollector(cfs.getComparator());
-
-        // Get the max timestamp of the precompacted sstables
-        // and adds generation of live ancestors
-        sstableMetadataCollector.addAncestor(sstable.descriptor.generation);
-        for (Integer i : sstable.getAncestors())
-        {
-            if (new File(sstable.descriptor.withGeneration(i).filenameFor(Component.DATA)).exists())
-                sstableMetadataCollector.addAncestor(i);
-        }
         sstableMetadataCollector.sstableLevel(sstable.getSSTableLevel());
         return SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(directory)),
                                     estimatedRows,
@@ -85,6 +75,7 @@ public class Upgrader
                                     cfs.metadata,
                                     sstableMetadataCollector,
                                     SerializationHeader.make(cfs.metadata, Sets.newHashSet(sstable)),
+                                    cfs.indexManager.listIndexes(),
                                     transaction);
     }
 
@@ -92,7 +83,7 @@ public class Upgrader
     {
         outputHandler.output("Upgrading " + sstable);
         int nowInSec = FBUtilities.nowInSeconds();
-        try (SSTableRewriter writer = new SSTableRewriter(cfs, transaction, CompactionTask.getMaxDataAge(transaction.originals()), true).keepOriginals(keepOriginals);
+        try (SSTableRewriter writer = SSTableRewriter.constructKeepingOriginals(transaction, keepOriginals, CompactionTask.getMaxDataAge(transaction.originals()), true);
              AbstractCompactionStrategy.ScannerList scanners = strategyManager.getScanners(transaction.originals());
              CompactionIterator iter = new CompactionIterator(transaction.opType(), scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
         {

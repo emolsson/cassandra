@@ -127,7 +127,7 @@ public class RowTest
         ColumnDefinition defA = cfm.getColumnDefinition(new ColumnIdentifier("a", true));
         ColumnDefinition defB = cfm.getColumnDefinition(new ColumnIdentifier("b", true));
 
-        Row.Builder builder = BTreeBackedRow.unsortedBuilder(cfm.partitionColumns().regulars, nowInSeconds);
+        Row.Builder builder = BTreeRow.unsortedBuilder(nowInSeconds);
         builder.newRow(cfm.comparator.make("c1"));
         writeSimpleCellValue(builder, cfm, defA, "a1", 0);
         writeSimpleCellValue(builder, cfm, defA, "a2", 1);
@@ -141,7 +141,7 @@ public class RowTest
         row = (Row) unfiltered;
         assertEquals("a2", defA.cellValueType().getString(row.getCell(defA).value()));
         assertEquals("b1", defB.cellValueType().getString(row.getCell(defB).value()));
-        assertEquals(2, row.columns().columnCount());
+        assertEquals(2, row.columns().size());
     }
 
     @Test
@@ -152,7 +152,7 @@ public class RowTest
 
         Cell cell = BufferCell.expiring(def, 0, ttl, nowInSeconds, ((AbstractType) def.cellValueType()).decompose("a1"));
 
-        PartitionUpdate update = PartitionUpdate.singleRowUpdate(cfm, dk, BTreeBackedRow.singleCellRow(cfm.comparator.make("c1"), cell));
+        PartitionUpdate update = PartitionUpdate.singleRowUpdate(cfm, dk, BTreeRow.singleCellRow(cfm.comparator.make("c1"), cell));
         new Mutation(update).applyUnsafe();
 
         // when we read with a nowInSeconds before the cell has expired,

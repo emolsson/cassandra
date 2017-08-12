@@ -21,11 +21,19 @@ package org.apache.cassandra.cache;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.*;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
 import static org.junit.Assert.*;
+
+
+import java.util.ArrayList;
+import java.util.List;
+
+
+import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.Pair;
 
 import com.googlecode.concurrentlinkedhashmap.Weighers;
 
@@ -34,8 +42,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -66,16 +73,16 @@ public class CacheProviderTest
                                     cfm);
     }
 
-    private ArrayBackedCachedPartition createPartition()
+    private CachedBTreePartition createPartition()
     {
         PartitionUpdate update = new RowUpdateBuilder(cfm, System.currentTimeMillis(), "key1")
                                  .add("col1", "val1")
                                  .buildUpdate();
 
-        return ArrayBackedCachedPartition.create(update.unfilteredIterator(), FBUtilities.nowInSeconds());
+        return CachedBTreePartition.create(update.unfilteredIterator(), FBUtilities.nowInSeconds());
     }
 
-    private void simpleCase(ArrayBackedCachedPartition partition, ICache<MeasureableString, IRowCacheEntry> cache)
+    private void simpleCase(CachedBTreePartition partition, ICache<MeasureableString, IRowCacheEntry> cache)
     {
         cache.put(key1, partition);
         assertNotNull(cache.get(key1));
@@ -89,15 +96,15 @@ public class CacheProviderTest
         assertEquals(CAPACITY, cache.size());
     }
 
-    private void assertDigests(IRowCacheEntry one, ArrayBackedCachedPartition two)
+    private void assertDigests(IRowCacheEntry one, CachedBTreePartition two)
     {
-        assertTrue(one instanceof ArrayBackedCachedPartition);
+        assertTrue(one instanceof CachedBTreePartition);
         try
         {
             MessageDigest d1 = MessageDigest.getInstance("MD5");
             MessageDigest d2 = MessageDigest.getInstance("MD5");
-            UnfilteredRowIterators.digest(((ArrayBackedCachedPartition) one).unfilteredIterator(), d1);
-            UnfilteredRowIterators.digest(((ArrayBackedCachedPartition) two).unfilteredIterator(), d2);
+            UnfilteredRowIterators.digest(null, ((CachedBTreePartition) one).unfilteredIterator(), d1, MessagingService.current_version);
+            UnfilteredRowIterators.digest(null, ((CachedBTreePartition) two).unfilteredIterator(), d2, MessagingService.current_version);
             assertTrue(MessageDigest.isEqual(d1.digest(), d2.digest()));
         }
         catch (NoSuchAlgorithmException e)
@@ -106,7 +113,7 @@ public class CacheProviderTest
         }
     }
 
-    private void concurrentCase(final ArrayBackedCachedPartition partition, final ICache<MeasureableString, IRowCacheEntry> cache) throws InterruptedException
+    private void concurrentCase(final CachedBTreePartition partition, final ICache<MeasureableString, IRowCacheEntry> cache) throws InterruptedException
     {
         final long startTime = System.currentTimeMillis() + 500;
         Runnable runnable = new Runnable()
@@ -140,7 +147,7 @@ public class CacheProviderTest
     public void testSerializingCache() throws InterruptedException
     {
         ICache<MeasureableString, IRowCacheEntry> cache = SerializingCache.create(CAPACITY, Weighers.<RefCountedMemory>singleton(), new SerializingCacheProvider.RowCacheSerializer());
-        ArrayBackedCachedPartition partition = createPartition();
+        CachedBTreePartition partition = createPartition();
         simpleCase(partition, cache);
         concurrentCase(partition, cache);
     }
@@ -148,18 +155,16 @@ public class CacheProviderTest
     @Test
     public void testKeys()
     {
-        UUID cfId = UUID.randomUUID();
-
-
+        Pair<String, String> ksAndCFName = Pair.create(KEYSPACE1, CF_STANDARD1);
         byte[] b1 = {1, 2, 3, 4};
-        RowCacheKey key1 = new RowCacheKey(cfId, ByteBuffer.wrap(b1));
+        RowCacheKey key1 = new RowCacheKey(ksAndCFName, ByteBuffer.wrap(b1));
         byte[] b2 = {1, 2, 3, 4};
-        RowCacheKey key2 = new RowCacheKey(cfId, ByteBuffer.wrap(b2));
+        RowCacheKey key2 = new RowCacheKey(ksAndCFName, ByteBuffer.wrap(b2));
         assertEquals(key1, key2);
         assertEquals(key1.hashCode(), key2.hashCode());
-        
+
         byte[] b3 = {1, 2, 3, 5};
-        RowCacheKey key3 = new RowCacheKey(cfId, ByteBuffer.wrap(b3));
+        RowCacheKey key3 = new RowCacheKey(ksAndCFName, ByteBuffer.wrap(b3));
         assertNotSame(key1, key3);
         assertNotSame(key1.hashCode(), key3.hashCode());
     }

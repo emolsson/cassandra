@@ -18,23 +18,33 @@
  */
 package org.apache.cassandra.schema;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import com.google.common.collect.ImmutableMap;
+
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.UnfilteredRowIterators;
-import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.io.compress.*;
-import org.apache.cassandra.schema.KeyspaceMetadata;
-import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.thrift.CfDef;
 import org.apache.cassandra.thrift.ColumnDef;
 import org.apache.cassandra.thrift.IndexType;
@@ -42,10 +52,8 @@ import org.apache.cassandra.thrift.ThriftConversion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
-import org.junit.BeforeClass;
-import org.junit.Test;
-
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class SchemaKeyspaceTest
 {
@@ -126,10 +134,47 @@ public class SchemaKeyspaceTest
 
                 // Testing with compression to catch #3558
                 CFMetaData withCompression = cfm.copy();
-                withCompression.compressionParameters(CompressionParameters.snappy(32768));
+                withCompression.compression(CompressionParams.snappy(32768));
                 checkInverses(withCompression);
             }
         }
+    }
+
+    @Test
+    public void testExtensions() throws IOException
+    {
+        String keyspace = "SandBox";
+
+        createTable(keyspace, "CREATE TABLE test (a text primary key, b int, c int)");
+
+        CFMetaData metadata = Schema.instance.getCFMetaData(keyspace, "test");
+        assertTrue("extensions should be empty", metadata.params.extensions.isEmpty());
+
+        ImmutableMap<String, ByteBuffer> extensions = ImmutableMap.of("From ... with Love",
+                                                                      ByteBuffer.wrap(new byte[]{0, 0, 7}));
+
+        CFMetaData copy = metadata.copy().extensions(extensions);
+
+        updateTable(keyspace, metadata, copy);
+
+        metadata = Schema.instance.getCFMetaData(keyspace, "test");
+        assertEquals(extensions, metadata.params.extensions);
+    }
+
+    private static void updateTable(String keyspace, CFMetaData oldTable, CFMetaData newTable)
+    {
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceInstance(keyspace).getMetadata();
+        Mutation mutation = SchemaKeyspace.makeUpdateTableMutation(ksm, oldTable, newTable, FBUtilities.timestampMicros(), false);
+        SchemaKeyspace.mergeSchema(Collections.singleton(mutation));
+    }
+
+    private static void createTable(String keyspace, String cql)
+    {
+        CFMetaData table = CFMetaData.compile(cql, keyspace);
+
+        KeyspaceMetadata ksm = KeyspaceMetadata.create(keyspace, KeyspaceParams.simple(1), Tables.of(table));
+        Mutation mutation = SchemaKeyspace.makeCreateTableMutation(ksm, table, FBUtilities.timestampMicros());
+        SchemaKeyspace.mergeSchema(Collections.singleton(mutation));
     }
 
     private static void checkInverses(CFMetaData cfm) throws Exception
@@ -143,10 +188,21 @@ public class SchemaKeyspaceTest
 
         // Test schema conversion
         Mutation rm = SchemaKeyspace.makeCreateTableMutation(keyspace, cfm, FBUtilities.timestampMicros());
-        PartitionUpdate serializedCf = rm.getPartitionUpdate(Schema.instance.getId(SystemKeyspace.NAME, SchemaKeyspace.TABLES));
-        PartitionUpdate serializedCD = rm.getPartitionUpdate(Schema.instance.getId(SystemKeyspace.NAME, SchemaKeyspace.COLUMNS));
-        CFMetaData newCfm = SchemaKeyspace.createTableFromTablePartitionAndColumnsPartition(UnfilteredRowIterators.filter(serializedCf.unfilteredIterator(), FBUtilities.nowInSeconds()),
-                                                                                            UnfilteredRowIterators.filter(serializedCD.unfilteredIterator(), FBUtilities.nowInSeconds()));
-        assert cfm.equals(newCfm) : String.format("%n%s%n!=%n%s", cfm, newCfm);
+        PartitionUpdate serializedCf = rm.getPartitionUpdate(Schema.instance.getId(SchemaKeyspace.NAME, SchemaKeyspace.TABLES));
+        PartitionUpdate serializedCD = rm.getPartitionUpdate(Schema.instance.getId(SchemaKeyspace.NAME, SchemaKeyspace.COLUMNS));
+
+        UntypedResultSet.Row tableRow = QueryProcessor.resultify(String.format("SELECT * FROM %s.%s", SchemaKeyspace.NAME, SchemaKeyspace.TABLES),
+                                                                 UnfilteredRowIterators.filter(serializedCf.unfilteredIterator(), FBUtilities.nowInSeconds()))
+                                                      .one();
+        TableParams params = SchemaKeyspace.createTableParamsFromRow(tableRow);
+
+        UntypedResultSet columnsRows = QueryProcessor.resultify(String.format("SELECT * FROM %s.%s", SchemaKeyspace.NAME, SchemaKeyspace.COLUMNS),
+                                                                UnfilteredRowIterators.filter(serializedCD.unfilteredIterator(), FBUtilities.nowInSeconds()));
+        Set<ColumnDefinition> columns = new HashSet<>();
+        for (UntypedResultSet.Row row : columnsRows)
+            columns.add(SchemaKeyspace.createColumnFromRow(row, Types.none()));
+
+        assertEquals(cfm.params, params);
+        assertEquals(new HashSet<>(cfm.allColumns()), columns);
     }
 }

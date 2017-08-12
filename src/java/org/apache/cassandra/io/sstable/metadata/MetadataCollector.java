@@ -17,14 +17,11 @@
  */
 package org.apache.cassandra.io.sstable.metadata;
 
-import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import com.google.common.collect.Maps;
 
@@ -35,10 +32,10 @@ import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
 import org.apache.cassandra.db.rows.Cell;
-import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.MurmurHash;
 import org.apache.cassandra.utils.StreamingHistogram;
@@ -94,7 +91,6 @@ public class MetadataCollector implements PartitionStatisticsCollector
     protected final MinMaxIntTracker localDeletionTimeTracker = new MinMaxIntTracker(Cell.NO_DELETION_TIME, Cell.NO_DELETION_TIME);
     protected final MinMaxIntTracker ttlTracker = new MinMaxIntTracker(Cell.NO_TTL, Cell.NO_TTL);
     protected double compressionRatio = NO_COMPRESSION_RATIO;
-    protected Set<Integer> ancestors = new HashSet<>();
     protected StreamingHistogram estimatedTombstoneDropTime = defaultTombstoneDropTimeHistogram();
     protected int sstableLevel;
     protected ByteBuffer[] minClusteringValues;
@@ -120,29 +116,12 @@ public class MetadataCollector implements PartitionStatisticsCollector
         this.maxClusteringValues = new ByteBuffer[comparator.size()];
     }
 
-    public MetadataCollector(Iterable<SSTableReader> sstables, ClusteringComparator comparator, int level, boolean skipAncestors)
+    public MetadataCollector(Iterable<SSTableReader> sstables, ClusteringComparator comparator, int level)
     {
         this(comparator);
 
         replayPosition(ReplayPosition.getReplayPosition(sstables));
         sstableLevel(level);
-        // Get the max timestamp of the precompacted sstables
-        // and adds generation of live ancestors
-        if (!skipAncestors)
-        {
-            for (SSTableReader sstable : sstables)
-            {
-                addAncestor(sstable.descriptor.generation);
-                for (Integer i : sstable.getAncestors())
-                    if (new File(sstable.descriptor.withGeneration(i).filenameFor(Component.DATA)).exists())
-                        addAncestor(i);
-            }
-        }
-    }
-
-    public MetadataCollector(Iterable<SSTableReader> sstables, ClusteringComparator comparator, int level)
-    {
-        this(sstables, comparator, level, false);
     }
 
     public MetadataCollector addKey(ByteBuffer key)
@@ -186,11 +165,8 @@ public class MetadataCollector implements PartitionStatisticsCollector
             return;
 
         updateTimestamp(newInfo.timestamp());
-        if (newInfo.isExpiring())
-        {
-            updateTTL(newInfo.ttl());
-            updateLocalDeletionTime(newInfo.localExpirationTime());
-        }
+        updateTTL(newInfo.ttl());
+        updateLocalDeletionTime(newInfo.localExpirationTime());
     }
 
     public void update(Cell cell)
@@ -237,12 +213,6 @@ public class MetadataCollector implements PartitionStatisticsCollector
         return this;
     }
 
-    public MetadataCollector addAncestor(int generation)
-    {
-        this.ancestors.add(generation);
-        return this;
-    }
-
     public MetadataCollector sstableLevel(int sstableLevel)
     {
         this.sstableLevel = sstableLevel;
@@ -256,10 +226,17 @@ public class MetadataCollector implements PartitionStatisticsCollector
         {
             AbstractType<?> type = comparator.subtype(i);
             ByteBuffer newValue = clustering.get(i);
-            minClusteringValues[i] = min(minClusteringValues[i], newValue, type);
-            maxClusteringValues[i] = max(maxClusteringValues[i], newValue, type);
+            minClusteringValues[i] = maybeMinimize(min(minClusteringValues[i], newValue, type));
+            maxClusteringValues[i] = maybeMinimize(max(maxClusteringValues[i], newValue, type));
         }
         return this;
+    }
+
+    private static ByteBuffer maybeMinimize(ByteBuffer buffer)
+    {
+        // ByteBuffer.minimalBufferFor doesn't handle null, but we can get it in this case since it's possible
+        // for some clustering values to be null
+        return buffer == null ? null : ByteBufferUtil.minimalBufferFor(buffer);
     }
 
     private static ByteBuffer min(ByteBuffer b1, ByteBuffer b2, AbstractType<?> comparator)
@@ -313,7 +290,7 @@ public class MetadataCollector implements PartitionStatisticsCollector
                                                              repairedAt,
                                                              totalColumnsSet,
                                                              totalRows));
-        components.put(MetadataType.COMPACTION, new CompactionMetadata(ancestors, cardinality));
+        components.put(MetadataType.COMPACTION, new CompactionMetadata(cardinality));
         components.put(MetadataType.HEADER, header.toComponent());
         return components;
     }

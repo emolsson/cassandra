@@ -29,9 +29,9 @@ import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndex;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.SecondaryIndexManager;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
@@ -52,7 +52,7 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
     }
 
     @Override
-    public Collection<ColumnDefinition> getColumnDefs()
+    public List<ColumnDefinition> getColumnDefs()
     {
         return Collections.singletonList(columnDef);
     }
@@ -72,29 +72,53 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
     @Override
     public boolean hasSupportingIndex(SecondaryIndexManager indexManager)
     {
-        SecondaryIndex index = indexManager.getIndexForColumn(columnDef);
-        return index != null && isSupportedBy(index);
+        for (Index index : indexManager.listIndexes())
+            if (isSupportedBy(index))
+                return true;
+
+        return false;
     }
 
     @Override
     public final Restriction mergeWith(Restriction otherRestriction) throws InvalidRequestException
     {
-            checkFalse(otherRestriction.isMultiColumn(),
-                       "Mixing single column relations and multi column relations on clustering columns is not allowed");
+        // We want to allow query like: b > ? AND (b,c) < (?, ?)
+        if (otherRestriction.isMultiColumn() && canBeConvertedToMultiColumnRestriction())
+        {
+            return toMultiColumnRestriction().mergeWith(otherRestriction);
+        }
 
-            return doMergeWith(otherRestriction);
+        return doMergeWith(otherRestriction);
     }
 
     protected abstract Restriction doMergeWith(Restriction otherRestriction) throws InvalidRequestException;
 
     /**
+     * Converts this <code>SingleColumnRestriction</code> into a {@link MultiColumnRestriction}
+     *
+     * @return the <code>MultiColumnRestriction</code> corresponding to this
+     */
+    abstract MultiColumnRestriction toMultiColumnRestriction();
+
+    /**
+     * Checks if this <code>Restriction</code> can be converted into a {@link MultiColumnRestriction}
+     *
+     * @return <code>true</code> if this <code>Restriction</code> can be converted into a
+     * {@link MultiColumnRestriction}, <code>false</code> otherwise.
+     */
+    boolean canBeConvertedToMultiColumnRestriction()
+    {
+        return true;
+    }
+
+    /**
      * Check if this type of restriction is supported by the specified index.
      *
-     * @param index the Secondary index
+     * @param index the secondary index
      * @return <code>true</code> this type of restriction is supported by the specified index,
      * <code>false</code> otherwise.
      */
-    protected abstract boolean isSupportedBy(SecondaryIndex index);
+    protected abstract boolean isSupportedBy(Index index);
 
     public static final class EQRestriction extends SingleColumnRestriction
     {
@@ -107,7 +131,7 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        public Iterable getFunctions()
+        public Iterable<Function> getFunctions()
         {
             return value.getFunctions();
         }
@@ -119,9 +143,15 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            return new MultiColumnRestriction.EQRestriction(Collections.singletonList(columnDef), value);
+        }
+
+        @Override
         public void addRowFilterTo(RowFilter filter,
                                    SecondaryIndexManager indexManager,
-                                   QueryOptions options) throws InvalidRequestException
+                                   QueryOptions options)
         {
             filter.add(columnDef, Operator.EQ, value.bindAndGet(options));
         }
@@ -148,9 +178,9 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
-            return index.supportsOperator(Operator.EQ);
+            return index.supportsExpression(columnDef, Operator.EQ);
         }
     }
 
@@ -194,9 +224,9 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected final boolean isSupportedBy(SecondaryIndex index)
+        protected final boolean isSupportedBy(Index index)
         {
-            return index.supportsOperator(Operator.IN);
+            return index.supportsExpression(columnDef, Operator.IN);
         }
 
         protected abstract List<ByteBuffer> getValues(QueryOptions options) throws InvalidRequestException;
@@ -210,6 +240,12 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         {
             super(columnDef);
             this.values = values;
+        }
+
+        @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            return new MultiColumnRestriction.InRestrictionWithValues(Collections.singletonList(columnDef), values);
         }
 
         @Override
@@ -251,6 +287,12 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            return new MultiColumnRestriction.InRestrictionWithMarker(Collections.singletonList(columnDef), marker);
+        }
+
+        @Override
         protected List<ByteBuffer> getValues(QueryOptions options) throws InvalidRequestException
         {
             Terminal term = marker.bind(options);
@@ -284,6 +326,12 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            return new MultiColumnRestriction.SliceRestriction(Collections.singletonList(columnDef), slice);
+        }
+
+        @Override
         public boolean isSlice()
         {
             return true;
@@ -304,7 +352,12 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         @Override
         public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options)
         {
-            ByteBuffer value = slice.bound(bound).bindAndGet(options);
+            Bound b = reverseBoundIfNeeded(getFirstColumn(), bound);
+
+            if (!hasBound(b))
+                return builder;
+
+            ByteBuffer value = slice.bound(b).bindAndGet(options);
             checkBindValueSet(value, "Invalid unset value for column %s", columnDef.name);
             return builder.addElementToAll(value);
 
@@ -343,9 +396,9 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
-            return slice.isSupportedBy(index);
+            return slice.isSupportedBy(columnDef, index);
         }
 
         @Override
@@ -383,6 +436,18 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
             super(columnDef);
             entryKeys.add(mapKey);
             entryValues.add(mapValue);
+        }
+
+        @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        boolean canBeConvertedToMultiColumnRestriction()
+        {
+            return false;
         }
 
         @Override
@@ -428,18 +493,18 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         }
 
         @Override
-        protected boolean isSupportedBy(SecondaryIndex index)
+        protected boolean isSupportedBy(Index index)
         {
             boolean supported = false;
 
             if (numberOfValues() > 0)
-                supported |= index.supportsOperator(Operator.CONTAINS);
+                supported |= index.supportsExpression(columnDef, Operator.CONTAINS);
 
             if (numberOfKeys() > 0)
-                supported |= index.supportsOperator(Operator.CONTAINS_KEY);
+                supported |= index.supportsExpression(columnDef, Operator.CONTAINS_KEY);
 
             if (numberOfEntries() > 0)
-                supported |= index.supportsOperator(Operator.EQ);
+                supported |= index.supportsExpression(columnDef, Operator.EQ);
 
             return supported;
         }
@@ -525,6 +590,142 @@ public abstract class SingleColumnRestriction extends AbstractRestriction
         private ContainsRestriction(ColumnDefinition columnDef)
         {
             super(columnDef);
+        }
+    }
+
+    public static final class IsNotNullRestriction extends SingleColumnRestriction
+    {
+        public IsNotNullRestriction(ColumnDefinition columnDef)
+        {
+            super(columnDef);
+        }
+
+        @Override
+        public Iterable<Function> getFunctions()
+        {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isNotNull()
+        {
+            return true;
+        }
+
+        @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            return new MultiColumnRestriction.NotNullRestriction(Collections.singletonList(columnDef));
+        }
+
+        @Override
+        public void addRowFilterTo(RowFilter filter,
+                                   SecondaryIndexManager indexManager,
+                                   QueryOptions options)
+        {
+            throw new UnsupportedOperationException("Secondary indexes do not support IS NOT NULL restrictions");
+        }
+
+        @Override
+        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
+        {
+            throw new UnsupportedOperationException("Cannot use IS NOT NULL restriction for slicing");
+        }
+
+        @Override
+        public String toString()
+        {
+            return "IS NOT NULL";
+        }
+
+        @Override
+        public Restriction doMergeWith(Restriction otherRestriction) throws InvalidRequestException
+        {
+            throw invalidRequest("%s cannot be restricted by a relation if it includes an IS NOT NULL", columnDef.name);
+        }
+
+        @Override
+        protected boolean isSupportedBy(Index index)
+        {
+            return index.supportsExpression(columnDef, Operator.IS_NOT);
+        }
+    }
+
+    public static final class LikeRestriction extends SingleColumnRestriction
+    {
+        private final Operator operator;
+        private final Term value;
+
+        public LikeRestriction(ColumnDefinition columnDef, Operator operator, Term value)
+        {
+            super(columnDef);
+            this.operator = operator;
+            this.value = value;
+        }
+
+        @Override
+        public Iterable<Function> getFunctions()
+        {
+            return value.getFunctions();
+        }
+
+        @Override
+        public boolean isEQ()
+        {
+            return false;
+        }
+
+        @Override
+        public boolean isLIKE()
+        {
+            return true;
+        }
+
+        @Override
+        public boolean canBeConvertedToMultiColumnRestriction()
+        {
+            return false;
+        }
+
+        @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void addRowFilterTo(RowFilter filter,
+                                   SecondaryIndexManager indexManager,
+                                   QueryOptions options)
+        {
+            filter.add(columnDef, operator, value.bindAndGet(options));
+        }
+
+        @Override
+        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
+        {
+            // LIKE could be used with clustering columns as soon as they are indexed,
+            // but we have to hide such expression from clustering filter since it
+            // can only filter based on the complete values.
+            return builder;
+        }
+
+        @Override
+        public String toString()
+        {
+            return operator.toString();
+        }
+
+        @Override
+        public Restriction doMergeWith(Restriction otherRestriction) throws InvalidRequestException
+        {
+            throw invalidRequest("%s cannot be restricted by more than one relation if it includes a %s", columnDef.name, operator);
+        }
+
+        @Override
+        protected boolean isSupportedBy(Index index)
+        {
+            return index.supportsExpression(columnDef, operator);
         }
     }
 }

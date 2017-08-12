@@ -14,8 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import cProfile
 import codecs
+import pstats
+
 from itertools import izip
+from datetime import timedelta, tzinfo
+from StringIO import StringIO
+
+ZERO = timedelta(0)
+
+
+class UTC(tzinfo):
+    """UTC"""
+
+    def utcoffset(self, dt):
+        return ZERO
+
+    def tzname(self, dt):
+        return "UTC"
+
+    def dst(self, dt):
+        return ZERO
 
 
 def split_list(items, pred):
@@ -103,6 +124,20 @@ def get_file_encoding_bomsize(filename):
             file_encoding, size = encoding, len(bom)
             break
     else:
-        file_encoding, size = "ascii", 0
+        file_encoding, size = "utf-8", 0
 
     return (file_encoding, size)
+
+
+def profile_on():
+    pr = cProfile.Profile()
+    pr.enable()
+    return pr
+
+
+def profile_off(pr):
+    pr.disable()
+    s = StringIO()
+    ps = pstats.Stats(pr, stream=s).sort_stats('cumulative')
+    ps.print_stats()
+    print s.getvalue()

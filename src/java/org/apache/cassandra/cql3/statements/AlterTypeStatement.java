@@ -36,7 +36,6 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
 
     protected AlterTypeStatement(UTName name)
     {
-        super();
         this.name = name;
     }
 
@@ -50,7 +49,7 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             throw new InvalidRequestException("You need to be logged in a keyspace or use a fully qualified user type name");
     }
 
-    protected abstract UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException;
+    protected abstract UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException;
 
     public static AlterTypeStatement addition(UTName name, ColumnIdentifier fieldName, CQL3Type.Raw type)
     {
@@ -78,18 +77,13 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
         // It doesn't really change anything anyway.
     }
 
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
-    }
-
     @Override
     public String keyspace()
     {
         return name.getKeyspace();
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         if (ksm == null)
@@ -99,7 +93,7 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             ksm.types.get(name.getUserTypeName())
                      .orElseThrow(() -> new InvalidRequestException(String.format("No user type named %s exists.", name)));
 
-        UserType updated = makeUpdatedType(toUpdate);
+        UserType updated = makeUpdatedType(toUpdate, ksm);
 
         // Now, we need to announce the type update to basically change it for new tables using this type,
         // but we also need to find all existing user types and CF using it and change them.
@@ -113,6 +107,16 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
                 modified |= updateDefinition(copy, def, toUpdate.keyspace, toUpdate.name, updated);
             if (modified)
                 MigrationManager.announceColumnFamilyUpdate(copy, false, isLocalOnly);
+        }
+
+        for (ViewDefinition view : ksm.views)
+        {
+            ViewDefinition copy = view.copy();
+            boolean modified = false;
+            for (ColumnDefinition def : copy.metadata.allColumns())
+                modified |= updateDefinition(copy.metadata, def, toUpdate.keyspace, toUpdate.name, updated);
+            if (modified)
+                MigrationManager.announceViewUpdate(copy, isLocalOnly);
         }
 
         // Other user types potentially using the updated type
@@ -130,7 +134,7 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             if (upd != null)
                 MigrationManager.announceTypeUpdate((UserType) upd, isLocalOnly);
         }
-        return true;
+        return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 
     private static int getIdxOfField(UserType type, ColumnIdentifier field)
@@ -231,6 +235,15 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
         return updatedTypes;
     }
 
+    protected void checkTypeNotUsedByAggregate(KeyspaceMetadata ksm)
+    {
+        ksm.functions.udas().filter(aggregate -> aggregate.initialCondition() != null && aggregate.stateType().referencesUserType(name.getStringTypeName()))
+                     .findAny()
+                     .ifPresent((aggregate) -> {
+                         throw new InvalidRequestException(String.format("Cannot alter user type %s as it is still used as an INITCOND by aggregate %s", name, aggregate));
+                     });
+    }
+
     private static class AddOrAlter extends AlterTypeStatement
     {
         private final boolean isAdd;
@@ -254,15 +267,21 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             newNames.addAll(toUpdate.fieldNames());
             newNames.add(fieldName.bytes);
 
+            AbstractType<?> addType = type.prepare(keyspace()).getType();
+            if (addType.referencesUserType(toUpdate.getNameAsString()))
+                throw new InvalidRequestException(String.format("Cannot add new field %s of type %s to type %s as this would create a circular reference", fieldName, type, name));
+
             List<AbstractType<?>> newTypes = new ArrayList<>(toUpdate.size() + 1);
             newTypes.addAll(toUpdate.fieldTypes());
-            newTypes.add(type.prepare(keyspace()).getType());
+            newTypes.add(addType);
 
             return new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes);
         }
 
-        private UserType doAlter(UserType toUpdate) throws InvalidRequestException
+        private UserType doAlter(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException
         {
+            checkTypeNotUsedByAggregate(ksm);
+
             int idx = getIdxOfField(toUpdate, fieldName);
             if (idx < 0)
                 throw new InvalidRequestException(String.format("Unknown field %s in type %s", fieldName, name));
@@ -278,9 +297,9 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             return new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes);
         }
 
-        protected UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException
+        protected UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException
         {
-            return isAdd ? doAdd(toUpdate) : doAlter(toUpdate);
+            return isAdd ? doAdd(toUpdate) : doAlter(toUpdate, ksm);
         }
     }
 
@@ -294,8 +313,10 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             this.renames = renames;
         }
 
-        protected UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException
+        protected UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException
         {
+            checkTypeNotUsedByAggregate(ksm);
+
             List<ByteBuffer> newNames = new ArrayList<>(toUpdate.fieldNames());
             List<AbstractType<?>> newTypes = new ArrayList<>(toUpdate.fieldTypes());
 

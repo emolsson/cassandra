@@ -66,7 +66,7 @@ public class BootStrapper extends ProgressEventNotifierSupport
 
     public ListenableFuture<StreamState> bootstrap(StreamStateStore stateStore, boolean useStrictConsistency)
     {
-        logger.debug("Beginning bootstrap process");
+        logger.trace("Beginning bootstrap process");
 
         RangeStreamer streamer = new RangeStreamer(tokenMetadata,
                                                    tokens,
@@ -74,7 +74,8 @@ public class BootStrapper extends ProgressEventNotifierSupport
                                                    "Bootstrap",
                                                    useStrictConsistency,
                                                    DatabaseDescriptor.getEndpointSnitch(),
-                                                   stateStore);
+                                                   stateStore,
+                                                   true);
         streamer.addSourceFilter(new RangeStreamer.FailureDetectorSourceFilter(FailureDetector.instance));
 
         for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
@@ -156,7 +157,7 @@ public class BootStrapper extends ProgressEventNotifierSupport
      */
     public static Collection<Token> getBootstrapTokens(final TokenMetadata metadata, InetAddress address) throws ConfigurationException
     {
-        String allocationKeyspace = DatabaseDescriptor.getAllocateTokensKeyspace();
+        String allocationKeyspace = DatabaseDescriptor.getAllocateTokensForKeyspace();
         Collection<String> initialTokens = DatabaseDescriptor.getInitialTokens();
         if (initialTokens.size() > 0 && allocationKeyspace != null)
             logger.warn("manually specified tokens override automatic allocation");
@@ -181,7 +182,7 @@ public class BootStrapper extends ProgressEventNotifierSupport
     private static Collection<Token> getSpecifiedTokens(final TokenMetadata metadata,
                                                         Collection<String> initialTokens)
     {
-        logger.debug("tokens manually specified as {}",  initialTokens);
+        logger.trace("tokens manually specified as {}",  initialTokens);
         List<Token> tokens = new ArrayList<>(initialTokens.size());
         for (String tokenString : initialTokens)
         {

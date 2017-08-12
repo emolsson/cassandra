@@ -26,7 +26,6 @@ import java.util.UUID;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
-
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
@@ -37,6 +36,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.MerkleTree;
+import org.apache.cassandra.utils.MerkleTrees;
 
 import static org.junit.Assert.assertEquals;
 
@@ -65,10 +65,11 @@ public class LocalSyncTaskTest extends SchemaLoader
         final InetAddress ep2 = InetAddress.getByName("127.0.0.1");
 
         Range<Token> range = new Range<>(partirioner.getMinimumToken(), partirioner.getRandomToken());
-        RepairJobDesc desc = new RepairJobDesc(UUID.randomUUID(), UUID.randomUUID(), KEYSPACE1, "Standard1", range);
+        RepairJobDesc desc = new RepairJobDesc(UUID.randomUUID(), UUID.randomUUID(), KEYSPACE1, "Standard1", Arrays.asList(range));
 
-        MerkleTree tree1 = createInitialTree(desc);
-        MerkleTree tree2 = createInitialTree(desc);
+        MerkleTrees tree1 = createInitialTree(desc);
+
+        MerkleTrees tree2 = createInitialTree(desc);
 
         // difference the trees
         // note: we reuse the same endpoint which is bogus in theory but fine here
@@ -88,12 +89,13 @@ public class LocalSyncTaskTest extends SchemaLoader
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore("Standard1");
 
-        ActiveRepairService.instance.registerParentRepairSession(parentRepairSession, Arrays.asList(cfs), Arrays.asList(range), false);
+        ActiveRepairService.instance.registerParentRepairSession(parentRepairSession, Arrays.asList(cfs), Arrays.asList(range), false, System.currentTimeMillis(), false);
 
-        RepairJobDesc desc = new RepairJobDesc(parentRepairSession, UUID.randomUUID(), KEYSPACE1, "Standard1", range);
+        RepairJobDesc desc = new RepairJobDesc(parentRepairSession, UUID.randomUUID(), KEYSPACE1, "Standard1", Arrays.asList(range));
 
-        MerkleTree tree1 = createInitialTree(desc);
-        MerkleTree tree2 = createInitialTree(desc);
+        MerkleTrees tree1 = createInitialTree(desc);
+
+        MerkleTrees tree2 = createInitialTree(desc);
 
         // change a range in one of the trees
         Token token = partirioner.midpoint(range.left, range.right);
@@ -115,9 +117,10 @@ public class LocalSyncTaskTest extends SchemaLoader
         assertEquals("Wrong differing ranges", interesting.size(), task.getCurrentStat().numberOfDifferences);
     }
 
-    private MerkleTree createInitialTree(RepairJobDesc desc)
+    private MerkleTrees createInitialTree(RepairJobDesc desc)
     {
-        MerkleTree tree = new MerkleTree(partirioner, desc.range, MerkleTree.RECOMMENDED_DEPTH, (int)Math.pow(2, 15));
+        MerkleTrees tree = new MerkleTrees(partirioner);
+        tree.addMerkleTrees((int) Math.pow(2, 15), desc.ranges);
         tree.init();
         for (MerkleTree.TreeRange r : tree.invalids())
         {

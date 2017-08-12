@@ -17,7 +17,9 @@
  */
 package org.apache.cassandra.utils;
 
+import java.io.File;
 import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
@@ -71,7 +73,7 @@ public final class CLibrary
         catch (UnsatisfiedLinkError e)
         {
             logger.warn("JNA link failure, one or more native method will be unavailable.");
-            logger.debug("JNA link failure details: {}", e.getMessage());
+            logger.trace("JNA link failure details: {}", e.getMessage());
         }
         catch (NoSuchMethodError e)
         {
@@ -148,7 +150,18 @@ public final class CLibrary
 
     public static void trySkipCache(String path, long offset, long len)
     {
-        trySkipCache(getfd(path), offset, len, path);
+        File f = new File(path);
+        if (!f.exists())
+            return;
+
+        try (FileInputStream fis = new FileInputStream(f))
+        {
+            trySkipCache(getfd(fis.getChannel()), offset, len, path);
+        }
+        catch (IOException e)
+        {
+            logger.warn("Could not skip cache", e);
+        }
     }
 
     public static void trySkipCache(int fd, long offset, long len, String path)
@@ -264,7 +277,7 @@ public final class CLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn(String.format("fsync(%d) failed, errno (%d).", fd, errno(e)));
+            logger.warn(String.format("fsync(%d) failed, errno (%d) {}", fd, errno(e)), e);
         }
     }
 
@@ -325,19 +338,5 @@ public final class CLibrary
         }
 
         return -1;
-    }
-
-    public static int getfd(String path)
-    {
-        try(FileChannel channel = FileChannel.open(Paths.get(path), StandardOpenOption.READ))
-        {
-            return getfd(channel);
-        }
-        catch (IOException e)
-        {
-            JVMStabilityInspector.inspectThrowable(e);
-            // ignore
-            return -1;
-        }
     }
 }

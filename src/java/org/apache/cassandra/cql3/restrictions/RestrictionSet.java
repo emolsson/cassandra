@@ -26,8 +26,8 @@ import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction.ContainsRestriction;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.SecondaryIndexManager;
 
 /**
  * Sets of column restrictions.
@@ -73,9 +73,9 @@ final class RestrictionSet implements Restrictions, Iterable<Restriction>
     }
 
     @Override
-    public final Set<ColumnDefinition> getColumnDefs()
+    public final List<ColumnDefinition> getColumnDefs()
     {
-        return restrictions.keySet();
+        return new ArrayList<>(restrictions.keySet());
     }
 
     @Override
@@ -96,13 +96,13 @@ final class RestrictionSet implements Restrictions, Iterable<Restriction>
     @Override
     public final boolean isEmpty()
     {
-        return getColumnDefs().isEmpty();
+        return restrictions.isEmpty();
     }
 
     @Override
     public final int size()
     {
-        return getColumnDefs().size();
+        return restrictions.size();
     }
 
     /**

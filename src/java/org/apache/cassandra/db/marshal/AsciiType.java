@@ -37,7 +37,7 @@ public class AsciiType extends AbstractType<String>
 {
     public static final AsciiType instance = new AsciiType();
 
-    AsciiType() {} // singleton
+    AsciiType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
     private final ThreadLocal<CharsetEncoder> encoder = new ThreadLocal<CharsetEncoder>()
     {
@@ -47,11 +47,6 @@ public class AsciiType extends AbstractType<String>
             return Charset.forName("US-ASCII").newEncoder();
         }
     };
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
 
     public ByteBuffer fromString(String source)
     {
@@ -88,7 +83,7 @@ public class AsciiType extends AbstractType<String>
     {
         try
         {
-            return '"' + new String(Json.JSON_STRING_ENCODER.quoteAsString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII")))) + '"';
+            return '"' + Json.quoteAsJsonString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII"))) + '"';
         }
         catch (CharacterCodingException exc)
         {
@@ -104,10 +99,5 @@ public class AsciiType extends AbstractType<String>
     public TypeSerializer<String> getSerializer()
     {
         return AsciiSerializer.instance;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return true;
     }
 }

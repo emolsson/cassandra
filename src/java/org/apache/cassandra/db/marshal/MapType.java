@@ -67,11 +67,18 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
 
     private MapType(AbstractType<K> keys, AbstractType<V> values, boolean isMultiCell)
     {
-        super(Kind.MAP);
+        super(ComparisonType.CUSTOM, Kind.MAP);
         this.keys = keys;
         this.values = values;
-        this.serializer = MapSerializer.getInstance(keys.getSerializer(), values.getSerializer());
+        this.serializer = MapSerializer.getInstance(keys.getSerializer(), values.getSerializer(), keys);
         this.isMultiCell = isMultiCell;
+    }
+
+    @Override
+    public boolean referencesUserType(String userTypeName)
+    {
+        return getKeysType().referencesUserType(userTypeName) ||
+               getValuesType().referencesUserType(userTypeName);
     }
 
     public AbstractType<K> getKeysType()
@@ -126,7 +133,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return compareMaps(keys, values, o1, o2);
     }
@@ -165,11 +172,6 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     public MapSerializer<K, V> getSerializer()
     {
         return serializer;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return keys.isByteOrderComparable();
     }
 
     @Override
@@ -244,7 +246,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             if (key.startsWith("\""))
                 sb.append(key);
             else
-                sb.append('"').append(Json.JSON_STRING_ENCODER.quoteAsString(key)).append('"');
+                sb.append('"').append(Json.quoteAsJsonString(key)).append('"');
 
             sb.append(": ");
             sb.append(values.toJSONString(CollectionSerializer.readValue(buffer, protocolVersion), protocolVersion));

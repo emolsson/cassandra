@@ -18,9 +18,12 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.File;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 
 import com.google.common.io.Files;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -35,9 +38,13 @@ import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.StreamEvent;
+import org.apache.cassandra.streaming.StreamEventHandler;
+import org.apache.cassandra.streaming.StreamState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.OutputHandler;
@@ -74,7 +81,18 @@ public class SSTableLoaderTest
     @After
     public void cleanup()
     {
-        FileUtils.deleteRecursive(tmpdir);
+        try {
+            FileUtils.deleteRecursive(tmpdir);
+        } catch (FSWriteError e) {
+            /**
+             * Windows does not allow a mapped file to be deleted, so we probably forgot to clean the buffers somewhere.
+             * We force a GC here to force buffer deallocation, and then try deleting the directory again.
+             * For more information, see: http://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
+             * If this is not the problem, the exception will be rethrown anyway.
+             */
+            System.gc();
+            FileUtils.deleteRecursive(tmpdir);
+        }
     }
 
     private static final class TestClient extends SSTableLoader.Client
@@ -113,16 +131,24 @@ public class SSTableLoaderTest
             writer.addRow("key1", "col1", "100");
         }
 
-        SSTableLoader loader = new SSTableLoader(dataDir, new TestClient(), new OutputHandler.SystemOutput(false, false));
-        loader.stream().get();
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
+        cfs.forceBlockingFlush(); // wait for sstables to be on disk else we won't be able to stream them
 
-        List<FilteredPartition> partitions = Util.getAll(Util.cmd(Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1)).build());
+        final CountDownLatch latch = new CountDownLatch(1);
+        SSTableLoader loader = new SSTableLoader(dataDir, new TestClient(), new OutputHandler.SystemOutput(false, false));
+        loader.stream(Collections.emptySet(), completionStreamListener(latch)).get();
+
+        List<FilteredPartition> partitions = Util.getAll(Util.cmd(cfs).build());
 
         assertEquals(1, partitions.size());
         assertEquals("key1", AsciiType.instance.getString(partitions.get(0).partitionKey().getKey()));
-        assertEquals(ByteBufferUtil.bytes("100"), partitions.get(0).getRow(new Clustering(ByteBufferUtil.bytes("col1")))
+        assertEquals(ByteBufferUtil.bytes("100"), partitions.get(0).getRow(Clustering.make(ByteBufferUtil.bytes("col1")))
                                                                    .getCell(cfmeta.getColumnDefinition(ByteBufferUtil.bytes("val")))
                                                                    .value());
+
+        // The stream future is signalled when the work is complete but before releasing references. Wait for release
+        // before cleanup (CASSANDRA-10118).
+        latch.await();
     }
 
     @Test
@@ -144,30 +170,57 @@ public class SSTableLoaderTest
                                                   .withBufferSizeInMB(1)
                                                   .build();
 
-        for (int i = 0; i < 1000; i++) // make sure to write more than 1 MB
+        int NB_PARTITIONS = 5000; // Enough to write >1MB and get at least one completed sstable before we've closed the writer
+
+        for (int i = 0; i < NB_PARTITIONS; i++)
         {
             for (int j = 0; j < 100; j++)
                 writer.addRow(String.format("key%d", i), String.format("col%d", j), "100");
         }
 
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD2);
+        cfs.forceBlockingFlush(); // wait for sstables to be on disk else we won't be able to stream them
+
         //make sure we have some tables...
         assertTrue(dataDir.listFiles().length > 0);
 
+        final CountDownLatch latch = new CountDownLatch(2);
         //writer is still open so loader should not load anything
         SSTableLoader loader = new SSTableLoader(dataDir, new TestClient(), new OutputHandler.SystemOutput(false, false));
-        loader.stream().get();
+        loader.stream(Collections.emptySet(), completionStreamListener(latch)).get();
 
-        List<FilteredPartition> partitions = Util.getAll(Util.cmd(Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD2)).build());
+        List<FilteredPartition> partitions = Util.getAll(Util.cmd(cfs).build());
 
-        assertTrue(partitions.size() > 0 && partitions.size() < 1000);
+        assertTrue(partitions.size() > 0 && partitions.size() < NB_PARTITIONS);
 
         // now we complete the write and the second loader should load the last sstable as well
         writer.close();
 
         loader = new SSTableLoader(dataDir, new TestClient(), new OutputHandler.SystemOutput(false, false));
-        loader.stream().get();
+        loader.stream(Collections.emptySet(), completionStreamListener(latch)).get();
 
         partitions = Util.getAll(Util.cmd(Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD2)).build());
-        assertEquals(1000, partitions.size());
+        assertEquals(NB_PARTITIONS, partitions.size());
+
+        // The stream future is signalled when the work is complete but before releasing references. Wait for release
+        // before cleanup (CASSANDRA-10118).
+        latch.await();
+    }
+
+    StreamEventHandler completionStreamListener(final CountDownLatch latch)
+    {
+        return new StreamEventHandler() {
+            public void onFailure(Throwable arg0)
+            {
+                latch.countDown();
+            }
+
+            public void onSuccess(StreamState arg0)
+            {
+                latch.countDown();
+            }
+
+            public void handleStreamEvent(StreamEvent event) {}
+        };
     }
 }

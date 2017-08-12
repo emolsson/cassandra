@@ -47,7 +47,7 @@ public class DataOutputBufferFixed extends DataOutputBuffer
     }
 
     @Override
-    protected void doFlush() throws IOException
+    protected void doFlush(int count) throws IOException
     {
         throw new BufferOverflowException();
     }
@@ -61,5 +61,10 @@ public class DataOutputBufferFixed extends DataOutputBuffer
     protected void reallocate(long newSize)
     {
         throw new BufferOverflowException();
+    }
+
+    public void clear()
+    {
+        buffer.clear();
     }
 }

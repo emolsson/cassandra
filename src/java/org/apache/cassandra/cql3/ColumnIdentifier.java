@@ -18,11 +18,11 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Locale;
-import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.common.collect.MapMaker;
 
@@ -35,7 +35,6 @@ import org.apache.cassandra.cql3.selection.SimpleSelector;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
@@ -44,16 +43,21 @@ import org.apache.cassandra.utils.memory.AbstractAllocator;
  * Represents an identifer for a CQL column definition.
  * TODO : should support light-weight mode without text representation for when not interned
  */
-public class ColumnIdentifier extends org.apache.cassandra.cql3.selection.Selectable implements IMeasurableMemory, Comparable<ColumnIdentifier>
+public class ColumnIdentifier extends Selectable implements IMeasurableMemory, Comparable<ColumnIdentifier>
 {
+    private static final Pattern PATTERN_DOUBLE_QUOTE = Pattern.compile("\"", Pattern.LITERAL);
+    private static final String ESCAPED_DOUBLE_QUOTE = Matcher.quoteReplacement("\"\"");
+    
     public final ByteBuffer bytes;
     private final String text;
     /**
      * since these objects are compared frequently, we stash an efficiently compared prefix of the bytes, in the expectation
      * that the majority of comparisons can be answered by this value only
      */
-    private final long prefixComparison;
+    public final long prefixComparison;
     private final boolean interned;
+
+    private static final Pattern UNQUOTED_IDENTIFIER = Pattern.compile("[a-z][a-z0-9_]*");
 
     private static final long EMPTY_SIZE = ObjectSizes.measure(new ColumnIdentifier(ByteBufferUtil.EMPTY_BYTE_BUFFER, "", false));
 
@@ -150,6 +154,15 @@ public class ColumnIdentifier extends org.apache.cassandra.cql3.selection.Select
         return text;
     }
 
+    /**
+     * Returns a string representation of the identifier that is safe to use directly in CQL queries.
+     * In necessary, the string will be double-quoted, and any quotes inside the string will be escaped.
+     */
+    public String toCQLString()
+    {
+        return maybeQuote(text);
+    }
+
     public long unsharedHeapSize()
     {
         return EMPTY_SIZE
@@ -194,12 +207,24 @@ public class ColumnIdentifier extends org.apache.cassandra.cql3.selection.Select
      * once the comparator is known with prepare(). This should only be used with identifiers that are actual
      * column names. See CASSANDRA-8178 for more background.
      */
-    public static class Raw implements Selectable.Raw
+    public static interface Raw extends Selectable.Raw
+    {
+
+        public ColumnIdentifier prepare(CFMetaData cfm);
+
+        /**
+         * Returns a string representation of the identifier that is safe to use directly in CQL queries.
+         * In necessary, the string will be double-quoted, and any quotes inside the string will be escaped.
+         */
+        public String toCQLString();
+    }
+
+    public static class Literal implements Raw
     {
         private final String rawText;
         private final String text;
 
-        public Raw(String rawText, boolean keepCase)
+        public Literal(String rawText, boolean keepCase)
         {
             this.rawText = rawText;
             this.text =  keepCase ? rawText : rawText.toLowerCase(Locale.US);
@@ -239,9 +264,10 @@ public class ColumnIdentifier extends org.apache.cassandra.cql3.selection.Select
         @Override
         public final boolean equals(Object o)
         {
-            if(!(o instanceof ColumnIdentifier.Raw))
+            if(!(o instanceof Literal))
                 return false;
-            ColumnIdentifier.Raw that = (ColumnIdentifier.Raw)o;
+
+            Literal that = (Literal) o;
             return text.equals(that.text);
         }
 
@@ -250,5 +276,63 @@ public class ColumnIdentifier extends org.apache.cassandra.cql3.selection.Select
         {
             return text;
         }
+
+        public String toCQLString()
+        {
+            return maybeQuote(text);
+        }
+    }
+
+    public static class ColumnIdentifierValue implements Raw
+    {
+        private final ColumnIdentifier identifier;
+
+        public ColumnIdentifierValue(ColumnIdentifier identifier)
+        {
+            this.identifier = identifier;
+        }
+
+        public ColumnIdentifier prepare(CFMetaData cfm)
+        {
+            return identifier;
+        }
+
+        public boolean processesSelection()
+        {
+            return false;
+        }
+
+        @Override
+        public final int hashCode()
+        {
+            return identifier.hashCode();
+        }
+
+        @Override
+        public final boolean equals(Object o)
+        {
+            if(!(o instanceof ColumnIdentifierValue))
+                return false;
+            ColumnIdentifierValue that = (ColumnIdentifierValue) o;
+            return identifier.equals(that.identifier);
+        }
+
+        @Override
+        public String toString()
+        {
+            return identifier.toString();
+        }
+
+        public String toCQLString()
+        {
+            return maybeQuote(identifier.text);
+        }
+    }
+
+    static String maybeQuote(String text)
+    {
+        if (UNQUOTED_IDENTIFIER.matcher(text).matches())
+            return text;
+        return '"' + PATTERN_DOUBLE_QUOTE.matcher(text).replaceAll(ESCAPED_DOUBLE_QUOTE) + '"';
     }
 }

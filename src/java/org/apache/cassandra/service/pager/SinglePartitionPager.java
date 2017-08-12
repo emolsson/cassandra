@@ -24,11 +24,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.exceptions.RequestValidationException;
-import org.apache.cassandra.exceptions.RequestExecutionException;
-import org.apache.cassandra.service.ClientState;
 
 /**
  * Common interface to single partition queries (by slice and by name).
@@ -39,18 +35,18 @@ public class SinglePartitionPager extends AbstractQueryPager
 {
     private static final Logger logger = LoggerFactory.getLogger(SinglePartitionPager.class);
 
-    private final SinglePartitionReadCommand<?> command;
+    private final SinglePartitionReadCommand command;
 
-    private volatile Clustering lastReturned;
+    private volatile PagingState.RowMark lastReturned;
 
-    public SinglePartitionPager(SinglePartitionReadCommand<?> command, PagingState state)
+    public SinglePartitionPager(SinglePartitionReadCommand command, PagingState state, int protocolVersion)
     {
-        super(command);
+        super(command, protocolVersion);
         this.command = command;
 
         if (state != null)
         {
-            lastReturned = LegacyLayout.decodeClustering(command.metadata(), state.cellName);
+            lastReturned = state.rowMark;
             restoreState(command.partitionKey(), state.remaining, state.remainingInPartition);
         }
     }
@@ -69,17 +65,22 @@ public class SinglePartitionPager extends AbstractQueryPager
     {
         return lastReturned == null
              ? null
-             : new PagingState(null, LegacyLayout.encodeClustering(command.metadata(), lastReturned), maxRemaining(), remainingInPartition());
+             : new PagingState(null, lastReturned, maxRemaining(), remainingInPartition());
     }
 
     protected ReadCommand nextPageReadCommand(int pageSize)
     {
-        return command.forPaging(lastReturned, pageSize);
+        return command.forPaging(lastReturned == null ? null : lastReturned.clustering(command.metadata()), pageSize);
     }
 
     protected void recordLast(DecoratedKey key, Row last)
     {
-        if (last != null)
-            lastReturned = last.clustering();
+        if (last != null && last.clustering() != Clustering.STATIC_CLUSTERING)
+            lastReturned = PagingState.RowMark.create(command.metadata(), last, protocolVersion);
+    }
+
+    protected boolean isPreviouslyReturnedPartition(DecoratedKey key)
+    {
+        return lastReturned != null;
     }
 }

@@ -43,11 +43,14 @@ public class Config
     public String authorizer;
     public String role_manager;
     public volatile int permissions_validity_in_ms = 2000;
-    public int permissions_cache_max_entries = 1000;
+    public volatile int permissions_cache_max_entries = 1000;
     public volatile int permissions_update_interval_in_ms = -1;
     public volatile int roles_validity_in_ms = 2000;
-    public int roles_cache_max_entries = 1000;
+    public volatile int roles_cache_max_entries = 1000;
     public volatile int roles_update_interval_in_ms = -1;
+    public volatile int credentials_validity_in_ms = 2000;
+    public volatile int credentials_cache_max_entries = 1000;
+    public volatile int credentials_update_interval_in_ms = -1;
 
     /* Hashing strategy Random or OPHF */
     public String partitioner;
@@ -56,6 +59,7 @@ public class Config
     public volatile boolean hinted_handoff_enabled = true;
     public Set<String> hinted_handoff_disabled_datacenters = Sets.newConcurrentHashSet();
     public volatile Integer max_hint_window_in_ms = 3 * 3600 * 1000; // three hours
+    public String hints_directory;
 
     public ParameterizedClass seed_provider;
     public DiskAccessMode disk_access_mode = DiskAccessMode.auto;
@@ -83,7 +87,7 @@ public class Config
 
     public volatile Long truncate_request_timeout_in_ms = 60000L;
 
-    public Integer streaming_socket_timeout_in_ms = 0;
+    public Integer streaming_socket_timeout_in_ms = 3600000;
 
     public boolean cross_node_timeout = false;
 
@@ -92,13 +96,12 @@ public class Config
     public Integer concurrent_reads = 32;
     public Integer concurrent_writes = 32;
     public Integer concurrent_counter_writes = 32;
-    public Integer concurrent_batchlog_writes = 32;
     public Integer concurrent_materialized_view_writes = 32;
 
     @Deprecated
     public Integer concurrent_replicates = null;
 
-    public Integer memtable_flush_writers = null;
+    public Integer memtable_flush_writers = 1;
     public Integer memtable_heap_space_in_mb;
     public Integer memtable_offheap_space_in_mb;
     public Float memtable_cleanup_threshold = null;
@@ -109,6 +112,7 @@ public class Config
     public String listen_interface;
     public Boolean listen_interface_prefer_ipv6 = false;
     public String broadcast_address;
+    public Boolean listen_on_broadcast_address = false;
     public String internode_authenticator;
 
     /* intentionally left set to true, despite being set to false in stock 2.2 cassandra.yaml
@@ -131,6 +135,7 @@ public class Config
 
     public Boolean start_native_transport = false;
     public Integer native_transport_port = 9042;
+    public Integer native_transport_port_ssl = null;
     public Integer native_transport_max_threads = 128;
     public Integer native_transport_max_frame_size_in_mb = 256;
     public volatile Long native_transport_max_concurrent_connections = -1L;
@@ -154,7 +159,7 @@ public class Config
     public Integer max_streaming_retries = 3;
 
     public volatile Integer stream_throughput_outbound_megabits_per_sec = 200;
-    public volatile Integer inter_dc_stream_throughput_outbound_megabits_per_sec = 0;
+    public volatile Integer inter_dc_stream_throughput_outbound_megabits_per_sec = 200;
 
     public String[] data_file_directories = new String[0];
 
@@ -170,6 +175,8 @@ public class Config
     public ParameterizedClass commitlog_compression;
     public int commitlog_max_compression_buffers_in_pool = 3;
     public TransparentDataEncryptionOptions transparent_data_encryption_options = new TransparentDataEncryptionOptions();
+
+    public Integer max_mutation_size_in_kb;
 
     @Deprecated
     public int commitlog_periodic_queue_size = -1;
@@ -196,7 +203,10 @@ public class Config
 
     public int hinted_handoff_throttle_in_kb = 1024;
     public int batchlog_replay_throttle_in_kb = 1024;
-    public int max_hints_delivery_threads = 1;
+    public int max_hints_delivery_threads = 2;
+    public int hints_flush_period_in_ms = 10000;
+    public int max_hints_file_size_in_mb = 128;
+    public ParameterizedClass hints_compression;
     public int sstable_preemptive_open_interval_in_mb = 50;
 
     public volatile boolean incremental_backups = false;
@@ -215,9 +225,6 @@ public class Config
     public Long counter_cache_size_in_mb = null;
     public volatile int counter_cache_save_period = 7200;
     public volatile int counter_cache_keys_to_save = Integer.MAX_VALUE;
-
-    @Deprecated
-    public String memory_allocator;
 
     private static boolean isClientMode = false;
 
@@ -243,6 +250,8 @@ public class Config
     public volatile Long index_summary_capacity_in_mb;
     public volatile int index_summary_resize_interval_in_minutes = 60;
 
+    public int gc_warn_threshold_in_ms = 0;
+
     // TTL for different types of trace events.
     public int tracetype_query_ttl = (int) TimeUnit.DAYS.toSeconds(1);
     public int tracetype_repair_ttl = (int) TimeUnit.DAYS.toSeconds(7);
@@ -266,6 +275,7 @@ public class Config
     public int windows_timer_interval = 0;
 
     public boolean enable_user_defined_functions = false;
+    public boolean enable_scripted_user_defined_functions = false;
     /**
      * Optionally disable asynchronous UDF execution.
      * Disabling asynchronous UDF execution also implicitly disables the security-manager!

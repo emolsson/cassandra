@@ -77,8 +77,8 @@ public class IndexQueryPagingTest extends CQLTester
         // setting the fetch size < than the row count. Assert
         // that all rows are returned, so we know that paging
         // of the results was involved.
-        Session session = sessionNet(maxProtocolVersion);
-        Statement stmt = new SimpleStatement(String.format(cql, KEYSPACE + "." + currentTable()));
+        Session session = sessionNet();
+        Statement stmt = new SimpleStatement(String.format(cql, KEYSPACE + '.' + currentTable()));
         stmt.setFetchSize(rowCount - 1);
         assertEquals(rowCount, session.execute(stmt).all().size());
     }

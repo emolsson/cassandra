@@ -21,6 +21,8 @@ import java.io.*;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.util.zip.Checksum;
 import java.util.Set;
 
@@ -100,7 +102,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("IOException reading from socket; closing", e);
+            logger.trace("IOException reading from socket; closing", e);
         }
         finally
         {
@@ -113,6 +115,8 @@ public class IncomingTcpConnection extends Thread implements Closeable
     {
         try
         {
+            if (logger.isTraceEnabled())
+                logger.trace("Closing socket {} - isclosed: {}", socket, socket.isClosed());
             if (!socket.isClosed())
             {
                 socket.close();
@@ -120,7 +124,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("Error closing socket", e);
+            logger.trace("Error closing socket", e);
         }
         finally
         {
@@ -128,6 +132,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
     }
 
+    @SuppressWarnings("resource") // Not closing constructed DataInputPlus's as the stream needs to remain open.
     private void receiveMessages() throws IOException
     {
         // handshake (true) endpoint versions
@@ -143,11 +148,11 @@ public class IncomingTcpConnection extends Thread implements Closeable
         from = CompactEndpointSerializationHelper.deserialize(in);
         // record the (true) version of the endpoint
         MessagingService.instance().setVersion(from, maxVersion);
-        logger.debug("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
+        logger.trace("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
 
         if (compressed)
         {
-            logger.debug("Upgrading incoming connection to be compressed");
+            logger.trace("Upgrading incoming connection to be compressed");
             if (version < MessagingService.VERSION_21)
             {
                 in = new DataInputStreamPlus(new SnappyInputStream(socket.getInputStream()));
@@ -163,7 +168,8 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         else
         {
-            in = new NIODataInputStream(socket.getChannel(), BUFFER_SIZE);
+            ReadableByteChannel channel = socket.getChannel();
+            in = new NIODataInputStream(channel != null ? channel : Channels.newChannel(socket.getInputStream()), BUFFER_SIZE);
         }
 
         while (true)
@@ -181,18 +187,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         else
             id = input.readInt();
 
-        long timestamp = System.currentTimeMillis();
-        boolean isCrossNodeTimestamp = false;
-        // make sure to readInt, even if cross_node_to is not enabled
-        int partial = input.readInt();
-        if (DatabaseDescriptor.hasCrossNodeTimeout())
-        {
-            long crossNodeTimestamp = (timestamp & 0xFFFFFFFF00000000L) | (((partial & 0xFFFFFFFFL) << 2) >> 2);
-            isCrossNodeTimestamp = (timestamp != crossNodeTimestamp);
-            timestamp = crossNodeTimestamp;
-        }
-
-        MessageIn message = MessageIn.read(input, version, id);
+        MessageIn message = MessageIn.read(input, version, id, MessageIn.readTimestamp(input));
         if (message == null)
         {
             // callback expired; nothing to do
@@ -200,11 +195,11 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         if (version <= MessagingService.current_version)
         {
-            MessagingService.instance().receive(message, id, timestamp, isCrossNodeTimestamp);
+            MessagingService.instance().receive(message, id);
         }
         else
         {
-            logger.debug("Received connection from newer protocol version {}. Ignoring message", version);
+            logger.trace("Received connection from newer protocol version {}. Ignoring message", version);
         }
         return message.from;
     }

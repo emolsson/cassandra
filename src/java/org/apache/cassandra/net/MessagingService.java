@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
+import javax.net.ssl.SSLHandshakeException;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
@@ -40,13 +41,15 @@ import com.google.common.collect.Sets;
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.concurrent.TracingAwareExecutorService;
+import org.apache.cassandra.concurrent.LocalAwareExecutorService;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.dht.IPartitioner;
@@ -55,6 +58,8 @@ import org.apache.cassandra.gms.EchoMessage;
 import org.apache.cassandra.gms.GossipDigestAck;
 import org.apache.cassandra.gms.GossipDigestAck2;
 import org.apache.cassandra.gms.GossipDigestSyn;
+import org.apache.cassandra.hints.HintMessage;
+import org.apache.cassandra.hints.HintResponse;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -93,19 +98,22 @@ public final class MessagingService implements MessagingServiceMBean
      */
     public static final int PROTOCOL_MAGIC = 0xCA552DFA;
 
+    private boolean allNodesAtLeast22 = true;
+    private boolean allNodesAtLeast30 = true;
+
     /* All verb handler identifiers */
     public enum Verb
     {
         MUTATION,
-        @Deprecated BINARY,
+        HINT,
         READ_REPAIR,
         READ,
         REQUEST_RESPONSE, // client-initiated reads and writes
-        @Deprecated STREAM_INITIATE,
-        @Deprecated STREAM_INITIATE_DONE,
+        BATCH_STORE,  // was @Deprecated STREAM_INITIATE,
+        BATCH_REMOVE, // was @Deprecated STREAM_INITIATE_DONE,
         @Deprecated STREAM_REPLY,
         @Deprecated STREAM_REQUEST,
-        @Deprecated RANGE_SLICE,
+        RANGE_SLICE,
         @Deprecated BOOTSTRAP_TOKEN,
         @Deprecated TREE_REQUEST,
         @Deprecated TREE_RESPONSE,
@@ -129,17 +137,16 @@ public final class MessagingService implements MessagingServiceMBean
         _TRACE, // dummy verb so we can use MS.droppedMessagesMap
         ECHO,
         REPAIR_MESSAGE,
-        // use as padding for backwards compatability where a previous version needs to validate a verb from the future.
         PAXOS_PREPARE,
         PAXOS_PROPOSE,
         PAXOS_COMMIT,
         @Deprecated PAGED_RANGE,
-        BATCHLOG_MUTATION,
-        MATERIALIZED_VIEW_MUTATION,
         // remember to add new verbs at the end, since we serialize by ordinal
         UNUSED_1,
         UNUSED_2,
         UNUSED_3,
+        UNUSED_4,
+        UNUSED_5,
         ;
     }
 
@@ -147,13 +154,14 @@ public final class MessagingService implements MessagingServiceMBean
     {{
         put(Verb.MUTATION, Stage.MUTATION);
         put(Verb.COUNTER_MUTATION, Stage.COUNTER_MUTATION);
-        put(Verb.MATERIALIZED_VIEW_MUTATION, Stage.MATERIALIZED_VIEW_MUTATION);
-        put(Verb.BATCHLOG_MUTATION, Stage.BATCHLOG_MUTATION);
         put(Verb.READ_REPAIR, Stage.MUTATION);
+        put(Verb.HINT, Stage.MUTATION);
         put(Verb.TRUNCATE, Stage.MUTATION);
         put(Verb.PAXOS_PREPARE, Stage.MUTATION);
         put(Verb.PAXOS_PROPOSE, Stage.MUTATION);
         put(Verb.PAXOS_COMMIT, Stage.MUTATION);
+        put(Verb.BATCH_STORE, Stage.MUTATION);
+        put(Verb.BATCH_REMOVE, Stage.MUTATION);
 
         put(Verb.READ, Stage.READ);
         put(Verb.RANGE_SLICE, Stage.READ);
@@ -183,7 +191,6 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.MIGRATION_REQUEST, Stage.MIGRATION);
         put(Verb.INDEX_SCAN, Stage.READ);
         put(Verb.REPLICATION_FINISHED, Stage.MISC);
-        put(Verb.COUNTER_MUTATION, Stage.MUTATION);
         put(Verb.SNAPSHOT, Stage.MISC);
         put(Verb.ECHO, Stage.GOSSIP);
 
@@ -207,12 +214,10 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.INTERNAL_RESPONSE, CallbackDeterminedSerializer.instance);
 
         put(Verb.MUTATION, Mutation.serializer);
-        put(Verb.BATCHLOG_MUTATION, Mutation.serializer);
-        put(Verb.MATERIALIZED_VIEW_MUTATION, Mutation.serializer);
         put(Verb.READ_REPAIR, Mutation.serializer);
         put(Verb.READ, ReadCommand.serializer);
-        //put(Verb.RANGE_SLICE, ReadCommand.legacyRangeSliceCommandSerializer);
-        //put(Verb.PAGED_RANGE, ReadCommand.legacyPagedRangeCommandSerializer);
+        put(Verb.RANGE_SLICE, ReadCommand.rangeSliceSerializer);
+        put(Verb.PAGED_RANGE, ReadCommand.legacyPagedRangeCommandSerializer);
         put(Verb.BOOTSTRAP_TOKEN, BootStrapper.StringSerializer.instance);
         put(Verb.REPAIR_MESSAGE, RepairMessage.serializer);
         put(Verb.GOSSIP_DIGEST_ACK, GossipDigestAck.serializer);
@@ -227,6 +232,9 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.PAXOS_PREPARE, Commit.serializer);
         put(Verb.PAXOS_PROPOSE, Commit.serializer);
         put(Verb.PAXOS_COMMIT, Commit.serializer);
+        put(Verb.HINT, HintMessage.serializer);
+        put(Verb.BATCH_STORE, Batch.serializer);
+        put(Verb.BATCH_REMOVE, UUIDSerializer.serializer);
     }};
 
     /**
@@ -235,11 +243,10 @@ public final class MessagingService implements MessagingServiceMBean
     public static final EnumMap<Verb, IVersionedSerializer<?>> callbackDeserializers = new EnumMap<Verb, IVersionedSerializer<?>>(Verb.class)
     {{
         put(Verb.MUTATION, WriteResponse.serializer);
-        put(Verb.BATCHLOG_MUTATION, WriteResponse.serializer);
-        put(Verb.MATERIALIZED_VIEW_MUTATION, WriteResponse.serializer);
+        put(Verb.HINT, HintResponse.serializer);
         put(Verb.READ_REPAIR, WriteResponse.serializer);
         put(Verb.COUNTER_MUTATION, WriteResponse.serializer);
-        put(Verb.RANGE_SLICE, ReadResponse.legacyRangeSliceReplySerializer);
+        put(Verb.RANGE_SLICE, ReadResponse.rangeSliceSerializer);
         put(Verb.PAGED_RANGE, ReadResponse.legacyRangeSliceReplySerializer);
         put(Verb.READ, ReadResponse.serializer);
         put(Verb.TRUNCATE, TruncateResponse.serializer);
@@ -252,6 +259,9 @@ public final class MessagingService implements MessagingServiceMBean
 
         put(Verb.PAXOS_PREPARE, PrepareResponse.serializer);
         put(Verb.PAXOS_PROPOSE, BooleanSerializer.serializer);
+
+        put(Verb.BATCH_STORE, WriteResponse.serializer);
+        put(Verb.BATCH_REMOVE, WriteResponse.serializer);
     }};
 
     /* This records all the results mapped by message Id */
@@ -284,7 +294,7 @@ public final class MessagingService implements MessagingServiceMBean
     /* Lookup table for registering message handlers based on the verb. */
     private final Map<Verb, IVerbHandler> verbHandlers;
 
-    private final ConcurrentMap<InetAddress, OutboundTcpConnectionPool> connectionManagers = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
+    private final ConcurrentMap<InetAddress, OutboundTcpConnectionPool> connectionManagers = new NonBlockingHashMap<>();
 
     private static final Logger logger = LoggerFactory.getLogger(MessagingService.class);
     private static final int LOG_DROPPED_INTERVAL_IN_MS = 5000;
@@ -299,14 +309,15 @@ public final class MessagingService implements MessagingServiceMBean
      */
     public static final EnumSet<Verb> DROPPABLE_VERBS = EnumSet.of(Verb._TRACE,
                                                                    Verb.MUTATION,
-                                                                   Verb.BATCHLOG_MUTATION, //FIXME: should this be droppable??
-                                                                   Verb.MATERIALIZED_VIEW_MUTATION,
                                                                    Verb.COUNTER_MUTATION,
+                                                                   Verb.HINT,
                                                                    Verb.READ_REPAIR,
                                                                    Verb.READ,
                                                                    Verb.RANGE_SLICE,
                                                                    Verb.PAGED_RANGE,
-                                                                   Verb.REQUEST_RESPONSE);
+                                                                   Verb.REQUEST_RESPONSE,
+                                                                   Verb.BATCH_STORE,
+                                                                   Verb.BATCH_REMOVE);
 
 
     private static final class DroppedMessages
@@ -370,7 +381,7 @@ public final class MessagingService implements MessagingServiceMBean
             droppedMessagesMap.put(verb, new DroppedMessages(verb));
 
         listenGate = new SimpleCondition();
-        verbHandlers = new EnumMap<Verb, IVerbHandler>(Verb.class);
+        verbHandlers = new EnumMap<>(Verb.class);
         if (!testOnly)
         {
             Runnable logDropped = new Runnable()
@@ -403,8 +414,7 @@ public final class MessagingService implements MessagingServiceMBean
 
                 if (expiredCallbackInfo.shouldHint())
                 {
-                    Mutation mutation = (Mutation) ((WriteCallbackInfo) expiredCallbackInfo).sentMessage.payload;
-
+                    Mutation mutation = ((WriteCallbackInfo) expiredCallbackInfo).mutation();
                     return StorageProxy.submitHint(mutation, expiredCallbackInfo.target, null);
                 }
 
@@ -452,8 +462,20 @@ public final class MessagingService implements MessagingServiceMBean
      */
     public void convict(InetAddress ep)
     {
-        logger.debug("Resetting pool for {}", ep);
+        logger.trace("Resetting pool for {}", ep);
         getConnectionPool(ep).reset();
+    }
+
+    public void listen()
+    {
+        callbacks.reset(); // hack to allow tests to stop/restart MS
+        listen(FBUtilities.getLocalAddress());
+        if (DatabaseDescriptor.shouldListenOnBroadcastAddress()
+            && !FBUtilities.getLocalAddress().equals(FBUtilities.getBroadcastAddress()))
+        {
+            listen(FBUtilities.getBroadcastAddress());
+        }
+        listenGate.signalAll();
     }
 
     /**
@@ -461,16 +483,14 @@ public final class MessagingService implements MessagingServiceMBean
      *
      * @param localEp InetAddress whose port to listen on.
      */
-    public void listen(InetAddress localEp) throws ConfigurationException
+    private void listen(InetAddress localEp) throws ConfigurationException
     {
-        callbacks.reset(); // hack to allow tests to stop/restart MS
         for (ServerSocket ss : getServerSockets(localEp))
         {
             SocketThread th = new SocketThread(ss, "ACCEPT-" + localEp);
             th.start();
             socketThreads.add(th);
         }
-        listenGate.signalAll();
     }
 
     @SuppressWarnings("resource")
@@ -533,7 +553,9 @@ public final class MessagingService implements MessagingServiceMBean
                 FileUtils.closeQuietly(socket);
                 throw new RuntimeException(e);
             }
-            logger.info("Starting Messaging Service on port {}", DatabaseDescriptor.getStoragePort());
+            String nic = FBUtilities.getNetworkInterface(localEp);
+            logger.info("Starting Messaging Service on {}:{}{}", localEp, DatabaseDescriptor.getStoragePort(),
+                        nic == null? "" : String.format(" (%s)", nic));
             ss.add(socket);
         }
         return ss;
@@ -547,7 +569,7 @@ public final class MessagingService implements MessagingServiceMBean
         }
         catch (InterruptedException ie)
         {
-            logger.debug("await interrupted");
+            logger.trace("await interrupted");
         }
     }
 
@@ -622,16 +644,15 @@ public final class MessagingService implements MessagingServiceMBean
     }
 
     public int addCallback(IAsyncCallback cb,
-                           MessageOut<? extends IMutation> message,
+                           MessageOut<?> message,
                            InetAddress to,
                            long timeout,
                            ConsistencyLevel consistencyLevel,
                            boolean allowHints)
     {
         assert message.verb == Verb.MUTATION
-               || message.verb == Verb.BATCHLOG_MUTATION
-               || message.verb == Verb.MATERIALIZED_VIEW_MUTATION
-               || message.verb == Verb.COUNTER_MUTATION;
+            || message.verb == Verb.COUNTER_MUTATION
+            || message.verb == Verb.PAXOS_COMMIT;
         int messageId = nextId();
 
         CallbackInfo previous = callbacks.put(messageId,
@@ -682,7 +703,7 @@ public final class MessagingService implements MessagingServiceMBean
     }
 
     /**
-     * Send a mutation message to a given endpoint. This method specifies a callback
+     * Send a mutation message or a Paxos Commit to a given endpoint. This method specifies a callback
      * which is invoked with the actual response.
      * Also holds the message (only mutation messages) to determine if it
      * needs to trigger a hint (uses StorageProxy for that).
@@ -693,9 +714,9 @@ public final class MessagingService implements MessagingServiceMBean
      *                suggest that a timeout occurred to the invoker of the send().
      * @return an reference to message id used to match with the result
      */
-    public int sendRR(MessageOut<? extends IMutation> message,
+    public int sendRR(MessageOut<?> message,
                       InetAddress to,
-                      AbstractWriteResponseHandler<? extends IMutation> handler,
+                      AbstractWriteResponseHandler<?> handler,
                       boolean allowHints)
     {
         int id = addCallback(handler, message, to, message.getTimeout(), handler.consistencyLevel, allowHints);
@@ -773,7 +794,15 @@ public final class MessagingService implements MessagingServiceMBean
         try
         {
             for (SocketThread th : socketThreads)
-                th.close();
+                try
+                {
+                    th.close();
+                }
+                catch (IOException e)
+                {
+                    // see https://issues.apache.org/jira/browse/CASSANDRA-10545
+                    handleIOException(e);
+                }
         }
         catch (IOException e)
         {
@@ -781,7 +810,7 @@ public final class MessagingService implements MessagingServiceMBean
         }
     }
 
-    public void receive(MessageIn message, int id, long timestamp, boolean isCrossNodeTimestamp)
+    public void receive(MessageIn message, int id)
     {
         TraceState state = Tracing.instance.initializeFromMessage(message);
         if (state != null)
@@ -792,11 +821,11 @@ public final class MessagingService implements MessagingServiceMBean
             if (!ms.allowIncomingMessage(message, id))
                 return;
 
-        Runnable runnable = new MessageDeliveryTask(message, id, timestamp, isCrossNodeTimestamp);
-        TracingAwareExecutorService stage = StageManager.getStage(message.getMessageType());
+        Runnable runnable = new MessageDeliveryTask(message, id);
+        LocalAwareExecutorService stage = StageManager.getStage(message.getMessageType());
         assert stage != null : "No stage for message type " + message.verb;
 
-        stage.execute(runnable, state);
+        stage.execute(runnable, ExecutorLocals.create(state));
     }
 
     public void setCallbackForTests(int messageId, CallbackInfo callback)
@@ -833,20 +862,67 @@ public final class MessagingService implements MessagingServiceMBean
         return packed >>> (start + 1) - count & ~(-1 << count);
     }
 
+    public boolean areAllNodesAtLeast22()
+    {
+        return allNodesAtLeast22;
+    }
+
+    public boolean areAllNodesAtLeast30()
+    {
+        return allNodesAtLeast30;
+    }
+
     /**
      * @return the last version associated with address, or @param version if this is the first such version
      */
     public int setVersion(InetAddress endpoint, int version)
     {
-        logger.debug("Setting version {} for {}", version, endpoint);
+        // We can't talk to someone from the future
+        version = Math.min(version, current_version);
+
+        logger.trace("Setting version {} for {}", version, endpoint);
+
+        if (version < VERSION_22)
+            allNodesAtLeast22 = false;
+        if (version < VERSION_30)
+            allNodesAtLeast30 = false;
+
         Integer v = versions.put(endpoint, version);
+
+        // if the version was increased to 2.2 or later see if the min version across the cluster has changed
+        if (v != null && (v < VERSION_30 && version >= VERSION_22))
+            refreshAllNodeMinVersions();
+
         return v == null ? version : v;
     }
 
     public void resetVersion(InetAddress endpoint)
     {
-        logger.debug("Resetting version for {}", endpoint);
-        versions.remove(endpoint);
+        logger.trace("Resetting version for {}", endpoint);
+        Integer removed = versions.remove(endpoint);
+        if (removed != null && removed <= VERSION_30)
+            refreshAllNodeMinVersions();
+    }
+
+    private void refreshAllNodeMinVersions()
+    {
+        boolean anyNodeLowerThan30 = false;
+        for (Integer version : versions.values())
+        {
+            if (version < MessagingService.VERSION_30)
+            {
+                anyNodeLowerThan30 = true;
+                allNodesAtLeast30 = false;
+            }
+
+            if (version < MessagingService.VERSION_22)
+            {
+                allNodesAtLeast22 = false;
+                return;
+            }
+        }
+        allNodesAtLeast22 = true;
+        allNodesAtLeast30 = !anyNodeLowerThan30;
     }
 
     public int getVersion(InetAddress endpoint)
@@ -880,15 +956,67 @@ public final class MessagingService implements MessagingServiceMBean
         return versions.containsKey(endpoint);
     }
 
+    public void incrementDroppedMutations(Optional<IMutation> mutationOpt, long timeTaken)
+    {
+        if (mutationOpt.isPresent())
+        {
+            updateDroppedMutationCount(mutationOpt.get());
+        }
+        incrementDroppedMessages(Verb.MUTATION, timeTaken);
+    }
+
     public void incrementDroppedMessages(Verb verb)
     {
         incrementDroppedMessages(verb, false);
+    }
+
+    public void incrementDroppedMessages(Verb verb, long timeTaken)
+    {
+        incrementDroppedMessages(verb, timeTaken, false);
+    }
+
+    public void incrementDroppedMessages(MessageIn message, long timeTaken)
+    {
+        if (message.payload instanceof IMutation)
+        {
+            updateDroppedMutationCount((IMutation) message.payload);
+        }
+        incrementDroppedMessages(message.verb, timeTaken, message.constructionTime.isCrossNode);
+    }
+
+    public void incrementDroppedMessages(Verb verb, long timeTaken, boolean isCrossNodeTimeout)
+    {
+        assert DROPPABLE_VERBS.contains(verb) : "Verb " + verb + " should not legally be dropped";
+        incrementDroppedMessages(droppedMessagesMap.get(verb), timeTaken, isCrossNodeTimeout);
     }
 
     public void incrementDroppedMessages(Verb verb, boolean isCrossNodeTimeout)
     {
         assert DROPPABLE_VERBS.contains(verb) : "Verb " + verb + " should not legally be dropped";
         incrementDroppedMessages(droppedMessagesMap.get(verb), isCrossNodeTimeout);
+    }
+
+    private void updateDroppedMutationCount(IMutation mutation)
+    {
+        assert mutation != null : "Mutation should not be null when updating dropped mutations count";
+
+        for (UUID columnFamilyId : mutation.getColumnFamilyIds())
+        {
+            ColumnFamilyStore cfs = Keyspace.open(mutation.getKeyspaceName()).getColumnFamilyStore(columnFamilyId);
+            if (cfs != null)
+            {
+                cfs.metric.droppedMutations.inc();
+            }
+        }
+    }
+
+    private void incrementDroppedMessages(DroppedMessages droppedMessages, long timeTaken, boolean isCrossNodeTimeout)
+    {
+        if (isCrossNodeTimeout)
+            droppedMessages.metrics.crossNodeDroppedLatency.update(timeTaken, TimeUnit.MILLISECONDS);
+        else
+            droppedMessages.metrics.internalDroppedLatency.update(timeTaken, TimeUnit.MILLISECONDS);
+        incrementDroppedMessages(droppedMessages, isCrossNodeTimeout);
     }
 
     private void incrementDroppedMessages(DroppedMessages droppedMessages, boolean isCrossNodeTimeout)
@@ -904,7 +1032,7 @@ public final class MessagingService implements MessagingServiceMBean
     {
         List<String> logs = getDroppedMessagesLogs();
         for (String log : logs)
-            logger.error(log);
+            logger.info(log);
 
         if (logs.size() > 0)
             StatusLogger.log();
@@ -923,11 +1051,14 @@ public final class MessagingService implements MessagingServiceMBean
             int droppedCrossNodeTimeout = droppedMessages.droppedCrossNodeTimeout.getAndSet(0);
             if (droppedInternalTimeout > 0 || droppedCrossNodeTimeout > 0)
             {
-                ret.add(String.format("%s messages were dropped in last %d ms: %d for internal timeout and %d for cross node timeout",
-                                      verb,
-                                      LOG_DROPPED_INTERVAL_IN_MS,
-                                      droppedInternalTimeout,
-                                      droppedCrossNodeTimeout));
+                ret.add(String.format("%s messages were dropped in last %d ms: %d for internal timeout and %d for cross node timeout."
+                                     + " Mean internal dropped latency: %d ms and Mean cross-node dropped latency: %d ms",
+                                     verb,
+                                     LOG_DROPPED_INTERVAL_IN_MS,
+                                     droppedInternalTimeout,
+                                     droppedCrossNodeTimeout,
+                                     TimeUnit.NANOSECONDS.toMillis((long)droppedMessages.metrics.internalDroppedLatency.getSnapshot().getMean()),
+                                     TimeUnit.NANOSECONDS.toMillis((long)droppedMessages.metrics.crossNodeDroppedLatency.getSnapshot().getMean())));
             }
         }
         return ret;
@@ -955,7 +1086,7 @@ public final class MessagingService implements MessagingServiceMBean
                     socket = server.accept();
                     if (!authenticate(socket))
                     {
-                        logger.debug("remote failed to authenticate");
+                        logger.trace("remote failed to authenticate");
                         socket.close();
                         continue;
                     }
@@ -968,7 +1099,7 @@ public final class MessagingService implements MessagingServiceMBean
                     int header = in.readInt();
                     boolean isStream = MessagingService.getBits(header, 3, 1) == 1;
                     int version = MessagingService.getBits(header, 15, 8);
-                    logger.debug("Connection version {} from {}", version, socket.getInetAddress());
+                    logger.trace("Connection version {} from {}", version, socket.getInetAddress());
                     socket.setSoTimeout(0);
 
                     Thread thread = isStream
@@ -980,17 +1111,22 @@ public final class MessagingService implements MessagingServiceMBean
                 catch (AsynchronousCloseException e)
                 {
                     // this happens when another thread calls close().
-                    logger.debug("Asynchronous close seen by server thread");
+                    logger.trace("Asynchronous close seen by server thread");
                     break;
                 }
                 catch (ClosedChannelException e)
                 {
-                    logger.debug("MessagingService server thread already closed");
+                    logger.trace("MessagingService server thread already closed");
                     break;
+                }
+                catch (SSLHandshakeException e)
+                {
+                    logger.error("SSL handshake error for inbound connection from " + socket, e);
+                    FileUtils.closeQuietly(socket);
                 }
                 catch (IOException e)
                 {
-                    logger.debug("Error reading the socket " + socket, e);
+                    logger.trace("Error reading the socket " + socket, e);
                     FileUtils.closeQuietly(socket);
                 }
             }
@@ -999,7 +1135,7 @@ public final class MessagingService implements MessagingServiceMBean
 
         void close() throws IOException
         {
-            logger.debug("Closing accept() thread");
+            logger.trace("Closing accept() thread");
 
             try
             {
@@ -1007,13 +1143,9 @@ public final class MessagingService implements MessagingServiceMBean
             }
             catch (IOException e)
             {
-                // dirty hack for clean shutdown on OSX w/ Java >= 1.8.0_20
                 // see https://issues.apache.org/jira/browse/CASSANDRA-8220
-                // see https://bugs.openjdk.java.net/browse/JDK-8050499
-                if (!"Unknown error: 316".equals(e.getMessage()) || !"Mac OS X".equals(System.getProperty("os.name")))
-                    throw e;
+                handleIOException(e);
             }
-
             for (Closeable connection : connections)
             {
                 connection.close();
@@ -1024,6 +1156,14 @@ public final class MessagingService implements MessagingServiceMBean
         {
             return DatabaseDescriptor.getInternodeAuthenticator().authenticate(socket.getInetAddress(), socket.getPort());
         }
+    }
+
+    private static void handleIOException(IOException e) throws IOException
+    {
+        // dirty hack for clean shutdown on OSX w/ Java >= 1.8.0_20
+        // see https://bugs.openjdk.java.net/browse/JDK-8050499
+        if (!"Unknown error: 316".equals(e.getMessage()) || !"Mac OS X".equals(System.getProperty("os.name")))
+            throw e;
     }
 
     public Map<String, Integer> getLargeMessagePendingTasks()
@@ -1080,6 +1220,30 @@ public final class MessagingService implements MessagingServiceMBean
         return droppedTasks;
     }
 
+    public Map<String, Integer> getGossipMessagePendingTasks()
+    {
+        Map<String, Integer> pendingTasks = new HashMap<String, Integer>(connectionManagers.size());
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers.entrySet())
+            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getPendingMessages());
+        return pendingTasks;
+    }
+
+    public Map<String, Long> getGossipMessageCompletedTasks()
+    {
+        Map<String, Long> completedTasks = new HashMap<String, Long>(connectionManagers.size());
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers.entrySet())
+            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getCompletedMesssages());
+        return completedTasks;
+    }
+
+    public Map<String, Long> getGossipMessageDroppedTasks()
+    {
+        Map<String, Long> droppedTasks = new HashMap<String, Long>(connectionManagers.size());
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers.entrySet())
+            droppedTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getDroppedMessages());
+        return droppedTasks;
+    }
+
     public Map<String, Integer> getDroppedMessages()
     {
         Map<String, Integer> map = new HashMap<>(droppedMessagesMap.size());
@@ -1109,6 +1273,12 @@ public final class MessagingService implements MessagingServiceMBean
     public static IPartitioner globalPartitioner()
     {
         return StorageService.instance.getTokenMetadata().partitioner;
+    }
+
+    public static void validatePartitioner(Collection<? extends AbstractBounds<?>> allBounds)
+    {
+        for (AbstractBounds<?> bounds : allBounds)
+            validatePartitioner(bounds);
     }
 
     public static void validatePartitioner(AbstractBounds<?> bounds)

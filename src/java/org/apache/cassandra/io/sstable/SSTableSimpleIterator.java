@@ -21,7 +21,7 @@ import java.io.IOException;
 import java.io.IOError;
 import java.util.Iterator;
 
-import com.google.common.collect.AbstractIterator;
+import org.apache.cassandra.utils.AbstractIterator;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
@@ -71,7 +71,7 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
         {
             super(metadata, in, helper);
             this.header = header;
-            this.builder = BTreeBackedRow.sortedBuilder(helper.fetchedRegularColumns(header));
+            this.builder = BTreeRow.sortedBuilder();
         }
 
         public Row readStaticRow() throws IOException
@@ -139,24 +139,27 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
 
         protected Unfiltered computeNext()
         {
-            try
+            while (true)
             {
-                if (!deserializer.hasNext())
-                    return endOfData();
-
-                Unfiltered unfiltered = deserializer.readNext();
-                if (metadata.isStaticCompactTable() && unfiltered.kind() == Unfiltered.Kind.ROW)
+                try
                 {
-                    Row row = (Row) unfiltered;
-                    ColumnDefinition def = metadata.getColumnDefinition(LegacyLayout.encodeClustering(metadata, row.clustering()));
-                    if (def != null && def.isStatic())
-                        return computeNext();
+                    if (!deserializer.hasNext())
+                        return endOfData();
+
+                    Unfiltered unfiltered = deserializer.readNext();
+                    if (metadata.isStaticCompactTable() && unfiltered.kind() == Unfiltered.Kind.ROW)
+                    {
+                        Row row = (Row) unfiltered;
+                        ColumnDefinition def = metadata.getColumnDefinition(LegacyLayout.encodeClustering(metadata, row.clustering()));
+                        if (def != null && def.isStatic())
+                            continue;
+                    }
+                    return unfiltered;
                 }
-                return unfiltered;
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
+                catch (IOException e)
+                {
+                    throw new IOError(e);
+                }
             }
         }
 

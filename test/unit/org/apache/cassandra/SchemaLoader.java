@@ -21,27 +21,24 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.index.sasi.SASIIndex;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.junit.After;
 import org.junit.BeforeClass;
 
-import org.apache.cassandra.cache.CachingOptions;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.compaction.LeveledCompactionStrategy;
-import org.apache.cassandra.db.index.PerRowSecondaryIndexTest;
-import org.apache.cassandra.db.index.SecondaryIndex;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.io.compress.CompressionParameters;
-import org.apache.cassandra.io.compress.SnappyCompressor;
+import org.apache.cassandra.index.StubIndex;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.schema.KeyspaceMetadata;
-import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.schema.*;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -69,7 +66,7 @@ public class SchemaLoader
 
     public static void prepareServer()
     {
-       CQLTester.prepareServer(false);
+       CQLTester.prepareServer();
     }
 
     public static void startGossiper()
@@ -118,7 +115,7 @@ public class SchemaLoader
                 KeyspaceParams.simple(1),
                 Tables.of(
                 // Column Families
-                standardCFMD(ks1, "Standard1").compactionStrategyOptions(compactionOptions),
+                standardCFMD(ks1, "Standard1").compaction(CompactionParams.scts(compactionOptions)),
                 standardCFMD(ks1, "Standard2"),
                 standardCFMD(ks1, "Standard3"),
                 standardCFMD(ks1, "Standard4"),
@@ -147,15 +144,11 @@ public class SchemaLoader
                 //CFMetaData.Builder.create(ks1, "StandardComposite", false, true, false).withColumnNameComparator(composite).build(),
                 //CFMetaData.Builder.create(ks1, "StandardComposite2", false, true, false).withColumnNameComparator(compositeMaxMin).build(),
                 //CFMetaData.Builder.create(ks1, "StandardDynamicComposite", false, true, false).withColumnNameComparator(dynamicComposite).build(),
-                standardCFMD(ks1, "StandardLeveled")
-                        .compactionStrategyClass(LeveledCompactionStrategy.class)
-                        .compactionStrategyOptions(leveledOptions),
-                standardCFMD(ks1, "legacyleveled")
-                        .compactionStrategyClass(LeveledCompactionStrategy.class)
-                        .compactionStrategyOptions(leveledOptions),
+                standardCFMD(ks1, "StandardLeveled").compaction(CompactionParams.lcs(leveledOptions)),
+                standardCFMD(ks1, "legacyleveled").compaction(CompactionParams.lcs(leveledOptions)),
                 standardCFMD(ks1, "StandardLowIndexInterval").minIndexInterval(8)
-                        .maxIndexInterval(256)
-                        .caching(CachingOptions.NONE)
+                                                             .maxIndexInterval(256)
+                                                             .caching(CachingParams.CACHE_NOTHING)
                 //CFMetaData.Builder.create(ks1, "UUIDKeys").addPartitionKey("key",UUIDType.instance).build(),
                 //CFMetaData.Builder.create(ks1, "MixedTypes").withColumnNameComparator(LongType.instance).addPartitionKey("key", UUIDType.instance).build(),
                 //CFMetaData.Builder.create(ks1, "MixedTypesComposite", false, true, false).withColumnNameComparator(composite).addPartitionKey("key", composite).build(),
@@ -213,11 +206,10 @@ public class SchemaLoader
         schema.add(KeyspaceMetadata.create(ks_rcs,
                 KeyspaceParams.simple(1),
                 Tables.of(
-                standardCFMD(ks_rcs, "CFWithoutCache").caching(CachingOptions.NONE),
-                standardCFMD(ks_rcs, "CachedCF").caching(CachingOptions.ALL),
+                standardCFMD(ks_rcs, "CFWithoutCache").caching(CachingParams.CACHE_NOTHING),
+                standardCFMD(ks_rcs, "CachedCF").caching(CachingParams.CACHE_EVERYTHING),
                 standardCFMD(ks_rcs, "CachedIntCF").
-                        caching(new CachingOptions(new CachingOptions.KeyCache(CachingOptions.KeyCache.Type.ALL),
-                                new CachingOptions.RowCache(CachingOptions.RowCache.Type.HEAD, 100))))));
+                        caching(new CachingParams(true, 100)))));
 
         // CounterCacheSpace
         /*schema.add(KeyspaceMetadata.testMetadata(ks_ccs,
@@ -228,10 +220,6 @@ public class SchemaLoader
 
         schema.add(KeyspaceMetadata.create(ks_nocommit, KeyspaceParams.simpleTransient(1), Tables.of(
                 standardCFMD(ks_nocommit, "Standard1"))));
-
-        // PerRowSecondaryIndexTest
-        schema.add(KeyspaceMetadata.create(ks_prsi, KeyspaceParams.simple(1), Tables.of(
-                perRowIndexedCFMD(ks_prsi, "Indexed1"))));
 
         // CQLKeyspace
         schema.add(KeyspaceMetadata.create(ks_cql, KeyspaceParams.simple(1), Tables.of(
@@ -264,6 +252,8 @@ public class SchemaLoader
                         + "WITH COMPACT STORAGE", ks_cql)
         )));
 
+        if (DatabaseDescriptor.getPartitioner() instanceof Murmur3Partitioner)
+            schema.add(KeyspaceMetadata.create("sasi", KeyspaceParams.simpleTransient(1), Tables.of(sasiCFMD("sasi", "test_cf"), clusteringSASICFMD("sasi", "clustering_test_cf"))));
 
         if (Boolean.parseBoolean(System.getProperty("cassandra.test.compression", "false")))
             useCompression(schema);
@@ -285,10 +275,7 @@ public class SchemaLoader
                                     cfName,
                                     ColumnIdentifier.getInterned(IntegerType.instance.fromString("42"), IntegerType.instance),
                                     UTF8Type.instance,
-                                    null,
-                                    null,
-                                    null,
-                                    null,
+                                    ColumnDefinition.NO_POSITION,
                                     ColumnDefinition.Kind.REGULAR);
     }
 
@@ -298,32 +285,39 @@ public class SchemaLoader
                                     cfName,
                                     ColumnIdentifier.getInterned("fortytwo", true),
                                     UTF8Type.instance,
-                                    null,
-                                    null,
-                                    null,
-                                    null,
+                                    ColumnDefinition.NO_POSITION,
                                     ColumnDefinition.Kind.REGULAR);
     }
 
     public static CFMetaData perRowIndexedCFMD(String ksName, String cfName)
     {
         final Map<String, String> indexOptions = Collections.singletonMap(
-                                                      SecondaryIndex.CUSTOM_INDEX_OPTION_NAME,
-                                                      PerRowSecondaryIndexTest.TestIndex.class.getName());
+                                                      IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                      StubIndex.class.getName());
 
         CFMetaData cfm =  CFMetaData.Builder.create(ksName, cfName)
                 .addPartitionKey("key", AsciiType.instance)
                 .build();
 
-        return cfm.addOrReplaceColumnDefinition(ColumnDefinition.regularDef(ksName, cfName, "indexed", AsciiType.instance)
-                                                                .setIndex("indexe1", IndexType.CUSTOM, indexOptions));
+        ColumnDefinition indexedColumn = ColumnDefinition.regularDef(ksName, cfName, "indexed", AsciiType.instance);
+        cfm.addOrReplaceColumnDefinition(indexedColumn);
+
+        cfm.indexes(
+            cfm.getIndexes()
+               .with(IndexMetadata.fromIndexTargets(cfm,
+                                                    Collections.singletonList(new IndexTarget(indexedColumn.name,
+                                                                                              IndexTarget.Type.VALUES)),
+                                                    "indexe1",
+                                                    IndexMetadata.Kind.CUSTOM,
+                                                    indexOptions)));
+        return cfm;
     }
 
     private static void useCompression(List<KeyspaceMetadata> schema)
     {
         for (KeyspaceMetadata ksm : schema)
-            for (CFMetaData cfm : ksm.tables)
-                cfm.compressionParameters(CompressionParameters.snappy());
+            for (CFMetaData cfm : ksm.tablesAndViews())
+                cfm.compression(CompressionParams.snappy());
     }
 
     public static CFMetaData counterCFMD(String ksName, String cfName)
@@ -334,7 +328,7 @@ public class SchemaLoader
                 .addRegularColumn("val", CounterColumnType.instance)
                 .addRegularColumn("val2", CounterColumnType.instance)
                 .build()
-                .compressionParameters(getCompressionParameters());
+                .compression(getCompressionParameters());
     }
 
     public static CFMetaData standardCFMD(String ksName, String cfName)
@@ -363,7 +357,7 @@ public class SchemaLoader
             builder.addRegularColumn("val" + i, AsciiType.instance);
 
         return builder.build()
-               .compressionParameters(getCompressionParameters());
+               .compression(getCompressionParameters());
     }
 
     public static CFMetaData denseCFMD(String ksName, String cfName)
@@ -385,7 +379,7 @@ public class SchemaLoader
             .addClusteringColumn("cols", comp)
             .addRegularColumn("val", AsciiType.instance)
             .build()
-            .compressionParameters(getCompressionParameters());
+            .compression(getCompressionParameters());
     }
 
     // TODO: Fix superCFMD failing on legacy table creation. Seems to be applying composite comparator to partition key
@@ -409,7 +403,12 @@ public class SchemaLoader
         return standardCFMD(ksName, cfName);
 
     }
-    public static CFMetaData compositeIndexCFMD(String ksName, String cfName, boolean withIndex) throws ConfigurationException
+    public static CFMetaData compositeIndexCFMD(String ksName, String cfName, boolean withRegularIndex) throws ConfigurationException
+    {
+        return compositeIndexCFMD(ksName, cfName, withRegularIndex, false);
+    }
+
+    public static CFMetaData compositeIndexCFMD(String ksName, String cfName, boolean withRegularIndex, boolean withStaticIndex) throws ConfigurationException
     {
         // the withIndex flag exists to allow tests index creation
         // on existing columns
@@ -418,13 +417,36 @@ public class SchemaLoader
                 .addClusteringColumn("c1", AsciiType.instance)
                 .addRegularColumn("birthdate", LongType.instance)
                 .addRegularColumn("notbirthdate", LongType.instance)
+                .addStaticColumn("static", LongType.instance)
                 .build();
 
-        if (withIndex)
-            cfm.getColumnDefinition(new ColumnIdentifier("birthdate", true))
-               .setIndex("birthdate_key_index", IndexType.COMPOSITES, Collections.EMPTY_MAP);
+        if (withRegularIndex)
+        {
+            cfm.indexes(
+                cfm.getIndexes()
+                   .with(IndexMetadata.fromIndexTargets(cfm,
+                                                        Collections.singletonList(
+                                                            new IndexTarget(new ColumnIdentifier("birthdate", true),
+                                                                            IndexTarget.Type.VALUES)),
+                                                        "birthdate_key_index",
+                                                        IndexMetadata.Kind.COMPOSITES,
+                                                        Collections.EMPTY_MAP)));
+        }
 
-        return cfm.compressionParameters(getCompressionParameters());
+        if (withStaticIndex)
+        {
+            cfm.indexes(
+                    cfm.getIndexes()
+                       .with(IndexMetadata.fromIndexTargets(cfm,
+                                                            Collections.singletonList(
+                                                                new IndexTarget(new ColumnIdentifier("static", true),
+                                                                                IndexTarget.Type.VALUES)),
+                                                            "static_index",
+                                                            IndexMetadata.Kind.COMPOSITES,
+                                                            Collections.EMPTY_MAP)));
+        }
+
+        return cfm.compression(getCompressionParameters());
     }
     public static CFMetaData keysIndexCFMD(String ksName, String cfName, boolean withIndex) throws ConfigurationException
     {
@@ -437,30 +459,173 @@ public class SchemaLoader
                                            .build();
 
         if (withIndex)
-            cfm.getColumnDefinition(new ColumnIdentifier("birthdate", true))
-               .setIndex("birthdate_composite_index", IndexType.KEYS, Collections.EMPTY_MAP);
+            cfm.indexes(
+                cfm.getIndexes()
+                   .with(IndexMetadata.fromIndexTargets(cfm,
+                                                        Collections.singletonList(
+                                                            new IndexTarget(new ColumnIdentifier("birthdate", true),
+                                                                            IndexTarget.Type.VALUES)),
+                                                         "birthdate_composite_index",
+                                                         IndexMetadata.Kind.KEYS,
+                                                         Collections.EMPTY_MAP)));
 
-        return cfm.compressionParameters(getCompressionParameters());
+
+        return cfm.compression(getCompressionParameters());
     }
-    
+
     public static CFMetaData jdbcCFMD(String ksName, String cfName, AbstractType comp)
     {
         return CFMetaData.Builder.create(ksName, cfName).addPartitionKey("key", BytesType.instance)
                                                         .build()
-                                                        .compressionParameters(getCompressionParameters());
+                                                        .compression(getCompressionParameters());
     }
 
-    public static CompressionParameters getCompressionParameters()
+    public static CFMetaData sasiCFMD(String ksName, String cfName)
+    {
+        CFMetaData cfm = CFMetaData.Builder.create(ksName, cfName)
+                                           .addPartitionKey("id", UTF8Type.instance)
+                                           .addRegularColumn("first_name", UTF8Type.instance)
+                                           .addRegularColumn("last_name", UTF8Type.instance)
+                                           .addRegularColumn("age", Int32Type.instance)
+                                           .addRegularColumn("height", Int32Type.instance)
+                                           .addRegularColumn("timestamp", LongType.instance)
+                                           .addRegularColumn("address", UTF8Type.instance)
+                                           .addRegularColumn("score", DoubleType.instance)
+                                           .addRegularColumn("comment", UTF8Type.instance)
+                                           .addRegularColumn("comment_suffix_split", UTF8Type.instance)
+                                           .addRegularColumn("/output/full-name/", UTF8Type.instance)
+                                           .addRegularColumn("/data/output/id", UTF8Type.instance)
+                                           .addRegularColumn("first_name_prefix", UTF8Type.instance)
+                                           .build();
+
+        cfm.indexes(cfm.getIndexes()
+                        .with(IndexMetadata.fromSchemaMetadata("first_name", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "first_name");
+                            put("mode", OnDiskIndexBuilder.Mode.CONTAINS.toString());
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("last_name", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "last_name");
+                            put("mode", OnDiskIndexBuilder.Mode.CONTAINS.toString());
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("age", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "age");
+
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("timestamp", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "timestamp");
+                            put("mode", OnDiskIndexBuilder.Mode.SPARSE.toString());
+
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("address", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put("analyzer_class", "org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer");
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "address");
+                            put("mode", OnDiskIndexBuilder.Mode.PREFIX.toString());
+                            put("case_sensitive", "false");
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("score", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "score");
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("comment", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "comment");
+                            put("mode", OnDiskIndexBuilder.Mode.CONTAINS.toString());
+                            put("analyzed", "true");
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("comment_suffix_split", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "comment_suffix_split");
+                            put("mode", OnDiskIndexBuilder.Mode.CONTAINS.toString());
+                            put("analyzed", "false");
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("output_full_name", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "/output/full-name/");
+                            put("analyzed", "true");
+                            put("analyzer_class", "org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer");
+                            put("case_sensitive", "false");
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("data_output_id", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "/data/output/id");
+                            put("mode", OnDiskIndexBuilder.Mode.CONTAINS.toString());
+                        }}))
+                        .with(IndexMetadata.fromSchemaMetadata("first_name_prefix", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                        {{
+                            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                            put(IndexTarget.TARGET_OPTION_NAME, "first_name_prefix");
+                            put("analyzed", "true");
+                            put("tokenization_normalize_lowercase", "true");
+                        }})));
+
+        return cfm;
+    }
+
+    public static CFMetaData clusteringSASICFMD(String ksName, String cfName)
+    {
+        CFMetaData cfm = CFMetaData.Builder.create(ksName, cfName)
+                                           .addPartitionKey("name", UTF8Type.instance)
+                                           .addClusteringColumn("location", UTF8Type.instance)
+                                           .addClusteringColumn("age", Int32Type.instance)
+                                           .addRegularColumn("height", Int32Type.instance)
+                                           .addRegularColumn("score", DoubleType.instance)
+                                           .build();
+
+        cfm.indexes(cfm.getIndexes()
+                       .with(IndexMetadata.fromSchemaMetadata("location", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                       {{
+                           put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                           put(IndexTarget.TARGET_OPTION_NAME, "location");
+                           put("mode", OnDiskIndexBuilder.Mode.PREFIX.toString());
+                       }}))
+                       .with(IndexMetadata.fromSchemaMetadata("age", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                       {{
+                           put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                           put(IndexTarget.TARGET_OPTION_NAME, "age");
+                           put("mode", OnDiskIndexBuilder.Mode.PREFIX.toString());
+                       }}))
+                       .with(IndexMetadata.fromSchemaMetadata("height", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                       {{
+                           put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                           put(IndexTarget.TARGET_OPTION_NAME, "height");
+                           put("mode", OnDiskIndexBuilder.Mode.PREFIX.toString());
+                       }}))
+                       .with(IndexMetadata.fromSchemaMetadata("score", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+                       {{
+                           put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+                           put(IndexTarget.TARGET_OPTION_NAME, "score");
+                           put("mode", OnDiskIndexBuilder.Mode.PREFIX.toString());
+                       }})));
+
+        return cfm;
+    }
+
+    public static CompressionParams getCompressionParameters()
     {
         return getCompressionParameters(null);
     }
 
-    public static CompressionParameters getCompressionParameters(Integer chunkSize)
+    public static CompressionParams getCompressionParameters(Integer chunkSize)
     {
         if (Boolean.parseBoolean(System.getProperty("cassandra.test.compression", "false")))
-            return CompressionParameters.snappy(chunkSize);
+            return CompressionParams.snappy(chunkSize);
 
-        return CompressionParameters.noCompression();
+        return CompressionParams.noCompression();
     }
 
     public static void cleanupAndLeaveDirs() throws IOException
@@ -470,7 +635,7 @@ public class SchemaLoader
         mkdirs();
         cleanup();
         mkdirs();
-        CommitLog.instance.startUnsafe();
+        CommitLog.instance.restartUnsafe();
     }
 
     public static void cleanup()

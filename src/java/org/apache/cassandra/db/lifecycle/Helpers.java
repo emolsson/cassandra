@@ -71,10 +71,10 @@ class Helpers
      * A convenience method for encapsulating this action over multiple SSTableReader with exception-safety
      * @return accumulate if not null (with any thrown exception attached), or any thrown exception otherwise
      */
-    static void setupKeyCache(Iterable<SSTableReader> readers)
+    static void setupOnline(Iterable<SSTableReader> readers)
     {
         for (SSTableReader reader : readers)
-            reader.setupKeyCache();
+            reader.setupOnline();
     }
 
     /**
@@ -98,16 +98,6 @@ class Helpers
     }
 
     /**
-     * A convenience method for encapsulating this action over multiple SSTableReader with exception-safety
-     * @return accumulate if not null (with any thrown exception attached), or any thrown exception otherwise
-     */
-    static void setupKeycache(Iterable<SSTableReader> readers)
-    {
-        for (SSTableReader reader : readers)
-            reader.setupKeyCache();
-    }
-
-    /**
      * assert that none of these readers have been replaced
      */
     static void checkNotReplaced(Iterable<SSTableReader> readers)
@@ -116,12 +106,12 @@ class Helpers
             assert !reader.isReplaced();
     }
 
-    static Throwable markObsolete(List<TransactionLogs.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable markObsolete(List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
         if (obsoletions == null || obsoletions.isEmpty())
             return accumulate;
 
-        for (TransactionLogs.Obsoletion obsoletion : obsoletions)
+        for (LogTransaction.Obsoletion obsoletion : obsoletions)
         {
             try
             {
@@ -135,13 +125,13 @@ class Helpers
         return accumulate;
     }
 
-    static Throwable prepareForObsoletion(Iterable<SSTableReader> readers, TransactionLogs txnLogs, List<TransactionLogs.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable prepareForObsoletion(Iterable<SSTableReader> readers, LogTransaction txnLogs, List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
         for (SSTableReader reader : readers)
         {
             try
             {
-                obsoletions.add(new TransactionLogs.Obsoletion(reader, txnLogs.obsoleted(reader)));
+                obsoletions.add(new LogTransaction.Obsoletion(reader, txnLogs.obsoleted(reader)));
             }
             catch (Throwable t)
             {
@@ -151,12 +141,12 @@ class Helpers
         return accumulate;
     }
 
-    static Throwable abortObsoletion(List<TransactionLogs.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable abortObsoletion(List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
         if (obsoletions == null || obsoletions.isEmpty())
             return accumulate;
 
-        for (TransactionLogs.Obsoletion obsoletion : obsoletions)
+        for (LogTransaction.Obsoletion obsoletion : obsoletions)
         {
             try
             {

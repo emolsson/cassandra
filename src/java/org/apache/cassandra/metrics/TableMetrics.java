@@ -20,29 +20,30 @@ package org.apache.cassandra.metrics;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentMap;
-
-import com.google.common.collect.Maps;
+import java.util.concurrent.TimeUnit;
 
 import com.codahale.metrics.*;
 import com.codahale.metrics.Timer;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
-import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.io.compress.CompressionMetadata;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.TopKSampler;
 
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
-
 
 /**
  * Metrics for {@link ColumnFamilyStore}.
  */
 public class TableMetrics
 {
+
+    public static final long[] EMPTY = new long[0];
 
     /** Total amount of data stored in the memtable that resides on-heap, including column related overhead and partitions overwritten. */
     public final Gauge<Long> memtableOnHeapSize;
@@ -116,6 +117,10 @@ public class TableMetrics
     public final TableHistogram liveScannedHistogram;
     /** Column update time delta on this CF */
     public final TableHistogram colUpdateTimeDeltaHistogram;
+    /** time taken acquiring the partition lock for materialized view updates for this table */
+    public final TableTimer viewLockAcquireTime;
+    /** time taken during the local read of a materialized view update */
+    public final TableTimer viewReadTime;
     /** Disk space used by snapshot files which */
     public final Gauge<Long> trueSnapshotsSize;
     /** Row cache hits, but result out of range */
@@ -136,6 +141,9 @@ public class TableMetrics
 
     /** Time spent waiting for free memtable space, either on- or off-heap */
     public final Histogram waitingOnFreeMemtableSpace;
+
+    /** Dropped Mutations Count */
+    public final Counter droppedMutations;
 
     private final MetricNameFactory factory;
     private final MetricNameFactory aliasFactory;
@@ -169,7 +177,7 @@ public class TableMetrics
         Iterator<SSTableReader> iterator = sstables.iterator();
         if (!iterator.hasNext())
         {
-            return new long[0];
+            return EMPTY;
         }
         long[] firstBucket = getHistogram.getHistogram(iterator.next()).getBuckets(false);
         long[] values = new long[firstBucket.length];
@@ -316,41 +324,19 @@ public class TableMetrics
                                                                  });
             }
         });
-        sstablesPerReadHistogram = createTableHistogram("SSTablesPerReadHistogram", cfs.keyspace.metric.sstablesPerReadHistogram);
+        sstablesPerReadHistogram = createTableHistogram("SSTablesPerReadHistogram", cfs.keyspace.metric.sstablesPerReadHistogram, true);
         compressionRatio = createTableGauge("CompressionRatio", new Gauge<Double>()
         {
             public Double getValue()
             {
-                double sum = 0;
-                int total = 0;
-                for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))
-                {
-                    if (sstable.getCompressionRatio() != MetadataCollector.NO_COMPRESSION_RATIO)
-                    {
-                        sum += sstable.getCompressionRatio();
-                        total++;
-                    }
-                }
-                return total != 0 ? sum / total : 0;
+                return computeCompressionRatio(cfs.getSSTables(SSTableSet.CANONICAL));
             }
         }, new Gauge<Double>() // global gauge
         {
             public Double getValue()
             {
-                double sum = 0;
-                int total = 0;
-                for (Keyspace keyspace : Keyspace.all())
-                {
-                    for (SSTableReader sstable : keyspace.getAllSSTables(SSTableSet.CANONICAL))
-                    {
-                        if (sstable.getCompressionRatio() != MetadataCollector.NO_COMPRESSION_RATIO)
-                        {
-                            sum += sstable.getCompressionRatio();
-                            total++;
-                        }
-                    }
-                }
-                return total != 0 ? sum / total : 0;
+                return computeCompressionRatio(Iterables.concat(Iterables.transform(Keyspace.all(),
+                                                                                    p -> p.getAllSSTables(SSTableSet.CANONICAL))));
             }
         });
         readLatency = new LatencyMetrics(factory, "Read", cfs.keyspace.metric.readLatency, globalReadLatency);
@@ -608,12 +594,25 @@ public class TableMetrics
                 return Math.max(requests, 1); // to avoid NaN.
             }
         });
-        tombstoneScannedHistogram = createTableHistogram("TombstoneScannedHistogram", cfs.keyspace.metric.tombstoneScannedHistogram);
-        liveScannedHistogram = createTableHistogram("LiveScannedHistogram", cfs.keyspace.metric.liveScannedHistogram);
-        colUpdateTimeDeltaHistogram = createTableHistogram("ColUpdateTimeDeltaHistogram", cfs.keyspace.metric.colUpdateTimeDeltaHistogram);
+        tombstoneScannedHistogram = createTableHistogram("TombstoneScannedHistogram", cfs.keyspace.metric.tombstoneScannedHistogram, false);
+        liveScannedHistogram = createTableHistogram("LiveScannedHistogram", cfs.keyspace.metric.liveScannedHistogram, false);
+        colUpdateTimeDeltaHistogram = createTableHistogram("ColUpdateTimeDeltaHistogram", cfs.keyspace.metric.colUpdateTimeDeltaHistogram, false);
         coordinatorReadLatency = Metrics.timer(factory.createMetricName("CoordinatorReadLatency"));
         coordinatorScanLatency = Metrics.timer(factory.createMetricName("CoordinatorScanLatency"));
-        waitingOnFreeMemtableSpace = Metrics.histogram(factory.createMetricName("WaitingOnFreeMemtableSpace"));
+        waitingOnFreeMemtableSpace = Metrics.histogram(factory.createMetricName("WaitingOnFreeMemtableSpace"), false);
+
+        // We do not want to capture view mutation specific metrics for a view
+        // They only makes sense to capture on the base table
+        if (cfs.metadata.isView())
+        {
+            viewLockAcquireTime = null;
+            viewReadTime = null;
+        }
+        else
+        {
+            viewLockAcquireTime = createTableTimer("ViewLockAcquireTime", cfs.keyspace.metric.viewLockAcquireTime);
+            viewReadTime = createTableTimer("ViewReadTime", cfs.keyspace.metric.viewReadTime);
+        }
 
         trueSnapshotsSize = createTableGauge("SnapshotsSize", new Gauge<Long>()
         {
@@ -625,6 +624,7 @@ public class TableMetrics
         rowCacheHitOutOfRange = createTableCounter("RowCacheHitOutOfRange");
         rowCacheHit = createTableCounter("RowCacheHit");
         rowCacheMiss = createTableCounter("RowCacheMiss");
+        droppedMutations = createTableCounter("DroppedMutations");
 
         casPrepare = new LatencyMetrics(factory, "CasPrepare", cfs.keyspace.metric.casPrepare);
         casPropose = new LatencyMetrics(factory, "CasPropose", cfs.keyspace.metric.casPropose);
@@ -733,22 +733,64 @@ public class TableMetrics
     }
 
     /**
+     * Computes the compression ratio for the specified SSTables
+     *
+     * @param sstables the SSTables
+     * @return the compression ratio for the specified SSTables
+     */
+    private static Double computeCompressionRatio(Iterable<SSTableReader> sstables)
+    {
+        double compressedLengthSum = 0;
+        double dataLengthSum = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            if (sstable.compression)
+            {
+                // We should not have any sstable which are in an open early mode as the sstable were selected
+                // using SSTableSet.CANONICAL.
+                assert sstable.openReason != SSTableReader.OpenReason.EARLY;
+
+                CompressionMetadata compressionMetadata = sstable.getCompressionMetadata();
+                compressedLengthSum += compressionMetadata.compressedFileLength;
+                dataLengthSum += compressionMetadata.dataLength;
+            }
+        }
+        return dataLengthSum != 0 ? compressedLengthSum / dataLengthSum : 0;
+    }
+
+    /**
      * Create a histogram-like interface that will register both a CF, keyspace and global level
      * histogram and forward any updates to both
      */
-    protected TableHistogram createTableHistogram(String name, Histogram keyspaceHistogram)
+    protected TableHistogram createTableHistogram(String name, Histogram keyspaceHistogram, boolean considerZeroes)
     {
-        return createTableHistogram(name, name, keyspaceHistogram);
+        return createTableHistogram(name, name, keyspaceHistogram, considerZeroes);
     }
 
-    protected TableHistogram createTableHistogram(String name, String alias, Histogram keyspaceHistogram)
+    protected TableHistogram createTableHistogram(String name, String alias, Histogram keyspaceHistogram, boolean considerZeroes)
     {
-        Histogram cfHistogram = Metrics.histogram(factory.createMetricName(name), aliasFactory.createMetricName(alias));
+        Histogram cfHistogram = Metrics.histogram(factory.createMetricName(name), aliasFactory.createMetricName(alias), considerZeroes);
         register(name, alias, cfHistogram);
         return new TableHistogram(cfHistogram,
                                   keyspaceHistogram,
                                   Metrics.histogram(globalFactory.createMetricName(name),
-                                                    globalAliasFactory.createMetricName(alias)));
+                                                    globalAliasFactory.createMetricName(alias),
+                                                    considerZeroes));
+    }
+
+    protected TableTimer createTableTimer(String name, Timer keyspaceTimer)
+    {
+        return createTableTimer(name, name, keyspaceTimer);
+    }
+
+    protected TableTimer createTableTimer(String name, String alias, Timer keyspaceTimer)
+    {
+        Timer cfTimer = Metrics.timer(factory.createMetricName(name), aliasFactory.createMetricName(alias));
+        register(name, alias, cfTimer);
+        return new TableTimer(cfTimer,
+                              keyspaceTimer,
+                              Metrics.timer(globalFactory.createMetricName(name),
+                                            globalAliasFactory.createMetricName(alias)));
     }
 
     /**
@@ -778,6 +820,25 @@ public class TableMetrics
             for(Histogram histo : all)
             {
                 histo.update(i);
+            }
+        }
+    }
+
+    public static class TableTimer
+    {
+        public final Timer[] all;
+        public final Timer cf;
+        private TableTimer(Timer cf, Timer keyspace, Timer global)
+        {
+            this.cf = cf;
+            this.all = new Timer[]{cf, keyspace, global};
+        }
+
+        public void update(long i, TimeUnit unit)
+        {
+            for(Timer timer : all)
+            {
+                timer.update(i, unit);
             }
         }
     }

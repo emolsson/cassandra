@@ -18,12 +18,14 @@
 package org.apache.cassandra.db.rows;
 
 import java.util.*;
+import java.security.MessageDigest;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MergeIterator;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
@@ -43,7 +45,7 @@ import org.apache.cassandra.utils.btree.UpdateFunction;
  * it's own data. For instance, a {@code Row} cannot contains a cell that is deleted by its own
  * row deletion.
  */
-public interface Row extends Unfiltered, Iterable<ColumnData>
+public interface Row extends Unfiltered, Collection<ColumnData>
 {
     /**
      * The clustering values for this row.
@@ -52,15 +54,10 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
     public Clustering clustering();
 
     /**
-     * The columns this row contains.
-     *
-     * Note that this is actually a superset of the columns the row contains. The row
-     * may not have values for each of those columns, but it can't have values for other
-     * columns.
-     *
-     * @return a superset of the columns contained in this row.
+     * An in-natural-order collection of the columns for which data (incl. simple tombstones)
+     * is present in this row.
      */
-    public Columns columns();
+    public Collection<ColumnDefinition> columns();
 
     /**
      * The row deletion.
@@ -69,7 +66,7 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
      *
      * @return the row deletion.
      */
-    public DeletionTime deletion();
+    public Deletion deletion();
 
     /**
      * Liveness information for the primary key columns of this row.
@@ -146,9 +143,27 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
     public Iterable<Cell> cells();
 
     /**
+     * An iterable over the cells of this row that return cells in "legacy order".
+     * <p>
+     * In 3.0+, columns are sorted so that all simple columns are before all complex columns. Previously
+     * however, the cells where just sorted by the column name. This iterator return cells in that
+     * legacy order. It's only ever meaningful for backward/thrift compatibility code.
+     *
+     * @param metadata the table this is a row of.
+     * @param reversed if cells should returned in reverse order.
+     * @return an iterable over the cells of this row in "legacy order".
+     */
+    public Iterable<Cell> cellsInLegacyOrder(CFMetaData metadata, boolean reversed);
+
+    /**
      * Whether the row stores any (non-live) complex deletion for any complex column.
      */
     public boolean hasComplexDeletion();
+
+    /**
+     * Whether the row stores any (non-RT) data for any complex column.
+     */
+    boolean hasComplex();
 
     /**
      * Whether the row has any deletion info (row deletion, cell tombstone, expired cell or complex deletion).
@@ -190,6 +205,16 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
     public Row purge(DeletionPurger purger, int nowInSec);
 
     /**
+     * Returns a copy of this row which only include the data queried by {@code filter}, excluding anything _fetched_ for
+     * internal reasons but not queried by the user (see {@link ColumnFilter} for details).
+     *
+     * @param filter the {@code ColumnFilter} to use when deciding what is user queried. This should be the filter
+     * that was used when querying the row on which this method is called.
+     * @return the row but with all data that wasn't queried by the user skipped.
+     */
+    public Row withOnlyQueriedData(ColumnFilter filter);
+
+    /**
      * Returns a copy of this row where all counter cells have they "local" shard marked for clearing.
      */
     public Row markCounterLocalToBeCleared();
@@ -205,6 +230,130 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
     public long unsharedHeapSizeExcludingData();
 
     public String toString(CFMetaData metadata, boolean fullDetails);
+
+    /**
+     * A row deletion/tombstone.
+     * <p>
+     * A row deletion mostly consists of the time of said deletion, but there is 2 variants: shadowable
+     * and regular row deletion.
+     * <p>
+     * A shadowable row deletion only exists if the row timestamp ({@code primaryKeyLivenessInfo().timestamp()})
+     * is lower than the deletion timestamp. That is, if a row has a shadowable deletion with timestamp A and an update is made
+     * to that row with a timestamp B such that B > A, then the shadowable deletion is 'shadowed' by that update. A concrete
+     * consequence is that if said update has cells with timestamp lower than A, then those cells are preserved
+     * (since the deletion is removed), and this contrarily to a normal (regular) deletion where the deletion is preserved
+     * and such cells are removed.
+     * <p>
+     * Currently, the only use of shadowable row deletions is Materialized Views, see CASSANDRA-10261.
+     */
+    public static class Deletion
+    {
+        public static final Deletion LIVE = new Deletion(DeletionTime.LIVE, false);
+
+        private final DeletionTime time;
+        private final boolean isShadowable;
+
+        public Deletion(DeletionTime time, boolean isShadowable)
+        {
+            assert !time.isLive() || !isShadowable;
+            this.time = time;
+            this.isShadowable = isShadowable;
+        }
+
+        public static Deletion regular(DeletionTime time)
+        {
+            return time.isLive() ? LIVE : new Deletion(time, false);
+        }
+
+        public static Deletion shadowable(DeletionTime time)
+        {
+            return new Deletion(time, true);
+        }
+
+        /**
+         * The time of the row deletion.
+         *
+         * @return the time of the row deletion.
+         */
+        public DeletionTime time()
+        {
+            return time;
+        }
+
+        /**
+         * Whether the deletion is a shadowable one or not.
+         *
+         * @return whether the deletion is a shadowable one. Note that if {@code isLive()}, then this is
+         * guarantee to return {@code false}.
+         */
+        public boolean isShadowable()
+        {
+            return isShadowable;
+        }
+
+        /**
+         * Wether the deletion is live or not, that is if its an actual deletion or not.
+         *
+         * @return {@code true} if this represents no deletion of the row, {@code false} if that's an actual
+         * deletion.
+         */
+        public boolean isLive()
+        {
+            return time().isLive();
+        }
+
+        public boolean supersedes(DeletionTime that)
+        {
+            return time.supersedes(that);
+        }
+
+        public boolean supersedes(Deletion that)
+        {
+            return time.supersedes(that.time);
+        }
+
+        public boolean isShadowedBy(LivenessInfo primaryKeyLivenessInfo)
+        {
+            return isShadowable && primaryKeyLivenessInfo.timestamp() > time.markedForDeleteAt();
+        }
+
+        public boolean deletes(LivenessInfo info)
+        {
+            return time.deletes(info);
+        }
+
+        public void digest(MessageDigest digest)
+        {
+            time.digest(digest);
+            FBUtilities.updateWithBoolean(digest, isShadowable);
+        }
+
+        public int dataSize()
+        {
+            return time.dataSize() + 1;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if(!(o instanceof Deletion))
+                return false;
+            Deletion that = (Deletion)o;
+            return this.time.equals(that.time) && this.isShadowable == that.isShadowable;
+        }
+
+        @Override
+        public final int hashCode()
+        {
+            return Objects.hash(time, isShadowable);
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("%s%s", time, isShadowable ? "(shadowable)" : "");
+        }
+    }
 
     /**
      * Interface for building rows.
@@ -268,9 +417,9 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
          *
          * This call is optional and can be skipped if the row is not deleted.
          *
-         * @param deletion the row deletion time, or {@code DeletionTime.LIVE} if the row isn't deleted.
+         * @param deletion the row deletion time, or {@code Deletion.LIVE} if the row isn't deleted.
          */
-        public void addRowDeletion(DeletionTime deletion);
+        public void addRowDeletion(Deletion deletion);
 
         /**
          * Adds a cell to this builder.
@@ -300,7 +449,6 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
      */
     public static class Merger
     {
-        private final Columns columns;
         private final Row[] rows;
         private final List<Iterator<ColumnData>> columnDataIterators;
 
@@ -311,12 +459,11 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
         private final List<ColumnData> dataBuffer = new ArrayList<>();
         private final ColumnDataReducer columnDataReducer;
 
-        public Merger(int size, int nowInSec, Columns columns)
+        public Merger(int size, int nowInSec, boolean hasComplex)
         {
-            this.columns = columns;
             this.rows = new Row[size];
             this.columnDataIterators = new ArrayList<>(size);
-            this.columnDataReducer = new ColumnDataReducer(size, nowInSec, columns.hasComplex());
+            this.columnDataReducer = new ColumnDataReducer(size, nowInSec, hasComplex);
         }
 
         public void clear()
@@ -348,7 +495,7 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
             }
 
             LivenessInfo rowInfo = LivenessInfo.EMPTY;
-            DeletionTime rowDeletion = DeletionTime.LIVE;
+            Deletion rowDeletion = Deletion.LIVE;
             for (Row row : rows)
             {
                 if (row == null)
@@ -360,10 +507,13 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
                     rowDeletion = row.deletion();
             }
 
-            if (activeDeletion.supersedes(rowDeletion))
-                rowDeletion = DeletionTime.LIVE;
+            if (rowDeletion.isShadowedBy(rowInfo))
+                rowDeletion = Deletion.LIVE;
+
+            if (rowDeletion.supersedes(activeDeletion))
+                activeDeletion = rowDeletion.time();
             else
-                activeDeletion = rowDeletion;
+                rowDeletion = Deletion.LIVE;
 
             if (activeDeletion.deletes(rowInfo))
                 rowInfo = LivenessInfo.EMPTY;
@@ -383,7 +533,7 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
             // Because some data might have been shadowed by the 'activeDeletion', we could have an empty row
             return rowInfo.isEmpty() && rowDeletion.isLive() && dataBuffer.isEmpty()
                  ? null
-                 : BTreeBackedRow.create(clustering, columns, rowInfo, rowDeletion, BTree.build(dataBuffer, UpdateFunction.<ColumnData>noOp()));
+                 : BTreeRow.create(clustering, rowInfo, rowDeletion, BTree.build(dataBuffer, UpdateFunction.<ColumnData>noOp()));
         }
 
         public Clustering mergedClustering()
@@ -465,7 +615,7 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
                         cellReducer.setActiveDeletion(activeDeletion);
                     }
 
-                    Iterator<Cell> cells = MergeIterator.get(complexCells, ColumnData.comparator, cellReducer);
+                    Iterator<Cell> cells = MergeIterator.get(complexCells, Cell.comparator, cellReducer);
                     while (cells.hasNext())
                     {
                         Cell merged = cells.next();

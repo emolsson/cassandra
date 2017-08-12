@@ -24,6 +24,7 @@ import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.streaming.StreamResultFuture;
@@ -50,6 +51,7 @@ public class IncomingStreamingConnection extends Thread implements Closeable
     }
 
     @Override
+    @SuppressWarnings("resource") // Not closing constructed DataInputPlus's as the stream needs to remain open.
     public void run()
     {
         try
@@ -69,7 +71,7 @@ public class IncomingStreamingConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("IOException reading from socket; closing", e);
+            logger.trace("IOException reading from socket; closing", e);
             close();
         }
     }
@@ -86,7 +88,7 @@ public class IncomingStreamingConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("Error closing socket", e);
+            logger.trace("Error closing socket", e);
         }
         finally
         {

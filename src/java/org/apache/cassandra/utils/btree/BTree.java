@@ -67,6 +67,8 @@ public class BTree
     // NB we encode Path indexes as Bytes, so this needs to be less than Byte.MAX_VALUE / 2
     static final int FAN_FACTOR = 1 << FAN_SHIFT;
 
+    static final int MINIMAL_NODE_SIZE = FAN_FACTOR >> 1;
+
     // An empty BTree Leaf - which is the same as an empty BTree
     static final Object[] EMPTY_LEAF = new Object[1];
 
@@ -183,7 +185,7 @@ public class BTree
         return btree;
     }
 
-    public static <K> Object[] merge(Object[] tree1, Object[] tree2, Comparator<K> comparator)
+    public static <K> Object[] merge(Object[] tree1, Object[] tree2, Comparator<? super K> comparator, UpdateFunction<K, K> updateF)
     {
         if (size(tree1) < size(tree2))
         {
@@ -191,7 +193,7 @@ public class BTree
             tree1 = tree2;
             tree2 = tmp;
         }
-        return update(tree1, comparator, new BTreeSet<K>(tree2, comparator), UpdateFunction.<K>noOp());
+        return update(tree1, comparator, new BTreeSet<K>(tree2, comparator), updateF);
     }
 
     public static <V> Iterator<V> iterator(Object[] btree)
@@ -292,6 +294,40 @@ public class BTree
             i = -1 - i;
             node = (Object[]) node[keyEnd + i];
         }
+    }
+
+    /**
+     * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+     * Finds and replaces the item provided by index in the tree.
+     */
+    public static <V> void replaceInSitu(Object[] tree, int index, V replace)
+    {
+        // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+        if ((index < 0) | (index >= size(tree)))
+            throw new IndexOutOfBoundsException(index + " not in range [0.." + size(tree) + ")");
+
+        while (!isLeaf(tree))
+        {
+            final int[] sizeMap = getSizeMap(tree);
+            int boundary = Arrays.binarySearch(sizeMap, index);
+            if (boundary >= 0)
+            {
+                // exact match, in this branch node
+                assert boundary < sizeMap.length - 1;
+                tree[boundary] = replace;
+                return;
+            }
+
+            boundary = -1 -boundary;
+            if (boundary > 0)
+            {
+                assert boundary < sizeMap.length;
+                index -= (1 + sizeMap[boundary - 1]);
+            }
+            tree = (Object[]) tree[getChildStart(tree) + boundary];
+        }
+        assert index < getLeafKeyEnd(tree);
+        tree[index] = replace;
     }
 
     /**
@@ -669,7 +705,18 @@ public class BTree
 
     public static boolean equals(Object[] a, Object[] b)
     {
-        return Iterators.elementsEqual(iterator(a), iterator(b));
+        return size(a) == size(b) && Iterators.elementsEqual(iterator(a), iterator(b));
+    }
+
+    public static int hashCode(Object[] btree)
+    {
+        // we can't just delegate to Arrays.deepHashCode(),
+        // because two equivalent trees may be represented by differently shaped trees
+        int result = 1;
+        for (Object v : iterable(btree))
+            result = 31 * result + Objects.hashCode(v);
+        return result;
+
     }
 
     /**
@@ -738,8 +785,15 @@ public class BTree
         return new Builder<>(comparator);
     }
 
+    public static <V> Builder<V> builder(Comparator<? super V> comparator, int initialCapacity)
+    {
+        return new Builder<>(comparator);
+    }
+
     public static class Builder<V>
     {
+
+        // a user-defined bulk resolution, to be applied manually via resolve()
         public static interface Resolver
         {
             // can return a different output type to input, so long as sort order is maintained
@@ -748,15 +802,37 @@ public class BTree
             Object resolve(Object[] array, int lb, int ub);
         }
 
+        // a user-defined resolver that is applied automatically on encountering two duplicate values
+        public static interface QuickResolver<V>
+        {
+            // can return a different output type to input, so long as sort order is maintained
+            // if a resolver is present, this method will be called for every sequence of equal inputs
+            // even those with only one item
+            V resolve(V a, V b);
+        }
+
         Comparator<? super V> comparator;
-        Object[] values = new Object[10];
+        Object[] values;
         int count;
-        boolean detected; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added
+        boolean detected = true; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added
         boolean auto = true; // false if the user has promised to enforce the sort order and resolve any duplicates
+        QuickResolver<V> quickResolver;
 
         protected Builder(Comparator<? super V> comparator)
         {
+            this(comparator, 16);
+        }
+
+        protected Builder(Comparator<? super V> comparator, int initialCapacity)
+        {
             this.comparator = comparator;
+            this.values = new Object[initialCapacity];
+        }
+
+        public Builder<V> setQuickResolver(QuickResolver<V> quickResolver)
+        {
+            this.quickResolver = quickResolver;
+            return this;
         }
 
         public void reuse()
@@ -781,14 +857,20 @@ public class BTree
         {
             if (count == values.length)
                 values = Arrays.copyOf(values, count * 2);
-            values[count++] = v;
 
-            if (auto && detected && count > 1)
+            Object[] values = this.values;
+            int prevCount = this.count++;
+            values[prevCount] = v;
+
+            if (auto && detected && prevCount > 0)
             {
-                int c = comparator.compare((V) values[count - 2], (V) values[count - 1]);
+                V prev = (V) values[prevCount - 1];
+                int c = comparator.compare(prev, v);
                 if (c == 0 && auto)
                 {
-                    count--;
+                    count = prevCount;
+                    if (quickResolver != null)
+                        values[prevCount - 1] = quickResolver.resolve(prev, v);
                 }
                 else if (c > 0)
                 {
@@ -870,7 +952,11 @@ public class BTree
                 if (c > 0)
                     break;
                 else if (c == 0)
+                {
+                    if (quickResolver != null)
+                        a[i] = quickResolver.resolve(ai, aj);
                     j++;
+                }
                 i++;
             }
 
@@ -885,11 +971,14 @@ public class BTree
 
             while (i < curEnd && j < addEnd)
             {
+                V ai = (V) a[i];
+                V aj = (V) a[j];
                 // could avoid one comparison if we cared, but would make this ugly
-                int c = comparator.compare((V) a[i], (V) a[j]);
+                int c = comparator.compare(ai, aj);
                 if (c == 0)
                 {
-                    a[newCount++] = a[i];
+                    Object newValue = quickResolver == null ? ai : quickResolver.resolve(ai, aj);
+                    a[newCount++] = newValue;
                     i++;
                     j++;
                 }
@@ -920,6 +1009,19 @@ public class BTree
             return count == 0;
         }
 
+        public Builder<V> reverse()
+        {
+            assert !auto;
+            int mid = count / 2;
+            for (int i = 0 ; i < mid ; i++)
+            {
+                Object t = values[i];
+                values[i] = values[count - (1 + i)];
+                values[count - (1 + i)] = t;
+            }
+            return this;
+        }
+
         public Builder<V> sort()
         {
             Arrays.sort((V[]) values, 0, count, comparator);
@@ -932,11 +1034,17 @@ public class BTree
             if (!detected && count > 1)
             {
                 sort();
-                int c = 1;
+                int prevIdx = 0;
+                V prev = (V) values[0];
                 for (int i = 1 ; i < count ; i++)
-                    if (comparator.compare((V) values[i], (V) values[i - 1]) != 0)
-                        values[c++] = values[i];
-                count = c;
+                {
+                    V next = (V) values[i];
+                    if (comparator.compare(prev, next) != 0)
+                        values[++prevIdx] = prev = next;
+                    else if (quickResolver != null)
+                        values[prevIdx] = prev = quickResolver.resolve(prev, next);
+                }
+                count = prevIdx + 1;
             }
             detected = true;
         }
@@ -1001,11 +1109,20 @@ public class BTree
             return node.length >= FAN_FACTOR / 2 && node.length <= FAN_FACTOR + 1;
         }
 
+        final int keyCount = getBranchKeyEnd(node);
+        if ((!isRoot && keyCount < FAN_FACTOR / 2) || keyCount > FAN_FACTOR + 1)
+            return false;
+
         int type = 0;
+        int size = -1;
+        int[] sizeMap = getSizeMap(node);
         // compare each child node with the branch element at the head of this node it corresponds with
         for (int i = getChildStart(node); i < getChildEnd(node) ; i++)
         {
             Object[] child = (Object[]) node[i];
+            size += size(child) + 1;
+            if (sizeMap[i - getChildStart(node)] != size)
+                return false;
             Object localmax = i < node.length - 2 ? node[i - getChildStart(node)] : max;
             if (!isWellFormed(cmp, child, false, min, localmax))
                 return false;

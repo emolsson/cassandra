@@ -62,10 +62,16 @@ public class SetType<T> extends CollectionType<Set<T>>
 
     public SetType(AbstractType<T> elements, boolean isMultiCell)
     {
-        super(Kind.SET);
+        super(ComparisonType.CUSTOM, Kind.SET);
         this.elements = elements;
-        this.serializer = SetSerializer.getInstance(elements.getSerializer());
+        this.serializer = SetSerializer.getInstance(elements.getSerializer(), elements);
         this.isMultiCell = isMultiCell;
+    }
+
+    @Override
+    public boolean referencesUserType(String userTypeName)
+    {
+        return getElementsType().referencesUserType(userTypeName);
     }
 
     public AbstractType<T> getElementsType()
@@ -113,7 +119,7 @@ public class SetType<T> extends CollectionType<Set<T>>
     }
 
     @Override
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return ListType.compareListOrSet(elements, o1, o2);
     }
@@ -121,11 +127,6 @@ public class SetType<T> extends CollectionType<Set<T>>
     public SetSerializer<T> getSerializer()
     {
         return serializer;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return elements.isByteOrderComparable();
     }
 
     @Override

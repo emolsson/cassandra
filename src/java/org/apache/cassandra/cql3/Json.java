@@ -35,9 +35,15 @@ public class Json
 {
     public static final ObjectMapper JSON_OBJECT_MAPPER = new ObjectMapper();
 
-    public static final JsonStringEncoder JSON_STRING_ENCODER = new JsonStringEncoder();
-
     public static final ColumnIdentifier JSON_COLUMN_ID = new ColumnIdentifier("[json]", true);
+
+    /**
+     * Quotes string contents using standard JSON quoting.
+     */
+    public static String quoteAsJsonString(String s)
+    {
+        return new String(JsonStringEncoder.getInstance().quoteAsString(s));
+    }
 
     public static Object decodeJson(String json)
     {
@@ -71,7 +77,7 @@ public class Json
 
         public Prepared prepareAndCollectMarkers(CFMetaData metadata, Collection<ColumnDefinition> receivers, VariableSpecifications boundNames)
         {
-            return new PreparedLiteral(metadata.ksName, parseJson(text, receivers));
+            return new PreparedLiteral(parseJson(text, receivers));
         }
     }
 
@@ -91,7 +97,7 @@ public class Json
         public Prepared prepareAndCollectMarkers(CFMetaData metadata, Collection<ColumnDefinition> receivers, VariableSpecifications boundNames)
         {
             boundNames.add(bindIndex, makeReceiver(metadata));
-            return new PreparedMarker(metadata.ksName, bindIndex, receivers);
+            return new PreparedMarker(bindIndex, receivers);
         }
 
         private ColumnSpecification makeReceiver(CFMetaData metadata)
@@ -105,27 +111,7 @@ public class Json
      */
     public static abstract class Prepared
     {
-        private final String keyspace;
-
-        protected Prepared(String keyspace)
-        {
-            this.keyspace = keyspace;
-        }
-
-        protected abstract Term.Raw getRawTermForColumn(ColumnDefinition def);
-
-        public Term getPrimaryKeyValueForColumn(ColumnDefinition def)
-        {
-            // Note that we know we don't have to call collectMarkerSpecification since it has already been collected
-            return getRawTermForColumn(def).prepare(keyspace, def);
-        }
-
-        public Operation getSetOperationForColumn(ColumnDefinition def)
-        {
-            // Note that we know we don't have to call collectMarkerSpecification on the operation since we have
-            // already collected all we need.
-            return new Operation.SetValue(getRawTermForColumn(def)).prepare(keyspace, def);
-        }
+        public abstract Term.Raw getRawTermForColumn(ColumnDefinition def);
     }
 
     /**
@@ -135,13 +121,12 @@ public class Json
     {
         private final Map<ColumnIdentifier, Term> columnMap;
 
-        public PreparedLiteral(String keyspace, Map<ColumnIdentifier, Term> columnMap)
+        public PreparedLiteral(Map<ColumnIdentifier, Term> columnMap)
         {
-            super(keyspace);
             this.columnMap = columnMap;
         }
 
-        protected Term.Raw getRawTermForColumn(ColumnDefinition def)
+        public Term.Raw getRawTermForColumn(ColumnDefinition def)
         {
             Term value = columnMap.get(def.name);
             return value == null ? Constants.NULL_LITERAL : new ColumnValue(value);
@@ -156,36 +141,15 @@ public class Json
         private final int bindIndex;
         private final Collection<ColumnDefinition> columns;
 
-        private Map<ColumnIdentifier, Term> columnMap;
-
-        public PreparedMarker(String keyspace, int bindIndex, Collection<ColumnDefinition> columns)
+        public PreparedMarker(int bindIndex, Collection<ColumnDefinition> columns)
         {
-            super(keyspace);
             this.bindIndex = bindIndex;
             this.columns = columns;
         }
 
-        protected DelayedColumnValue getRawTermForColumn(ColumnDefinition def)
+        public RawDelayedColumnValue getRawTermForColumn(ColumnDefinition def)
         {
-            return new DelayedColumnValue(this, def);
-        }
-
-        public void bind(QueryOptions options) throws InvalidRequestException
-        {
-            // this will be called once per column, so avoid duplicating work
-            if (columnMap != null)
-                return;
-
-            ByteBuffer value = options.getValues().get(bindIndex);
-            if (value == null)
-                throw new InvalidRequestException("Got null for INSERT JSON values");
-
-            columnMap = parseJson(UTF8Type.instance.getSerializer().deserialize(value), columns);
-        }
-
-        public Term getValue(ColumnDefinition def)
-        {
-            return columnMap.get(def.name);
+            return new RawDelayedColumnValue(this, def);
         }
     }
 
@@ -195,7 +159,7 @@ public class Json
      * Note that this is intrinsically an already prepared term, but this still implements Term.Raw so that we can
      * easily use it to create raw operations.
      */
-    private static class ColumnValue implements Term.Raw
+    private static class ColumnValue extends Term.Raw
     {
         private final Term term;
 
@@ -215,19 +179,22 @@ public class Json
         {
             return TestResult.NOT_ASSIGNABLE;
         }
+
+        public String getText()
+        {
+            return term.toString();
+        }
     }
 
     /**
-     * A NonTerminal for a single column.
-     *
-     * As with {@code ColumnValue}, this is intrinsically a prepared term but implements Terms.Raw for convenience.
+     * A Raw term for a single column. Like ColumnValue, this is intrinsically already prepared.
      */
-    private static class DelayedColumnValue extends Term.NonTerminal implements Term.Raw
+    private static class RawDelayedColumnValue extends Term.Raw
     {
         private final PreparedMarker marker;
         private final ColumnDefinition column;
 
-        public DelayedColumnValue(PreparedMarker prepared, ColumnDefinition column)
+        public RawDelayedColumnValue(PreparedMarker prepared, ColumnDefinition column)
         {
             this.marker = prepared;
             this.column = column;
@@ -236,13 +203,33 @@ public class Json
         @Override
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            return this;
+            return new DelayedColumnValue(marker, column);
         }
 
         @Override
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             return TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        public String getText()
+        {
+            return marker.toString();
+        }
+    }
+
+    /**
+     * A NonTerminal for a single column. As with {@code ColumnValue}, this is intrinsically a prepared.
+     */
+    private static class DelayedColumnValue extends Term.NonTerminal
+    {
+        private final PreparedMarker marker;
+        private final ColumnDefinition column;
+
+        public DelayedColumnValue(PreparedMarker prepared, ColumnDefinition column)
+        {
+            this.marker = prepared;
+            this.column = column;
         }
 
         @Override
@@ -260,8 +247,7 @@ public class Json
         @Override
         public Terminal bind(QueryOptions options) throws InvalidRequestException
         {
-            marker.bind(options);
-            Term term = marker.getValue(column);
+            Term term = options.getJsonColumnValue(marker.bindIndex, column.name, marker.columns);
             return term == null ? null : term.bind(options);
         }
 
@@ -270,12 +256,13 @@ public class Json
         {
             return Collections.emptyList();
         }
+
     }
 
     /**
      * Given a JSON string, return a map of columns to their values for the insert.
      */
-    private static Map<ColumnIdentifier, Term> parseJson(String jsonString, Collection<ColumnDefinition> expectedReceivers)
+    public static Map<ColumnIdentifier, Term> parseJson(String jsonString, Collection<ColumnDefinition> expectedReceivers)
     {
         try
         {

@@ -18,6 +18,7 @@ package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.util.AbstractCollection;
 import java.util.Objects;
 
 import com.google.common.collect.Iterables;
@@ -34,7 +35,7 @@ import org.apache.cassandra.utils.FBUtilities;
  * Unless you have a very good reason not to, every row implementation
  * should probably extend this class.
  */
-public abstract class AbstractRow implements Row
+public abstract class AbstractRow extends AbstractCollection<ColumnData> implements Row
 {
     public Unfiltered.Kind kind()
     {
@@ -47,13 +48,6 @@ public abstract class AbstractRow implements Row
             return true;
 
         return Iterables.any(cells(), cell -> cell.isLive(nowInSec));
-    }
-
-    public boolean isEmpty()
-    {
-        return primaryKeyLivenessInfo().isEmpty()
-            && deletion().isLive()
-            && !iterator().hasNext();
     }
 
     public boolean isStatic()
@@ -84,7 +78,7 @@ public abstract class AbstractRow implements Row
         }
 
         primaryKeyLivenessInfo().validate();
-        if (deletion().localDeletionTime() < 0)
+        if (deletion().time().localDeletionTime() < 0)
             throw new MarshalException("A local deletion time should not be negative");
 
         for (ColumnData cd : this)
@@ -98,6 +92,11 @@ public abstract class AbstractRow implements Row
 
     public String toString(CFMetaData metadata, boolean fullDetails)
     {
+        return toString(metadata, true, fullDetails);
+    }
+
+    public String toString(CFMetaData metadata, boolean includeClusterKeys, boolean fullDetails)
+    {
         StringBuilder sb = new StringBuilder();
         sb.append("Row");
         if (fullDetails)
@@ -107,7 +106,12 @@ public abstract class AbstractRow implements Row
                 sb.append(" del=").append(deletion());
             sb.append(" ]");
         }
-        sb.append(": ").append(clustering().toString(metadata)).append(" | ");
+        sb.append(": ");
+        if(includeClusterKeys)
+            sb.append(clustering().toString(metadata));
+        else
+            sb.append(clustering().toCQLString(metadata));
+        sb.append(" | ");
         boolean isFirst = true;
         for (ColumnData cd : this)
         {
@@ -132,7 +136,11 @@ public abstract class AbstractRow implements Row
                 if (cd.column().isSimple())
                 {
                     Cell cell = (Cell)cd;
-                    sb.append(cell.column().name).append('=').append(cell.column().type.getString(cell.value()));
+                    sb.append(cell.column().name).append('=');
+                    if (cell.isTombstone())
+                        sb.append("<tombstone>");
+                    else
+                        sb.append(cell.column().type.getString(cell.value()));
                 }
                 else
                 {
@@ -160,7 +168,6 @@ public abstract class AbstractRow implements Row
 
         Row that = (Row)other;
         if (!this.clustering().equals(that.clustering())
-             || !this.columns().equals(that.columns())
              || !this.primaryKeyLivenessInfo().equals(that.primaryKeyLivenessInfo())
              || !this.deletion().equals(that.deletion()))
             return false;

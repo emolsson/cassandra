@@ -19,26 +19,25 @@ package org.apache.cassandra.db.partitions;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Iterators;
-
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.io.util.DataInputBuffer;
-import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.MergeIterator;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
  * Stores updates made on a partition.
@@ -54,7 +53,7 @@ import org.apache.cassandra.utils.MergeIterator;
  * is also a few static helper constructor methods for special cases ({@code emptyUpdate()},
  * {@code fullPartitionDelete} and {@code singleRowUpdate}).
  */
-public class PartitionUpdate extends AbstractThreadUnsafePartition
+public class PartitionUpdate extends AbstractBTreePartition
 {
     protected static final Logger logger = LoggerFactory.getLogger(PartitionUpdate.class);
 
@@ -69,28 +68,36 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
     private boolean isBuilt;
     private boolean canReOpen = true;
 
-    private final MutableDeletionInfo deletionInfo;
-    private EncodingStats stats; // will be null if isn't built
-
-    private Row staticRow = Rows.EMPTY_STATIC_ROW;
+    private Holder holder;
+    private BTree.Builder<Row> rowBuilder;
+    private MutableDeletionInfo deletionInfo;
 
     private final boolean canHaveShadowedData;
 
     private PartitionUpdate(CFMetaData metadata,
                             DecoratedKey key,
                             PartitionColumns columns,
-                            Row staticRow,
-                            List<Row> rows,
                             MutableDeletionInfo deletionInfo,
-                            EncodingStats stats,
-                            boolean isBuilt,
+                            int initialRowCapacity,
                             boolean canHaveShadowedData)
     {
-        super(metadata, key, columns, rows);
-        this.staticRow = staticRow;
+        super(metadata, key);
         this.deletionInfo = deletionInfo;
-        this.stats = stats;
-        this.isBuilt = isBuilt;
+        this.holder = new Holder(columns, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+        this.canHaveShadowedData = canHaveShadowedData;
+        rowBuilder = builder(initialRowCapacity);
+    }
+
+    private PartitionUpdate(CFMetaData metadata,
+                            DecoratedKey key,
+                            Holder holder,
+                            MutableDeletionInfo deletionInfo,
+                            boolean canHaveShadowedData)
+    {
+        super(metadata, key);
+        this.holder = holder;
+        this.deletionInfo = deletionInfo;
+        this.isBuilt = true;
         this.canHaveShadowedData = canHaveShadowedData;
     }
 
@@ -99,7 +106,7 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
                            PartitionColumns columns,
                            int initialRowCapacity)
     {
-        this(metadata, key, columns, Rows.EMPTY_STATIC_ROW, new ArrayList<>(initialRowCapacity), MutableDeletionInfo.live(), null, false, true);
+        this(metadata, key, columns, MutableDeletionInfo.live(), initialRowCapacity, true);
     }
 
     public PartitionUpdate(CFMetaData metadata,
@@ -123,7 +130,9 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      */
     public static PartitionUpdate emptyUpdate(CFMetaData metadata, DecoratedKey key)
     {
-        return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false);
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
     }
 
     /**
@@ -138,7 +147,9 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      */
     public static PartitionUpdate fullPartitionDelete(CFMetaData metadata, DecoratedKey key, long timestamp, int nowInSec)
     {
-        return new PartitionUpdate(metadata, key, PartitionColumns.NONE, Rows.EMPTY_STATIC_ROW, Collections.<Row>emptyList(), new MutableDeletionInfo(timestamp, nowInSec), EncodingStats.NO_STATS, true, false);
+        MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);
+        Holder holder = new Holder(PartitionColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
     }
 
     /**
@@ -152,9 +163,17 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      */
     public static PartitionUpdate singleRowUpdate(CFMetaData metadata, DecoratedKey key, Row row)
     {
-        return row.isStatic()
-             ? new PartitionUpdate(metadata, key, new PartitionColumns(row.columns(), Columns.NONE), row, Collections.<Row>emptyList(), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false)
-             : new PartitionUpdate(metadata, key, new PartitionColumns(Columns.NONE, row.columns()), Rows.EMPTY_STATIC_ROW, Collections.singletonList(row), MutableDeletionInfo.live(), EncodingStats.NO_STATS, true, false);
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        if (row.isStatic())
+        {
+            Holder holder = new Holder(new PartitionColumns(Columns.from(row.columns()), Columns.NONE), BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
+            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+        }
+        else
+        {
+            Holder holder = new Holder(new PartitionColumns(Columns.NONE, Columns.from(row.columns())), BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+        }
     }
 
     /**
@@ -174,67 +193,44 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
     /**
      * Turns the given iterator into an update.
      *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
-    public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator)
+    public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
     {
-        CFMetaData metadata = iterator.metadata();
-        boolean reversed = iterator.isReverseOrder();
-
-        List<Row> rows = new ArrayList<>();
-        MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(iterator.partitionLevelDeletion(), metadata.comparator, reversed);
-
-        while (iterator.hasNext())
-        {
-            Unfiltered unfiltered = iterator.next();
-            if (unfiltered.kind() == Unfiltered.Kind.ROW)
-                rows.add((Row)unfiltered);
-            else
-                deletionBuilder.add((RangeTombstoneMarker)unfiltered);
-        }
-
-        if (reversed)
-            Collections.reverse(rows);
-
-        return new PartitionUpdate(metadata, iterator.partitionKey(), iterator.columns(), iterator.staticRow(), rows, deletionBuilder.build(), iterator.stats(), true, false);
+        iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
+        Holder holder = build(iterator, 16);
+        MutableDeletionInfo deletionInfo = (MutableDeletionInfo) holder.deletionInfo;
+        return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
     }
 
-    public static PartitionUpdate fromIterator(RowIterator iterator)
+    /**
+     * Turns the given iterator into an update.
+     *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
+     * Warning: this method does not close the provided iterator, it is up to
+     * the caller to close it.
+     */
+    public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
     {
-        CFMetaData metadata = iterator.metadata();
-        boolean reversed = iterator.isReverseOrder();
-
-        List<Row> rows = new ArrayList<>();
-
-        EncodingStats.Collector collector = new EncodingStats.Collector();
-
-        while (iterator.hasNext())
-        {
-            Row row = iterator.next();
-            rows.add(row);
-            Rows.collectStats(row, collector);
-        }
-
-        if (reversed)
-            Collections.reverse(rows);
-
-        return new PartitionUpdate(metadata, iterator.partitionKey(), iterator.columns(), iterator.staticRow(), rows, MutableDeletionInfo.live(), collector.get(), true, false);
+        iterator = RowIterators.withOnlyQueriedData(iterator, filter);
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Holder holder = build(iterator, deletionInfo, true, 16);
+        return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
     }
 
     protected boolean canHaveShadowedData()
     {
         return canHaveShadowedData;
-    }
-
-    public Row staticRow()
-    {
-        return staticRow;
-    }
-
-    public DeletionInfo deletionInfo()
-    {
-        return deletionInfo;
     }
 
     /**
@@ -308,7 +304,7 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      *
      * @return a partition update that include (merge) all the updates from {@code updates}.
      */
-    public static PartitionUpdate merge(Collection<PartitionUpdate> updates)
+    public static PartitionUpdate merge(List<PartitionUpdate> updates)
     {
         assert !updates.isEmpty();
         final int size = updates.size();
@@ -316,72 +312,9 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         if (size == 1)
             return Iterables.getOnlyElement(updates);
 
-        // Used when merging row to decide of liveness
-        int nowInSec = FBUtilities.nowInSeconds();
-
-        PartitionColumns.Builder builder = PartitionColumns.builder();
-        DecoratedKey key = null;
-        CFMetaData metadata = null;
-        MutableDeletionInfo deletion = MutableDeletionInfo.live();
-        Row staticRow = Rows.EMPTY_STATIC_ROW;
-        List<Iterator<Row>> updateRowIterators = new ArrayList<>(size);
-        EncodingStats stats = EncodingStats.NO_STATS;
-
-        for (PartitionUpdate update : updates)
-        {
-            builder.addAll(update.columns());
-            deletion.add(update.deletionInfo());
-            if (!update.staticRow().isEmpty())
-                staticRow = staticRow == Rows.EMPTY_STATIC_ROW ? update.staticRow() : Rows.merge(staticRow, update.staticRow(), nowInSec);
-            updateRowIterators.add(update.iterator());
-            stats = stats.mergeWith(update.stats());
-
-            if (key == null)
-                key = update.partitionKey();
-            else
-                assert key.equals(update.partitionKey());
-
-            if (metadata == null)
-                metadata = update.metadata();
-            else
-                assert metadata.cfId.equals(update.metadata().cfId);
-        }
-
-        PartitionColumns columns = builder.build();
-
-        final Row.Merger merger = new Row.Merger(size, nowInSec, columns.regulars);
-
-        Iterator<Row> merged = MergeIterator.get(updateRowIterators, metadata.comparator, new MergeIterator.Reducer<Row, Row>()
-        {
-            @Override
-            public boolean trivialReduceIsTrivial()
-            {
-                return true;
-            }
-
-            public void reduce(int idx, Row current)
-            {
-                merger.add(idx, current);
-            }
-
-            protected Row getReduced()
-            {
-                // Note that while merger.getRow() can theoretically return null, it won't in this case because
-                // we don't pass an "activeDeletion".
-                return merger.merge(DeletionTime.LIVE);
-            }
-
-            @Override
-            protected void onKeyChange()
-            {
-                merger.clear();
-            }
-        });
-
-        List<Row> rows = new ArrayList<>();
-        Iterators.addAll(rows, merged);
-
-        return new PartitionUpdate(metadata, key, columns, staticRow, rows, deletion, stats, true, true);
+        int nowInSecs = FBUtilities.nowInSeconds();
+        List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
+        return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
     }
 
     /**
@@ -400,17 +333,12 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      */
     public void updateAllTimestamp(long newTimestamp)
     {
-        // We know we won't be updating that update again after this call, and doing is post built is potentially
-        // slightly more efficient (things are more "compact"). So force a build if it hasn't happened yet.
-        maybeBuild();
-
+        Holder holder = holder();
         deletionInfo.updateAllTimestamp(newTimestamp - 1);
-
-        if (!staticRow.isEmpty())
-            staticRow = staticRow.updateAllTimestamp(newTimestamp);
-
-        for (int i = 0; i < rows.size(); i++)
-            rows.set(i, rows.get(i).updateAllTimestamp(newTimestamp));
+        Object[] tree = BTree.<Row>transformAndFilter(holder.tree, (x) -> x.updateAllTimestamp(newTimestamp));
+        Row staticRow = holder.staticRow.updateAllTimestamp(newTimestamp);
+        EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.<Row>iterator(tree), deletionInfo);
+        this.holder = new Holder(holder.columns, tree, deletionInfo, staticRow, newStats);
     }
 
     /**
@@ -423,7 +351,8 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
      */
     public int operationCount()
     {
-        return rows.size()
+        return rowCount()
+             + (staticRow().isEmpty() ? 0 : 1)
              + deletionInfo.rangeCount()
              + (deletionInfo.getPartitionDeletion().isLive() ? 0 : 1);
     }
@@ -446,16 +375,23 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
     }
 
     @Override
-    public int rowCount()
+    public PartitionColumns columns()
+    {
+        // The superclass implementation calls holder(), but that triggers a build of the PartitionUpdate. But since
+        // the columns are passed to the ctor, we know the holder always has the proper columns even if it doesn't have
+        // the built rows yet, so just bypass the holder() method.
+        return holder.columns;
+    }
+
+    protected Holder holder()
     {
         maybeBuild();
-        return super.rowCount();
+        return holder;
     }
 
     public EncodingStats stats()
     {
-        maybeBuild();
-        return stats;
+        return holder().stats;
     }
 
     /**
@@ -476,6 +412,15 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         // called concurrently with sort() (which should be avoided in the first place, but
         // better safe than sorry).
         isBuilt = false;
+        if (rowBuilder == null)
+            rowBuilder = builder(16);
+    }
+
+    private BTree.Builder<Row> builder(int initialCapacity)
+    {
+        return BTree.<Row>builder(metadata.comparator, initialCapacity)
+                    .setQuickResolver((a, b) ->
+                                      Rows.merge(a, b, createdAtInSec));
     }
 
     /**
@@ -493,17 +438,10 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         return super.iterator();
     }
 
-    @Override
-    protected SliceableUnfilteredRowIterator sliceableUnfilteredIterator(ColumnFilter columns, boolean reversed)
-    {
-        maybeBuild();
-        return super.sliceableUnfilteredIterator(columns, reversed);
-    }
-
     /**
      * Validates the data contained in this update.
      *
-     * @throws MarshalException if some of the data contained in this update is corrupted.
+     * @throws org.apache.cassandra.serializers.MarshalException if some of the data contained in this update is corrupted.
      */
     public void validate()
     {
@@ -561,7 +499,7 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         canReOpen = false;
 
         List<CounterMark> l = new ArrayList<>();
-        for (Row row : rows)
+        for (Row row : this)
         {
             for (Cell cell : row.cells())
             {
@@ -610,28 +548,21 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
 
         if (row.isStatic())
         {
-            // We test for == first because in most case it'll be true and that is faster
-            assert columns().statics == row.columns() || columns().statics.contains(row.columns());
-            staticRow = staticRow.isEmpty()
+            // this assert is expensive, and possibly of limited value; we should consider removing it
+            // or introducing a new class of assertions for test purposes
+            assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
+            Row staticRow = holder.staticRow.isEmpty()
                       ? row
-                      : Rows.merge(staticRow, row, createdAtInSec);
+                      : Rows.merge(holder.staticRow, row, createdAtInSec);
+            holder = new Holder(holder.columns, holder.tree, holder.deletionInfo, staticRow, holder.stats);
         }
         else
         {
-            // We test for == first because in most case it'll be true and that is faster
-            assert columns().regulars == row.columns() || columns().regulars.contains(row.columns());
-            rows.add(row);
+            // this assert is expensive, and possibly of limited value; we should consider removing it
+            // or introducing a new class of assertions for test purposes
+            assert columns().regulars.containsAll(row.columns()) : columns().regulars + " is not superset of " + row.columns();
+            rowBuilder.add(row);
         }
-    }
-
-    /**
-     * The number of rows contained in this update.
-     *
-     * @return the number of rows contained in this update.
-     */
-    public int size()
-    {
-        return rows.size();
     }
 
     private void maybeBuild()
@@ -647,91 +578,59 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         if (isBuilt)
             return;
 
-        if (rows.size() <= 1)
-        {
-            finishBuild();
-            return;
-        }
+        Holder holder = this.holder;
+        Object[] cur = holder.tree;
+        Object[] add = rowBuilder.build();
+        Object[] merged = BTree.<Row>merge(cur, add, metadata.comparator,
+                                           UpdateFunction.Simple.of((a, b) -> Rows.merge(a, b, createdAtInSec)));
 
-        Comparator<Row> comparator = metadata.comparator.rowComparator();
-        // Sort the rows. Because the same row can have been added multiple times, we can still have duplicates after that
-        Collections.sort(rows, comparator);
+        assert deletionInfo == holder.deletionInfo;
+        EncodingStats newStats = EncodingStats.Collector.collect(holder.staticRow, BTree.<Row>iterator(merged), deletionInfo);
 
-        // Now find the duplicates and merge them together
-        int previous = 0; // The last element that was set
-        for (int current = 1; current < rows.size(); current++)
-        {
-            // There is really only 2 possible comparison: < 0 or == 0 since we've sorted already
-            Row previousRow = rows.get(previous);
-            Row currentRow = rows.get(current);
-            int cmp = comparator.compare(previousRow, currentRow);
-            if (cmp == 0)
-            {
-                // current and previous are the same row. Merge current into previous
-                // (and so previous + 1 will be "free").
-                rows.set(previous, Rows.merge(previousRow, currentRow, createdAtInSec));
-            }
-            else
-            {
-                // current != previous, so move current just after previous if needs be
-                ++previous;
-                if (previous != current)
-                    rows.set(previous, currentRow);
-            }
-        }
-
-        // previous is on the last value to keep
-        for (int j = rows.size() - 1; j > previous; j--)
-            rows.remove(j);
-
-        finishBuild();
+        this.holder = new Holder(holder.columns, merged, holder.deletionInfo, holder.staticRow, newStats);
+        rowBuilder = null;
+        isBuilt = true;
     }
 
-    private void finishBuild()
+    @Override
+    public String toString()
     {
-        EncodingStats.Collector collector = new EncodingStats.Collector();
-        deletionInfo.collectStats(collector);
-        for (Row row : rows)
-            Rows.collectStats(row, collector);
-        stats = collector.get();
-        isBuilt = true;
+        if (isBuilt)
+            return super.toString();
+
+        // We intentionally override AbstractBTreePartition#toString() to avoid iterating over the rows in the
+        // partition, which can result in build() being triggered and lead to errors if the PartitionUpdate is later
+        // modified.
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("[%s.%s] key=%s columns=%s",
+                                metadata.ksName,
+                                metadata.cfName,
+                                metadata.getKeyValidator().getString(partitionKey().getKey()),
+                                columns()));
+
+        sb.append("\n    deletionInfo=").append(deletionInfo);
+        sb.append(" (not built)");
+        return sb.toString();
     }
 
     public static class PartitionUpdateSerializer
     {
         public void serialize(PartitionUpdate update, DataOutputPlus out, int version) throws IOException
         {
-            if (version < MessagingService.VERSION_30)
-            {
-                // TODO
-                throw new UnsupportedOperationException();
-
-                // if (cf == null)
-                // {
-                //     out.writeBoolean(false);
-                //     return;
-                // }
-
-                // out.writeBoolean(true);
-                // serializeCfId(cf.id(), out, version);
-                // cf.getComparator().deletionInfoSerializer().serialize(cf.deletionInfo(), out, version);
-                // ColumnSerializer columnSerializer = cf.getComparator().columnSerializer();
-                // int count = cf.getColumnCount();
-                // out.writeInt(count);
-                // int written = 0;
-                // for (Cell cell : cf)
-                // {
-                //     columnSerializer.serialize(cell, out);
-                //     written++;
-                // }
-                // assert count == written: "Table had " + count + " columns, but " + written + " written";
-            }
-
-            CFMetaData.serializer.serialize(update.metadata(), out, version);
-            try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
+            try (UnfilteredRowIterator iter = update.unfilteredIterator())
             {
                 assert !iter.isReverseOrder();
-                UnfilteredRowIteratorSerializer.serializer.serialize(iter, out, version, update.rows.size());
+
+                if (version < MessagingService.VERSION_30)
+                {
+                    LegacyLayout.serializeAsLegacyPartition(null, iter, out, version);
+                }
+                else
+                {
+                    CFMetaData.serializer.serialize(update.metadata(), out, version);
+                    UnfilteredRowIteratorSerializer.serializer.serialize(iter, null, out, version, update.rowCount());
+                }
             }
         }
 
@@ -745,9 +644,7 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
             else
             {
                 assert key != null;
-                CFMetaData metadata = deserializeMetadata(in, version);
-                DecoratedKey dk = metadata.decorateKey(key);
-                return deserializePre30(in, version, flag, metadata, dk);
+                return deserializePre30(in, version, flag, key);
             }
         }
 
@@ -761,15 +658,14 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
             else
             {
                 assert key != null;
-                CFMetaData metadata = deserializeMetadata(in, version);
-                return deserializePre30(in, version, flag, metadata, key);
+                return deserializePre30(in, version, flag, key.getKey());
             }
         }
 
         private static PartitionUpdate deserialize30(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
         {
             CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
-            UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(in, version, metadata, flag);
+            UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);
             if (header.isEmpty)
                 return emptyUpdate(metadata, header.key);
 
@@ -777,7 +673,8 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
             assert header.rowEstimate >= 0;
 
             MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(header.partitionDeletion, metadata.comparator, false);
-            List<Row> rows = new ArrayList<>(header.rowEstimate);
+            BTree.Builder<Row> rows = BTree.builder(metadata.comparator, header.rowEstimate);
+            rows.auto(false);
 
             try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, flag, header))
             {
@@ -791,61 +688,32 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
                 }
             }
 
+            MutableDeletionInfo deletionInfo = deletionBuilder.build();
             return new PartitionUpdate(metadata,
                                        header.key,
-                                       header.sHeader.columns(),
-                                       header.staticRow,
-                                       rows,
-                                       deletionBuilder.build(),
-                                       header.sHeader.stats(),
-                                       true,
+                                       new Holder(header.sHeader.columns(), rows.build(), deletionInfo, header.staticRow, header.sHeader.stats()),
+                                       deletionInfo,
                                        false);
         }
 
-        private static CFMetaData deserializeMetadata(DataInputPlus in, int version) throws IOException
+        private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
         {
-            // This is only used in mutation, and mutation have never allowed "null" column families
-            boolean present = in.readBoolean();
-            assert present;
-
-            CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);
-            return metadata;
-        }
-
-        private static PartitionUpdate deserializePre30(DataInputPlus in, int version, SerializationHelper.Flag flag, CFMetaData metadata, DecoratedKey dk) throws IOException
-        {
-            LegacyLayout.LegacyDeletionInfo info = LegacyLayout.LegacyDeletionInfo.serializer.deserialize(metadata, in, version);
-            int size = in.readInt();
-            Iterator<LegacyLayout.LegacyCell> cells = LegacyLayout.deserializeCells(metadata, in, flag, size);
-            SerializationHelper helper = new SerializationHelper(metadata, version, flag);
-            try (UnfilteredRowIterator iterator = LegacyLayout.onWireCellstoUnfilteredRowIterator(metadata, dk, info, cells, false, helper))
+            try (UnfilteredRowIterator iterator = LegacyLayout.deserializeLegacyPartition(in, version, flag, key))
             {
-                return PartitionUpdate.fromIterator(iterator);
+                assert iterator != null; // This is only used in mutation, and mutation have never allowed "null" column families
+                return PartitionUpdate.fromIterator(iterator, ColumnFilter.all(iterator.metadata()));
             }
         }
 
         public long serializedSize(PartitionUpdate update, int version)
         {
-            if (version < MessagingService.VERSION_30)
+            try (UnfilteredRowIterator iter = update.unfilteredIterator())
             {
-                // TODO
-                throw new UnsupportedOperationException("Version is " + version);
-                //if (cf == null)
-                //{
-                //    return TypeSizes.sizeof(false);
-                //}
-                //else
-                //{
-                //    return TypeSizes.sizeof(true)  /* nullness bool */
-                //        + cfIdSerializedSize(cf.id(), typeSizes, version)  /* id */
-                //        + contentSerializedSize(cf, typeSizes, version);
-                //}
-            }
+                if (version < MessagingService.VERSION_30)
+                    return LegacyLayout.serializedSizeAsLegacyPartition(null, iter, version);
 
-            try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
-            {
                 return CFMetaData.serializer.serializedSize(update.metadata(), version)
-                     + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, version, update.rows.size());
+                     + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rowCount());
             }
         }
     }
@@ -894,8 +762,8 @@ public class PartitionUpdate extends AbstractThreadUnsafePartition
         {
             // This is a bit of a giant hack as this is the only place where we mutate a Row object. This makes it more efficient
             // for counters however and this won't be needed post-#6506 so that's probably fine.
-            assert row instanceof BTreeBackedRow;
-            ((BTreeBackedRow)row).setValue(column, path, value);
+            assert row instanceof BTreeRow;
+            ((BTreeRow)row).setValue(column, path, value);
         }
     }
 }

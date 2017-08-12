@@ -56,8 +56,8 @@ import com.google.common.util.concurrent.Uninterruptibles;
  * Slightly modified version of the Apache Thrift TThreadPoolServer.
  * <p>
  * This allows passing an executor so you have more control over the actual
- * behaviour of the tasks being run.
- * <p/>
+ * behavior of the tasks being run.
+ * </p>
  * Newer version of Thrift should make this obsolete.
  */
 public class CustomTThreadPoolServer extends TServer
@@ -126,7 +126,7 @@ public class CustomTThreadPoolServer extends TServer
             catch (RejectedExecutionException e)
             {
                 // worker thread decremented activeClients but hadn't finished exiting
-                logger.debug("Dropping client connection because our limit of {} has been reached", args.maxWorkerThreads);
+                logger.trace("Dropping client connection because our limit of {} has been reached", args.maxWorkerThreads);
                 continue;
             }
 
@@ -211,7 +211,7 @@ public class CustomTThreadPoolServer extends TServer
             {
                 // Assume the client died and continue silently
                 // Log at debug to allow debugging of "frame too large" errors (see CASSANDRA-3142).
-                logger.debug("Thrift transport error occurred during processing of message.", ttx);
+                logger.trace("Thrift transport error occurred during processing of message.", ttx);
             }
             catch (TException tx)
             {

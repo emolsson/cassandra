@@ -23,6 +23,10 @@ import java.nio.ByteBuffer;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.transform.BasePartitions;
+import org.apache.cassandra.db.transform.BaseRows;
+import org.apache.cassandra.db.transform.StoppingTransformation;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -37,7 +41,9 @@ public abstract class DataLimits
 {
     public static final Serializer serializer = new Serializer();
 
-    public static final DataLimits NONE = new CQLLimits(Integer.MAX_VALUE)
+    public static final int NO_LIMIT = Integer.MAX_VALUE;
+
+    public static final DataLimits NONE = new CQLLimits(NO_LIMIT)
     {
         @Override
         public boolean hasEnoughLiveData(CachedPartition cached, int nowInSec)
@@ -60,9 +66,9 @@ public abstract class DataLimits
 
     // We currently deal with distinct queries by querying full partitions but limiting the result at 1 row per
     // partition (see SelectStatement.makeFilter). So an "unbounded" distinct is still actually doing some filtering.
-    public static final DataLimits DISTINCT_NONE = new CQLLimits(Integer.MAX_VALUE, 1, true);
+    public static final DataLimits DISTINCT_NONE = new CQLLimits(NO_LIMIT, 1, true);
 
-    private enum Kind { CQL_LIMIT, CQL_PAGING_LIMIT, THRIFT_LIMIT, SUPER_COLUMN_COUNTING_LIMIT }
+    public enum Kind { CQL_LIMIT, CQL_PAGING_LIMIT, THRIFT_LIMIT, SUPER_COLUMN_COUNTING_LIMIT }
 
     public static DataLimits cqlLimits(int cqlRowLimit)
     {
@@ -89,9 +95,10 @@ public abstract class DataLimits
         return new SuperColumnCountingLimits(partitionLimit, cellPerPartitionLimit);
     }
 
-    protected abstract Kind kind();
+    public abstract Kind kind();
 
     public abstract boolean isUnlimited();
+    public abstract boolean isDistinct();
 
     public abstract DataLimits forPaging(int pageSize);
     public abstract DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining);
@@ -125,17 +132,17 @@ public abstract class DataLimits
 
     public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, int nowInSec)
     {
-        return new CountingUnfilteredPartitionIterator(iter, newCounter(nowInSec, false));
+        return this.newCounter(nowInSec, false).applyTo(iter);
     }
 
     public UnfilteredRowIterator filter(UnfilteredRowIterator iter, int nowInSec)
     {
-        return new CountingUnfilteredRowIterator(iter, newCounter(nowInSec, false));
+        return this.newCounter(nowInSec, false).applyTo(iter);
     }
 
     public PartitionIterator filter(PartitionIterator iter, int nowInSec)
     {
-        return new CountingPartitionIterator(iter, this, nowInSec);
+        return this.newCounter(nowInSec, true).applyTo(iter);
     }
 
     /**
@@ -144,11 +151,36 @@ public abstract class DataLimits
      */
     public abstract float estimateTotalResults(ColumnFamilyStore cfs);
 
-    public interface Counter
+    public static abstract class Counter extends StoppingTransformation<BaseRowIterator<?>>
     {
-        public void newPartition(DecoratedKey partitionKey, Row staticRow);
-        public void newRow(Row row);
-        public void endOfPartition();
+        // false means we do not propagate our stop signals onto the iterator, we only count
+        private boolean enforceLimits = true;
+
+        public Counter onlyCount()
+        {
+            this.enforceLimits = false;
+            return this;
+        }
+
+        public PartitionIterator applyTo(PartitionIterator partitions)
+        {
+            return Transformation.apply(partitions, this);
+        }
+
+        public UnfilteredPartitionIterator applyTo(UnfilteredPartitionIterator partitions)
+        {
+            return Transformation.apply(partitions, this);
+        }
+
+        public UnfilteredRowIterator applyTo(UnfilteredRowIterator partition)
+        {
+            return (UnfilteredRowIterator) applyToPartition(partition);
+        }
+
+        public RowIterator applyTo(RowIterator partition)
+        {
+            return (RowIterator) applyToPartition(partition);
+        }
 
         /**
          * The number of results counted.
@@ -157,12 +189,40 @@ public abstract class DataLimits
          *
          * @return the number of results counted.
          */
-        public int counted();
+        public abstract int counted();
+        public abstract int countedInCurrentPartition();
 
-        public int countedInCurrentPartition();
+        public abstract boolean isDone();
+        public abstract boolean isDoneForPartition();
 
-        public boolean isDone();
-        public boolean isDoneForPartition();
+        @Override
+        protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
+        {
+            return partition instanceof UnfilteredRowIterator ? Transformation.apply((UnfilteredRowIterator) partition, this)
+                                                              : Transformation.apply((RowIterator) partition, this);
+        }
+
+        // called before we process a given partition
+        protected abstract void applyToPartition(DecoratedKey partitionKey, Row staticRow);
+
+        @Override
+        protected void attachTo(BasePartitions partitions)
+        {
+            if (enforceLimits)
+                super.attachTo(partitions);
+            if (isDone())
+                stop();
+        }
+
+        @Override
+        protected void attachTo(BaseRows rows)
+        {
+            if (enforceLimits)
+                super.attachTo(rows);
+            applyToPartition(rows.partitionKey(), rows.staticRow());
+            if (isDoneForPartition())
+                stopInPartition();
+        }
     }
 
     /**
@@ -173,13 +233,12 @@ public abstract class DataLimits
         protected final int rowLimit;
         protected final int perPartitionLimit;
 
-        // Whether the query is a distinct query or not. This is currently not used by the code but prior experience
-        // shows that keeping the information around is wise and might be useful in the future.
+        // Whether the query is a distinct query or not.
         protected final boolean isDistinct;
 
         private CQLLimits(int rowLimit)
         {
-            this(rowLimit, Integer.MAX_VALUE);
+            this(rowLimit, NO_LIMIT);
         }
 
         private CQLLimits(int rowLimit, int perPartitionLimit)
@@ -199,19 +258,24 @@ public abstract class DataLimits
             return new CQLLimits(rowLimit, 1, true);
         }
 
-        protected Kind kind()
+        public Kind kind()
         {
             return Kind.CQL_LIMIT;
         }
 
         public boolean isUnlimited()
         {
-            return rowLimit == Integer.MAX_VALUE && perPartitionLimit == Integer.MAX_VALUE;
+            return rowLimit == NO_LIMIT && perPartitionLimit == NO_LIMIT;
+        }
+
+        public boolean isDistinct()
+        {
+            return isDistinct;
         }
 
         public DataLimits forPaging(int pageSize)
         {
-            return new CQLLimits(pageSize, perPartitionLimit);
+            return new CQLLimits(pageSize, perPartitionLimit, isDistinct);
         }
 
         public DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
@@ -224,7 +288,7 @@ public abstract class DataLimits
             // When we do a short read retry, we're only ever querying the single partition on which we have a short read. So
             // we use toFetch as the row limit and use no perPartitionLimit (it would be equivalent in practice to use toFetch
             // for both argument or just for perPartitionLimit with no limit on rowLimit).
-            return new CQLLimits(toFetch, Integer.MAX_VALUE, isDistinct);
+            return new CQLLimits(toFetch, NO_LIMIT, isDistinct);
         }
 
         public boolean hasEnoughLiveData(CachedPartition cached, int nowInSec)
@@ -241,13 +305,15 @@ public abstract class DataLimits
                 return false;
 
             // Otherwise, we need to re-count
+
+            DataLimits.Counter counter = newCounter(nowInSec, false);
             try (UnfilteredRowIterator cacheIter = cached.unfilteredIterator(ColumnFilter.selection(cached.columns()), Slices.ALL, false);
-                 CountingUnfilteredRowIterator iter = new CountingUnfilteredRowIterator(cacheIter, newCounter(nowInSec, false)))
+                 UnfilteredRowIterator iter = counter.applyTo(cacheIter))
             {
                 // Consume the iterator until we've counted enough
-                while (iter.hasNext() && !iter.counter().isDone())
+                while (iter.hasNext())
                     iter.next();
-                return iter.counter().isDone();
+                return counter.isDone();
             }
         }
 
@@ -270,11 +336,11 @@ public abstract class DataLimits
         {
             // TODO: we should start storing stats on the number of rows (instead of the number of cells, which
             // is what getMeanColumns returns)
-            float rowsPerPartition = ((float) cfs.getMeanColumns()) / cfs.metadata.partitionColumns().regulars.columnCount();
+            float rowsPerPartition = ((float) cfs.getMeanColumns()) / cfs.metadata.partitionColumns().regulars.size();
             return rowsPerPartition * (cfs.estimateKeys());
         }
 
-        protected class CQLCounter implements Counter
+        protected class CQLCounter extends Counter
         {
             protected final int nowInSec;
             protected final boolean assumeLiveData;
@@ -290,20 +356,39 @@ public abstract class DataLimits
                 this.assumeLiveData = assumeLiveData;
             }
 
-            public void newPartition(DecoratedKey partitionKey, Row staticRow)
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
             {
                 rowInCurrentPartition = 0;
                 if (!staticRow.isEmpty() && (assumeLiveData || staticRow.hasLiveData(nowInSec)))
                     hasLiveStaticRow = true;
             }
 
-            public void endOfPartition()
+            @Override
+            public Row applyToRow(Row row)
+            {
+                if (assumeLiveData || row.hasLiveData(nowInSec))
+                    incrementRowCount();
+                return row;
+            }
+
+            @Override
+            public void onPartitionClose()
             {
                 // Normally, we don't count static rows as from a CQL point of view, it will be merge with other
                 // rows in the partition. However, if we only have the static row, it will be returned as one row
                 // so count it.
                 if (hasLiveStaticRow && rowInCurrentPartition == 0)
-                    ++rowCounted;
+                    incrementRowCount();
+                super.onPartitionClose();
+            }
+
+            private void incrementRowCount()
+            {
+                if (++rowCounted >= rowLimit)
+                    stop();
+                if (++rowInCurrentPartition >= perPartitionLimit)
+                    stopInPartition();
             }
 
             public int counted()
@@ -325,15 +410,6 @@ public abstract class DataLimits
             {
                 return isDone() || rowInCurrentPartition >= perPartitionLimit;
             }
-
-            public void newRow(Row row)
-            {
-                if (assumeLiveData || row.hasLiveData(nowInSec))
-                {
-                    ++rowCounted;
-                    ++rowInCurrentPartition;
-                }
-            }
         }
 
         @Override
@@ -341,14 +417,14 @@ public abstract class DataLimits
         {
             StringBuilder sb = new StringBuilder();
 
-            if (rowLimit != Integer.MAX_VALUE)
+            if (rowLimit != NO_LIMIT)
             {
                 sb.append("LIMIT ").append(rowLimit);
-                if (perPartitionLimit != Integer.MAX_VALUE)
+                if (perPartitionLimit != NO_LIMIT)
                     sb.append(' ');
             }
 
-            if (perPartitionLimit != Integer.MAX_VALUE)
+            if (perPartitionLimit != NO_LIMIT)
                 sb.append("PER PARTITION LIMIT ").append(perPartitionLimit);
 
             return sb.toString();
@@ -368,7 +444,7 @@ public abstract class DataLimits
         }
 
         @Override
-        protected Kind kind()
+        public Kind kind()
         {
             return Kind.CQL_PAGING_LIMIT;
         }
@@ -399,7 +475,7 @@ public abstract class DataLimits
             }
 
             @Override
-            public void newPartition(DecoratedKey partitionKey, Row staticRow)
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
             {
                 if (partitionKey.getKey().equals(lastReturnedKey))
                 {
@@ -412,7 +488,7 @@ public abstract class DataLimits
                 }
                 else
                 {
-                    super.newPartition(partitionKey, staticRow);
+                    super.applyToPartition(partitionKey, staticRow);
                 }
             }
         }
@@ -432,14 +508,19 @@ public abstract class DataLimits
             this.cellPerPartitionLimit = cellPerPartitionLimit;
         }
 
-        protected Kind kind()
+        public Kind kind()
         {
             return Kind.THRIFT_LIMIT;
         }
 
         public boolean isUnlimited()
         {
-            return partitionLimit == Integer.MAX_VALUE && cellPerPartitionLimit == Integer.MAX_VALUE;
+            return partitionLimit == NO_LIMIT && cellPerPartitionLimit == NO_LIMIT;
+        }
+
+        public boolean isDistinct()
+        {
+            return false;
         }
 
         public DataLimits forPaging(int pageSize)
@@ -478,13 +559,14 @@ public abstract class DataLimits
                 return false;
 
             // Otherwise, we need to re-count
+            DataLimits.Counter counter = newCounter(nowInSec, false);
             try (UnfilteredRowIterator cacheIter = cached.unfilteredIterator(ColumnFilter.selection(cached.columns()), Slices.ALL, false);
-                 CountingUnfilteredRowIterator iter = new CountingUnfilteredRowIterator(cacheIter, newCounter(nowInSec, false)))
+                 UnfilteredRowIterator iter = counter.applyTo(cacheIter))
             {
                 // Consume the iterator until we've counted enough
-                while (iter.hasNext() && !iter.counter().isDone())
+                while (iter.hasNext())
                     iter.next();
-                return iter.counter().isDone();
+                return counter.isDone();
             }
         }
 
@@ -506,11 +588,11 @@ public abstract class DataLimits
         public float estimateTotalResults(ColumnFamilyStore cfs)
         {
             // remember that getMeansColumns returns a number of cells: we should clean nomenclature
-            float cellsPerPartition = ((float) cfs.getMeanColumns()) / cfs.metadata.partitionColumns().regulars.columnCount();
+            float cellsPerPartition = ((float) cfs.getMeanColumns()) / cfs.metadata.partitionColumns().regulars.size();
             return cellsPerPartition * cfs.estimateKeys();
         }
 
-        protected class ThriftCounter implements Counter
+        protected class ThriftCounter extends Counter
         {
             protected final int nowInSec;
             protected final boolean assumeLiveData;
@@ -525,16 +607,35 @@ public abstract class DataLimits
                 this.assumeLiveData = assumeLiveData;
             }
 
-            public void newPartition(DecoratedKey partitionKey, Row staticRow)
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
             {
                 cellsInCurrentPartition = 0;
                 if (!staticRow.isEmpty())
-                    newRow(staticRow);
+                    applyToRow(staticRow);
             }
 
-            public void endOfPartition()
+            @Override
+            public Row applyToRow(Row row)
             {
-                ++partitionsCounted;
+                for (Cell cell : row.cells())
+                {
+                    if (assumeLiveData || cell.isLive(nowInSec))
+                    {
+                        ++cellsCounted;
+                        if (++cellsInCurrentPartition >= cellPerPartitionLimit)
+                            stopInPartition();
+                    }
+                }
+                return row;
+            }
+
+            @Override
+            public void onPartitionClose()
+            {
+                if (++partitionsCounted >= partitionLimit)
+                    stop();
+                super.onPartitionClose();
             }
 
             public int counted()
@@ -556,18 +657,6 @@ public abstract class DataLimits
             {
                 return isDone() || cellsInCurrentPartition >= cellPerPartitionLimit;
             }
-
-            public void newRow(Row row)
-            {
-                for (Cell cell : row.cells())
-                {
-                    if (assumeLiveData || cell.isLive(nowInSec))
-                    {
-                        ++cellsCounted;
-                        ++cellsInCurrentPartition;
-                    }
-                }
-            }
         }
 
         @Override
@@ -588,7 +677,7 @@ public abstract class DataLimits
             super(partitionLimit, cellPerPartitionLimit);
         }
 
-        protected Kind kind()
+        public Kind kind()
         {
             return Kind.SUPER_COLUMN_COUNTING_LIMIT;
         }
@@ -622,14 +711,17 @@ public abstract class DataLimits
                 super(nowInSec, assumeLiveData);
             }
 
-            public void newRow(Row row)
+            @Override
+            public Row applyToRow(Row row)
             {
                 // In the internal format, a row == a super column, so that's what we want to count.
                 if (assumeLiveData || row.hasLiveData(nowInSec))
                 {
                     ++cellsCounted;
-                    ++cellsInCurrentPartition;
+                    if (++cellsInCurrentPartition >= cellPerPartitionLimit)
+                        stopInPartition();
                 }
+                return row;
             }
         }
     }
@@ -644,21 +736,21 @@ public abstract class DataLimits
                 case CQL_LIMIT:
                 case CQL_PAGING_LIMIT:
                     CQLLimits cqlLimits = (CQLLimits)limits;
-                    out.writeVInt(cqlLimits.rowLimit);
-                    out.writeVInt(cqlLimits.perPartitionLimit);
+                    out.writeUnsignedVInt(cqlLimits.rowLimit);
+                    out.writeUnsignedVInt(cqlLimits.perPartitionLimit);
                     out.writeBoolean(cqlLimits.isDistinct);
                     if (limits.kind() == Kind.CQL_PAGING_LIMIT)
                     {
                         CQLPagingLimits pagingLimits = (CQLPagingLimits)cqlLimits;
                         ByteBufferUtil.writeWithVIntLength(pagingLimits.lastReturnedKey, out);
-                        out.writeVInt(pagingLimits.lastReturnedKeyRemaining);
+                        out.writeUnsignedVInt(pagingLimits.lastReturnedKeyRemaining);
                     }
                     break;
                 case THRIFT_LIMIT:
                 case SUPER_COLUMN_COUNTING_LIMIT:
                     ThriftLimits thriftLimits = (ThriftLimits)limits;
-                    out.writeVInt(thriftLimits.partitionLimit);
-                    out.writeVInt(thriftLimits.cellPerPartitionLimit);
+                    out.writeUnsignedVInt(thriftLimits.partitionLimit);
+                    out.writeUnsignedVInt(thriftLimits.cellPerPartitionLimit);
                     break;
             }
         }
@@ -670,19 +762,19 @@ public abstract class DataLimits
             {
                 case CQL_LIMIT:
                 case CQL_PAGING_LIMIT:
-                    int rowLimit = (int)in.readVInt();
-                    int perPartitionLimit = (int)in.readVInt();
+                    int rowLimit = (int)in.readUnsignedVInt();
+                    int perPartitionLimit = (int)in.readUnsignedVInt();
                     boolean isDistinct = in.readBoolean();
                     if (kind == Kind.CQL_LIMIT)
                         return new CQLLimits(rowLimit, perPartitionLimit, isDistinct);
 
                     ByteBuffer lastKey = ByteBufferUtil.readWithVIntLength(in);
-                    int lastRemaining = (int)in.readVInt();
+                    int lastRemaining = (int)in.readUnsignedVInt();
                     return new CQLPagingLimits(rowLimit, perPartitionLimit, isDistinct, lastKey, lastRemaining);
                 case THRIFT_LIMIT:
                 case SUPER_COLUMN_COUNTING_LIMIT:
-                    int partitionLimit = (int)in.readVInt();
-                    int cellPerPartitionLimit = (int)in.readVInt();
+                    int partitionLimit = (int)in.readUnsignedVInt();
+                    int cellPerPartitionLimit = (int)in.readUnsignedVInt();
                     return kind == Kind.THRIFT_LIMIT
                          ? new ThriftLimits(partitionLimit, cellPerPartitionLimit)
                          : new SuperColumnCountingLimits(partitionLimit, cellPerPartitionLimit);
@@ -698,21 +790,21 @@ public abstract class DataLimits
                 case CQL_LIMIT:
                 case CQL_PAGING_LIMIT:
                     CQLLimits cqlLimits = (CQLLimits)limits;
-                    size += TypeSizes.sizeofVInt(cqlLimits.rowLimit);
-                    size += TypeSizes.sizeofVInt(cqlLimits.perPartitionLimit);
+                    size += TypeSizes.sizeofUnsignedVInt(cqlLimits.rowLimit);
+                    size += TypeSizes.sizeofUnsignedVInt(cqlLimits.perPartitionLimit);
                     size += TypeSizes.sizeof(cqlLimits.isDistinct);
                     if (limits.kind() == Kind.CQL_PAGING_LIMIT)
                     {
                         CQLPagingLimits pagingLimits = (CQLPagingLimits)cqlLimits;
                         size += ByteBufferUtil.serializedSizeWithVIntLength(pagingLimits.lastReturnedKey);
-                        size += TypeSizes.sizeofVInt(pagingLimits.lastReturnedKeyRemaining);
+                        size += TypeSizes.sizeofUnsignedVInt(pagingLimits.lastReturnedKeyRemaining);
                     }
                     break;
                 case THRIFT_LIMIT:
                 case SUPER_COLUMN_COUNTING_LIMIT:
                     ThriftLimits thriftLimits = (ThriftLimits)limits;
-                    size += TypeSizes.sizeofVInt(thriftLimits.partitionLimit);
-                    size += TypeSizes.sizeofVInt(thriftLimits.cellPerPartitionLimit);
+                    size += TypeSizes.sizeofUnsignedVInt(thriftLimits.partitionLimit);
+                    size += TypeSizes.sizeofUnsignedVInt(thriftLimits.cellPerPartitionLimit);
                     break;
                 default:
                     throw new AssertionError();

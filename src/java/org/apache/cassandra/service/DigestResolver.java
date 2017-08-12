@@ -38,7 +38,7 @@ public class DigestResolver extends ResponseResolver
     public void preprocess(MessageIn<ReadResponse> message)
     {
         super.preprocess(message);
-        if (dataResponse == null && !message.payload.isDigestQuery())
+        if (dataResponse == null && !message.payload.isDigestResponse())
             dataResponse = message.payload;
     }
 
@@ -48,7 +48,7 @@ public class DigestResolver extends ResponseResolver
     public PartitionIterator getData()
     {
         assert isDataPresent();
-        return UnfilteredPartitionIterators.filter(dataResponse.makeIterator(command.metadata()), command.nowInSec());
+        return UnfilteredPartitionIterators.filter(dataResponse.makeIterator(command), command.nowInSec());
     }
 
     /*
@@ -66,8 +66,8 @@ public class DigestResolver extends ResponseResolver
         if (responses.size() == 1)
             return getData();
 
-        if (logger.isDebugEnabled())
-            logger.debug("resolving {} responses", responses.size());
+        if (logger.isTraceEnabled())
+            logger.trace("resolving {} responses", responses.size());
 
         long start = System.nanoTime();
 
@@ -77,7 +77,7 @@ public class DigestResolver extends ResponseResolver
         {
             ReadResponse response = message.payload;
 
-            ByteBuffer newDigest = response.digest(command.metadata());
+            ByteBuffer newDigest = response.digest(command);
             if (digest == null)
                 digest = newDigest;
             else if (!digest.equals(newDigest))
@@ -85,10 +85,10 @@ public class DigestResolver extends ResponseResolver
                 throw new DigestMismatchException(((SinglePartitionReadCommand)command).partitionKey(), digest, newDigest);
         }
 
-        if (logger.isDebugEnabled())
-            logger.debug("resolve: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+        if (logger.isTraceEnabled())
+            logger.trace("resolve: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
 
-        return UnfilteredPartitionIterators.filter(dataResponse.makeIterator(command.metadata()), command.nowInSec());
+        return UnfilteredPartitionIterators.filter(dataResponse.makeIterator(command), command.nowInSec());
     }
 
     public boolean isDataPresent()

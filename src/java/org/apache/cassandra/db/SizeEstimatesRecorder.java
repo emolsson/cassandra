@@ -28,9 +28,11 @@ import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.service.MigrationListener;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Refs;
 
@@ -57,17 +59,18 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
 
     public void run()
     {
-        if (StorageService.instance.isStarting())
+        TokenMetadata metadata = StorageService.instance.getTokenMetadata().cloneOnlyTokenMap();
+        if (!metadata.isMember(FBUtilities.getBroadcastAddress()))
         {
-            logger.debug("Node has not yet joined; not recording size estimates");
+            logger.debug("Node is not part of the ring; not recording size estimates");
             return;
         }
 
-        logger.debug("Recording size estimates");
+        logger.trace("Recording size estimates");
 
         // find primary token ranges for the local node.
         Collection<Token> localTokens = StorageService.instance.getLocalTokens();
-        Collection<Range<Token>> localRanges = StorageService.instance.getTokenMetadata().getPrimaryRangesFor(localTokens);
+        Collection<Range<Token>> localRanges = metadata.getPrimaryRangesFor(localTokens);
 
         for (Keyspace keyspace : Keyspace.nonSystem())
         {
@@ -76,7 +79,7 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
                 long start = System.nanoTime();
                 recordSizeEstimates(table, localRanges);
                 long passed = System.nanoTime() - start;
-                logger.debug("Spent {} milliseconds on estimating {}.{} size",
+                logger.trace("Spent {} milliseconds on estimating {}.{} size",
                              TimeUnit.NANOSECONDS.toMillis(passed),
                              table.metadata.ksName,
                              table.metadata.cfName);
@@ -87,9 +90,10 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
     @SuppressWarnings("resource")
     private void recordSizeEstimates(ColumnFamilyStore table, Collection<Range<Token>> localRanges)
     {
+        List<Range<Token>> unwrappedRanges = Range.normalize(localRanges);
         // for each local primary range, estimate (crudely) mean partition size and partitions count.
         Map<Range<Token>, Pair<Long, Long>> estimates = new HashMap<>(localRanges.size());
-        for (Range<Token> range : localRanges)
+        for (Range<Token> range : unwrappedRanges)
         {
             // filter sstables that have partitions in this range.
             Refs<SSTableReader> refs = null;

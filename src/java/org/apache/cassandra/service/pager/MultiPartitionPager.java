@@ -17,9 +17,7 @@
  */
 package org.apache.cassandra.service.pager;
 
-import java.util.List;
-
-import com.google.common.collect.AbstractIterator;
+import org.apache.cassandra.utils.AbstractIterator;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
@@ -53,7 +51,7 @@ public class MultiPartitionPager implements QueryPager
     private int remaining;
     private int current;
 
-    public MultiPartitionPager(SinglePartitionReadCommand.Group group, PagingState state)
+    public MultiPartitionPager(SinglePartitionReadCommand.Group group, PagingState state, int protocolVersion)
     {
         this.limit = group.limits();
         this.nowInSec = group.nowInSec();
@@ -74,11 +72,11 @@ public class MultiPartitionPager implements QueryPager
 
         pagers = new SinglePartitionPager[group.commands.size() - i];
         // 'i' is on the first non exhausted pager for the previous page (or the first one)
-        pagers[0] = group.commands.get(i).getPager(state);
+        pagers[0] = group.commands.get(i).getPager(state, protocolVersion);
 
         // Following ones haven't been started yet
         for (int j = i + 1; j < group.commands.size(); j++)
-            pagers[j - i] = group.commands.get(j).getPager(null);
+            pagers[j - i] = group.commands.get(j).getPager(null, protocolVersion);
 
         remaining = state == null ? limit.count() : state.remaining;
     }
@@ -90,7 +88,7 @@ public class MultiPartitionPager implements QueryPager
             return null;
 
         PagingState state = pagers[current].state();
-        return new PagingState(pagers[current].key(), state == null ? null : state.cellName, remaining, Integer.MAX_VALUE);
+        return new PagingState(pagers[current].key(), state == null ? null : state.rowMark, remaining, Integer.MAX_VALUE);
     }
 
     public boolean isExhausted()
@@ -108,35 +106,36 @@ public class MultiPartitionPager implements QueryPager
         return true;
     }
 
-    public ReadOrderGroup startOrderGroup()
+    public ReadExecutionController executionController()
     {
         // Note that for all pagers, the only difference is the partition key to which it applies, so in practice we
         // can use any of the sub-pager ReadOrderGroup group to protect the whole pager
         for (int i = current; i < pagers.length; i++)
         {
             if (pagers[i] != null)
-                return pagers[i].startOrderGroup();
+                return pagers[i].executionController();
         }
         throw new AssertionError("Shouldn't be called on an exhausted pager");
     }
 
-    @SuppressWarnings("resource")
+    @SuppressWarnings("resource") // iter closed via countingIter
     public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState) throws RequestValidationException, RequestExecutionException
     {
         int toQuery = Math.min(remaining, pageSize);
         PagersIterator iter = new PagersIterator(toQuery, consistency, clientState, null);
-        CountingPartitionIterator countingIter = new CountingPartitionIterator(iter, limit.forPaging(toQuery), nowInSec);
-        iter.setCounter(countingIter.counter());
-        return countingIter;
+        DataLimits.Counter counter = limit.forPaging(toQuery).newCounter(nowInSec, true);
+        iter.setCounter(counter);
+        return counter.applyTo(iter);
     }
 
-    public PartitionIterator fetchPageInternal(int pageSize, ReadOrderGroup orderGroup) throws RequestValidationException, RequestExecutionException
+    @SuppressWarnings("resource") // iter closed via countingIter
+    public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController) throws RequestValidationException, RequestExecutionException
     {
         int toQuery = Math.min(remaining, pageSize);
-        PagersIterator iter = new PagersIterator(toQuery, null, null, orderGroup);
-        CountingPartitionIterator countingIter = new CountingPartitionIterator(iter, limit.forPaging(toQuery), nowInSec);
-        iter.setCounter(countingIter.counter());
-        return countingIter;
+        PagersIterator iter = new PagersIterator(toQuery, null, null, executionController);
+        DataLimits.Counter counter = limit.forPaging(toQuery).newCounter(nowInSec, true);
+        iter.setCounter(counter);
+        return counter.applyTo(iter);
     }
 
     private class PagersIterator extends AbstractIterator<RowIterator> implements PartitionIterator
@@ -150,14 +149,14 @@ public class MultiPartitionPager implements QueryPager
         private final ClientState clientState;
 
         // For internal queries
-        private final ReadOrderGroup orderGroup;
+        private final ReadExecutionController executionController;
 
-        public PagersIterator(int pageSize, ConsistencyLevel consistency, ClientState clientState, ReadOrderGroup orderGroup)
+        public PagersIterator(int pageSize, ConsistencyLevel consistency, ClientState clientState, ReadExecutionController executionController)
         {
             this.pageSize = pageSize;
             this.consistency = consistency;
             this.clientState = clientState;
-            this.orderGroup = orderGroup;
+            this.executionController = executionController;
         }
 
         public void setCounter(DataLimits.Counter counter)
@@ -169,16 +168,16 @@ public class MultiPartitionPager implements QueryPager
         {
             while (result == null || !result.hasNext())
             {
+                if (result != null)
+                    result.close();
+
                 // This sets us on the first non-exhausted pager
                 if (isExhausted())
                     return endOfData();
 
-                if (result != null)
-                    result.close();
-
                 int toQuery = pageSize - counter.counted();
                 result = consistency == null
-                       ? pagers[current].fetchPageInternal(toQuery, orderGroup)
+                       ? pagers[current].fetchPageInternal(toQuery, executionController)
                        : pagers[current].fetchPage(toQuery, consistency, clientState);
             }
             return result.next();

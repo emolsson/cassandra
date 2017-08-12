@@ -25,12 +25,14 @@ import java.util.*;
 
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.statements.CFStatement;
 import org.apache.cassandra.cql3.statements.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.cql3.statements.UpdateStatement;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -39,6 +41,7 @@ import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.schema.Types;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.Pair;
 
@@ -206,7 +209,7 @@ public class CQLSSTableWriter implements Closeable
 
         QueryOptions options = QueryOptions.forInternalCalls(null, values);
         List<ByteBuffer> keys = insert.buildPartitionKeyNames(options);
-        CBuilder clustering = insert.createClustering(options);
+        SortedSet<Clustering> clusterings = insert.createClustering(options);
 
         long now = System.currentTimeMillis() * 1000;
         // Note that we asks indexes to not validate values (the last 'false' arg below) because that triggers a 'Keyspace.open'
@@ -216,13 +219,15 @@ public class CQLSSTableWriter implements Closeable
                                                        options,
                                                        insert.getTimestamp(now, options),
                                                        insert.getTimeToLive(options),
-                                                       Collections.<DecoratedKey, Partition>emptyMap(),
-                                                       false);
+                                                       Collections.<DecoratedKey, Partition>emptyMap());
 
         try
         {
             for (ByteBuffer key : keys)
-                insert.addUpdateForKey(writer.getUpdateFor(key), clustering, params);
+            {
+                for (Clustering clustering : clusterings)
+                    insert.addUpdateForKey(writer.getUpdateFor(key), clustering, params);
+            }
             return this;
         }
         catch (SSTableSimpleUnsortedWriter.SyncException e)
@@ -345,7 +350,7 @@ public class CQLSSTableWriter implements Closeable
             {
                 synchronized (CQLSSTableWriter.class)
                 {
-                    this.schema = getStatement(schema, CreateTableStatement.class, "CREATE TABLE").left.getCFMetaData();
+                    this.schema = getTableMetadata(schema);
 
                     // We need to register the keyspace/table metadata through Schema, otherwise we won't be able to properly
                     // build the insert statement in using().
@@ -432,6 +437,8 @@ public class CQLSSTableWriter implements Closeable
             this.boundNames = p.right;
             if (this.insert.hasConditions())
                 throw new IllegalArgumentException("Conditional statements are not supported");
+            if (this.insert.isCounter())
+                throw new IllegalArgumentException("Counter update statements are not supported");
             if (this.boundNames.isEmpty())
                 throw new IllegalArgumentException("Provided insert statement has no bind variables");
             return this;
@@ -477,6 +484,16 @@ public class CQLSSTableWriter implements Closeable
         {
             this.sorted = true;
             return this;
+        }
+
+        private static CFMetaData getTableMetadata(String schema)
+        {
+            CFStatement parsed = (CFStatement)QueryProcessor.parseStatement(schema);
+            // tables with UDTs are currently not supported by CQLSSTableWrite, so we just use Types.none(), for now
+            // see CASSANDRA-10624 for more details
+            CreateTableStatement statement = (CreateTableStatement) ((CreateTableStatement.RawStatement) parsed).prepare(Types.none()).statement;
+            statement.validate(ClientState.forInternalCalls());
+            return statement.getCFMetaData();
         }
 
         private static <T extends CQLStatement> Pair<T, List<ColumnSpecification>> getStatement(String query, Class<T> klass, String type)

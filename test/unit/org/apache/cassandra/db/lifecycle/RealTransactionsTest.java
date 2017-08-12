@@ -20,13 +20,11 @@ package org.apache.cassandra.db.lifecycle;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.commons.lang3.StringUtils;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -34,10 +32,8 @@ import junit.framework.Assert;
 import org.apache.cassandra.MockSchema;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
@@ -50,7 +46,6 @@ import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
@@ -89,10 +84,11 @@ public class RealTransactionsTest extends SchemaLoader
         SSTableReader oldSSTable = getSSTable(cfs, 1);
         LifecycleTransaction txn = cfs.getTracker().tryModify(oldSSTable, OperationType.COMPACTION);
         SSTableReader newSSTable = replaceSSTable(cfs, txn, false);
-        TransactionLogs.waitForDeletions();
+        LogTransaction.waitForDeletions();
 
-        assertFiles(txn.logs().getDataFolder(), new HashSet<>(newSSTable.getAllFilePaths()));
-        assertFiles(txn.logs().getLogsFolder(), Collections.<String>emptySet());
+        // both sstables are in the same folder
+        assertFiles(oldSSTable.descriptor.directory.getPath(), new HashSet<>(newSSTable.getAllFilePaths()));
+        assertFiles(newSSTable.descriptor.directory.getPath(), new HashSet<>(newSSTable.getAllFilePaths()));
     }
 
     @Test
@@ -105,10 +101,9 @@ public class RealTransactionsTest extends SchemaLoader
         LifecycleTransaction txn = cfs.getTracker().tryModify(oldSSTable, OperationType.COMPACTION);
 
         replaceSSTable(cfs, txn, true);
-        TransactionLogs.waitForDeletions();
+        LogTransaction.waitForDeletions();
 
-        assertFiles(txn.logs().getDataFolder(), new HashSet<>(oldSSTable.getAllFilePaths()));
-        assertFiles(txn.logs().getLogsFolder(), Collections.<String>emptySet());
+        assertFiles(oldSSTable.descriptor.directory.getPath(), new HashSet<>(oldSSTable.getAllFilePaths()));
     }
 
     @Test
@@ -120,11 +115,6 @@ public class RealTransactionsTest extends SchemaLoader
         SSTableReader ssTableReader = getSSTable(cfs, 100);
 
         String dataFolder = cfs.getLiveSSTables().iterator().next().descriptor.directory.getPath();
-        String transactionLogsFolder = StringUtils.join(dataFolder, File.separator, Directories.TRANSACTIONS_SUBDIR);
-
-        assertTrue(new File(transactionLogsFolder).exists());
-        assertFiles(transactionLogsFolder, Collections.<String>emptySet());
-
         assertFiles(dataFolder, new HashSet<>(ssTableReader.getAllFilePaths()));
     }
 
@@ -141,11 +131,11 @@ public class RealTransactionsTest extends SchemaLoader
     {
         cfs.truncateBlocking();
 
-        String schema = "CREATE TABLE %s.%s (key ascii, name ascii, val ascii, val1 ascii, PRIMARY KEY (key, name))";
-        String query = "INSERT INTO %s.%s (key, name, val) VALUES (?, ?, ?)";
+        String schema = "CREATE TABLE \"%s\".\"%s\" (key ascii, name ascii, val ascii, val1 ascii, PRIMARY KEY (key, name))";
+        String query = "INSERT INTO \"%s\".\"%s\" (key, name, val) VALUES (?, ?, ?)";
 
         try (CQLSSTableWriter writer = CQLSSTableWriter.builder()
-                                                       .inDirectory(cfs.directories.getDirectoryForNewSSTables())
+                                                       .inDirectory(cfs.getDirectories().getDirectoryForNewSSTables())
                                                        .forTable(String.format(schema, cfs.keyspace.getName(), cfs.name))
                                                        .using(String.format(query, cfs.keyspace.getName(), cfs.name))
                                                        .build())
@@ -163,7 +153,7 @@ public class RealTransactionsTest extends SchemaLoader
         int nowInSec = FBUtilities.nowInSeconds();
         try (CompactionController controller = new CompactionController(cfs, txn.originals(), cfs.gcBefore(FBUtilities.nowInSeconds())))
         {
-            try (SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false);
+            try (SSTableRewriter rewriter = SSTableRewriter.constructKeepingOriginals(txn, false, 1000);
                  AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(txn.originals());
                  CompactionIterator ci = new CompactionIterator(txn.opType(), scanners.scanners, controller, nowInSec, txn.opId())
             )
@@ -178,6 +168,7 @@ public class RealTransactionsTest extends SchemaLoader
                                                            0,
                                                            0,
                                                            SerializationHeader.make(cfs.metadata, txn.originals()),
+                                                           cfs.indexManager.listIndexes(),
                                                            txn));
                 while (ci.hasNext())
                 {

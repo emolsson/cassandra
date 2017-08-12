@@ -18,7 +18,6 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -163,7 +162,7 @@ public abstract class CBuilder
             built = true;
 
             // Currently, only dense table can leave some clustering column out (see #7990)
-            return size == 0 ? Clustering.EMPTY : new Clustering(values);
+            return size == 0 ? Clustering.EMPTY : Clustering.make(values);
         }
 
         public Slice.Bound buildBound(boolean isStart, boolean isInclusive)
@@ -193,22 +192,22 @@ public abstract class CBuilder
 
         public Clustering buildWith(ByteBuffer value)
         {
-            assert size+1 == type.size();
+            assert size+1 <= type.size();
 
-            ByteBuffer[] newValues = Arrays.copyOf(values, size+1);
+            ByteBuffer[] newValues = Arrays.copyOf(values, type.size());
             newValues[size] = value;
-            return new Clustering(newValues);
+            return Clustering.make(newValues);
         }
 
         public Clustering buildWith(List<ByteBuffer> newValues)
         {
-            assert size + newValues.size() == type.size();
-            ByteBuffer[] buffers = Arrays.copyOf(values, size + newValues.size());
+            assert size + newValues.size() <= type.size();
+            ByteBuffer[] buffers = Arrays.copyOf(values, type.size());
             int newSize = size;
             for (ByteBuffer value : newValues)
                 buffers[newSize++] = value;
 
-            return new Clustering(buffers);
+            return Clustering.make(buffers);
         }
 
         public Slice.Bound buildBoundWith(ByteBuffer value, boolean isStart, boolean isInclusive)

@@ -45,6 +45,17 @@ public interface CompactionManagerMBean
     public void forceUserDefinedCompaction(String dataFiles);
 
     /**
+     * Triggers the cleanup of user specified sstables.
+     * You can specify files from various keyspaces and columnfamilies.
+     * If you do so, cleanup is performed each file individually
+     *
+     * @param dataFiles a comma separated list of sstable file to cleanup.
+     *                  must contain keyspace and columnfamily name in path(for 2.1+) or file name itself.
+     */
+    public void forceUserDefinedCleanup(String dataFiles);
+
+
+    /**
      * Stop all running compaction-like tasks having the provided {@code type}.
      * @param type the type of compaction to stop. Can be one of:
      *   - COMPACTION
@@ -58,7 +69,8 @@ public interface CompactionManagerMBean
     /**
      * Stop an individual running compaction using the compactionId.
      * @param compactionId Compaction ID of compaction to stop. Such IDs can be found in
-     *                     the compactions_in_progress table of the system keyspace.
+     *                     the transaction log files whose name starts with compaction_,
+     *                     located in the table transactions folder.
      */
     public void stopCompactionById(String compactionId);
 

@@ -17,49 +17,52 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.File;
 import java.util.*;
-import java.util.concurrent.ConcurrentNavigableMap;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.io.sstable.SSTableTxnWriter;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.ReplayPosition;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
-import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
-import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.SSTableTxnWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.io.util.DiskAwareRunnable;
 import org.apache.cassandra.service.ActiveRepairService;
-import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import org.apache.cassandra.utils.memory.*;
+import org.apache.cassandra.utils.memory.HeapAllocator;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.apache.cassandra.utils.memory.MemtablePool;
 
 public class Memtable implements Comparable<Memtable>
 {
     private static final Logger logger = LoggerFactory.getLogger(Memtable.class);
 
-    static final MemtablePool MEMORY_POOL = DatabaseDescriptor.getMemtableAllocatorPool();
+    public static final MemtablePool MEMORY_POOL = DatabaseDescriptor.getMemtableAllocatorPool();
     private static final int ROW_OVERHEAD_HEAP_SIZE = estimateRowOverhead(Integer.parseInt(System.getProperty("cassandra.memtable_row_overhead_computation_step", "100000")));
 
     private final MemtableAllocator allocator;
@@ -92,6 +95,9 @@ public class Memtable implements Comparable<Memtable>
     public final ColumnFamilyStore cfs;
     private final long creationTime = System.currentTimeMillis();
     private final long creationNano = System.nanoTime();
+
+    // The smallest timestamp for all partitions stored in this memtable
+    private long minTimestamp = Long.MAX_VALUE;
 
     // Record the comparator of the CFS at the creation of the memtable. This
     // is only used when a user update the CF comparator, to know if the
@@ -199,7 +205,7 @@ public class Memtable implements Comparable<Memtable>
      */
     public boolean isExpired()
     {
-        int period = cfs.metadata.getMemtableFlushPeriod();
+        int period = cfs.metadata.params.memtableFlushPeriodInMs;
         return period > 0 && (System.nanoTime() - creationNano >= TimeUnit.MILLISECONDS.toNanos(period));
     }
 
@@ -209,7 +215,7 @@ public class Memtable implements Comparable<Memtable>
      *
      * replayPosition should only be null if this is a secondary index, in which case it is *expected* to be null
      */
-    long put(PartitionUpdate update, SecondaryIndexManager.Updater indexer, OpOrder.Group opGroup)
+    long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         AtomicBTreePartition previous = partitions.get(update.partitionKey());
 
@@ -236,6 +242,7 @@ public class Memtable implements Comparable<Memtable>
         }
 
         long[] pair = previous.addAllWithSizeDelta(update, opGroup, indexer);
+        minTimestamp = Math.min(minTimestamp, previous.stats().minTimestamp);
         liveDataSize.addAndGet(initialSize + pair[0]);
         columnsCollector.update(update.columns());
         statsCollector.update(update.stats());
@@ -248,9 +255,32 @@ public class Memtable implements Comparable<Memtable>
         return partitions.size();
     }
 
-    public FlushRunnable flushRunnable()
+    public List<FlushRunnable> flushRunnables(LifecycleTransaction txn)
     {
-        return new FlushRunnable(lastReplayPosition.get());
+        List<Range<Token>> localRanges = Range.sort(StorageService.instance.getLocalRanges(cfs.keyspace.getName()));
+
+        if (!cfs.getPartitioner().splitter().isPresent() || localRanges.isEmpty())
+            return Collections.singletonList(new FlushRunnable(lastReplayPosition.get(), txn));
+
+        return createFlushRunnables(localRanges, txn);
+    }
+
+    private List<FlushRunnable> createFlushRunnables(List<Range<Token>> localRanges, LifecycleTransaction txn)
+    {
+        assert cfs.getPartitioner().splitter().isPresent();
+
+        Directories.DataDirectory[] locations = cfs.getDirectories().getWriteableLocations();
+        List<PartitionPosition> boundaries = StorageService.getDiskBoundaries(localRanges, cfs.getPartitioner(), locations);
+        List<FlushRunnable> runnables = new ArrayList<>(boundaries.size());
+        PartitionPosition rangeStart = cfs.getPartitioner().getMinimumToken().minKeyBound();
+        ReplayPosition context = lastReplayPosition.get();
+        for (int i = 0; i < boundaries.size(); i++)
+        {
+            PartitionPosition t = boundaries.get(i);
+            runnables.add(new FlushRunnable(context, rangeStart, t, locations[i], txn));
+            rangeStart = t;
+        }
+        return runnables;
     }
 
     public String toString()
@@ -260,7 +290,7 @@ public class Memtable implements Comparable<Memtable>
                              100 * allocator.onHeap().ownershipRatio(), 100 * allocator.offHeap().ownershipRatio());
     }
 
-    public UnfilteredPartitionIterator makePartitionIterator(final ColumnFilter columnFilter, final DataRange dataRange, final boolean isForThrift)
+    public MemtableUnfilteredPartitionIterator makePartitionIterator(final ColumnFilter columnFilter, final DataRange dataRange, final boolean isForThrift)
     {
         AbstractBounds<PartitionPosition> keyRange = dataRange.keyRange();
 
@@ -278,35 +308,26 @@ public class Memtable implements Comparable<Memtable>
                    ? partitions.tailMap(keyRange.left, includeStart)
                    : partitions.subMap(keyRange.left, includeStart, keyRange.right, includeStop);
 
+        int minLocalDeletionTime = Integer.MAX_VALUE;
+
+        // avoid iterating over the memtable if we purge all tombstones
+        if (cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
+            minLocalDeletionTime = findMinLocalDeletionTime(subMap.entrySet().iterator());
+
         final Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iter = subMap.entrySet().iterator();
 
-        return new AbstractUnfilteredPartitionIterator()
+        return new MemtableUnfilteredPartitionIterator(cfs, iter, isForThrift, minLocalDeletionTime, columnFilter, dataRange);
+    }
+
+    private int findMinLocalDeletionTime(Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iterator)
+    {
+        int minLocalDeletionTime = Integer.MAX_VALUE;
+        while (iterator.hasNext())
         {
-            public boolean isForThrift()
-            {
-                return isForThrift;
-            }
-
-            public CFMetaData metadata()
-            {
-                return cfs.metadata;
-            }
-
-            public boolean hasNext()
-            {
-                return iter.hasNext();
-            }
-
-            public UnfilteredRowIterator next()
-            {
-                Map.Entry<PartitionPosition, AtomicBTreePartition> entry = iter.next();
-                // Actual stored key should be true DecoratedKey
-                assert entry.getKey() instanceof DecoratedKey;
-                DecoratedKey key = (DecoratedKey)entry.getKey();
-                ClusteringIndexFilter filter = dataRange.clusteringIndexFilter(key);
-                return filter.getUnfilteredRowIterator(columnFilter, entry.getValue());
-            }
-        };
+            Map.Entry<PartitionPosition, AtomicBTreePartition> entry = iterator.next();
+            minLocalDeletionTime = Math.min(minLocalDeletionTime, entry.getValue().stats().minLocalDeletionTime);
+        }
+        return minLocalDeletionTime;
     }
 
     public Partition getPartition(DecoratedKey key)
@@ -319,126 +340,124 @@ public class Memtable implements Comparable<Memtable>
         return creationTime;
     }
 
-    class FlushRunnable extends DiskAwareRunnable
+    public long getMinTimestamp()
     {
-        private final ReplayPosition context;
+        return minTimestamp;
+    }
+
+    class FlushRunnable implements Callable<SSTableMultiWriter>
+    {
+        public final ReplayPosition context;
         private final long estimatedSize;
+        private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> toFlush;
 
         private final boolean isBatchLogTable;
+        private final SSTableMultiWriter writer;
 
-        FlushRunnable(ReplayPosition context)
+        // keeping these to be able to log what we are actually flushing
+        private final PartitionPosition from;
+        private final PartitionPosition to;
+
+        FlushRunnable(ReplayPosition context, PartitionPosition from, PartitionPosition to, Directories.DataDirectory flushLocation, LifecycleTransaction txn)
+        {
+            this(context, partitions.subMap(from, to), flushLocation, from, to, txn);
+        }
+
+        FlushRunnable(ReplayPosition context, LifecycleTransaction txn)
+        {
+            this(context, partitions, null, null, null, txn);
+        }
+
+        FlushRunnable(ReplayPosition context, ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> toFlush, Directories.DataDirectory flushLocation, PartitionPosition from, PartitionPosition to, LifecycleTransaction txn)
         {
             this.context = context;
-
+            this.toFlush = toFlush;
+            this.from = from;
+            this.to = to;
             long keySize = 0;
-            for (PartitionPosition key : partitions.keySet())
+            for (PartitionPosition key : toFlush.keySet())
             {
                 //  make sure we don't write non-sensical keys
                 assert key instanceof DecoratedKey;
-                keySize += ((DecoratedKey)key).getKey().remaining();
+                keySize += ((DecoratedKey) key).getKey().remaining();
             }
             estimatedSize = (long) ((keySize // index entries
                                     + keySize // keys in data file
                                     + liveDataSize.get()) // data
                                     * 1.2); // bloom filter and row index overhead
 
-            this.isBatchLogTable = cfs.name.equals(SystemKeyspace.BATCHLOG) && cfs.keyspace.getName().equals(SystemKeyspace.NAME);
-        }
+            this.isBatchLogTable = cfs.name.equals(SystemKeyspace.BATCHES) && cfs.keyspace.getName().equals(SystemKeyspace.NAME);
 
-        public long getExpectedWriteSize()
-        {
-            return estimatedSize;
-        }
+            if (flushLocation == null)
+                writer = createFlushWriter(txn, cfs.getSSTablePath(getDirectories().getLocationForDisk(getDirectories().getWriteableLocation(estimatedSize))), columnsCollector.get(), statsCollector.get());
+            else
+                writer = createFlushWriter(txn, cfs.getSSTablePath(getDirectories().getLocationForDisk(flushLocation)), columnsCollector.get(), statsCollector.get());
 
-        protected void runMayThrow() throws Exception
-        {
-            long writeSize = getExpectedWriteSize();
-            Directories.DataDirectory dataDirectory = getWriteDirectory(writeSize);
-            File sstableDirectory = cfs.directories.getLocationForDisk(dataDirectory);
-            assert sstableDirectory != null : "Flush task is not bound to any disk";
-            SSTableReader sstable = writeSortedContents(context, sstableDirectory);
-            cfs.replaceFlushed(Memtable.this, sstable);
         }
 
         protected Directories getDirectories()
         {
-            return cfs.directories;
+            return cfs.getDirectories();
         }
 
-        private SSTableReader writeSortedContents(ReplayPosition context, File sstableDirectory)
+        private void writeSortedContents(ReplayPosition context)
         {
-            logger.info("Writing {}", Memtable.this.toString());
+            logger.debug("Writing {}, flushed range = ({}, {}]", Memtable.this.toString(), from, to);
 
-            SSTableReader ssTable;
-            try (SSTableTxnWriter writer = createFlushWriter(cfs.getSSTablePath(sstableDirectory), columnsCollector.get(), statsCollector.get()))
+            boolean trackContention = logger.isTraceEnabled();
+            int heavilyContendedRowCount = 0;
+            // (we can't clear out the map as-we-go to free up memory,
+            //  since the memtable is being used for queries in the "pending flush" category)
+            for (AtomicBTreePartition partition : toFlush.values())
             {
-                boolean trackContention = logger.isDebugEnabled();
-                int heavilyContendedRowCount = 0;
-                // (we can't clear out the map as-we-go to free up memory,
-                //  since the memtable is being used for queries in the "pending flush" category)
-                for (AtomicBTreePartition partition : partitions.values())
+                // Each batchlog partition is a separate entry in the log. And for an entry, we only do 2
+                // operations: 1) we insert the entry and 2) we delete it. Further, BL data is strictly local,
+                // we don't need to preserve tombstones for repair. So if both operation are in this
+                // memtable (which will almost always be the case if there is no ongoing failure), we can
+                // just skip the entry (CASSANDRA-4667).
+                if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
+                    continue;
+
+                if (trackContention && partition.usePessimisticLocking())
+                    heavilyContendedRowCount++;
+
+                if (!partition.isEmpty())
                 {
-                    // Each batchlog partition is a separate entry in the log. And for an entry, we only do 2
-                    // operations: 1) we insert the entry and 2) we delete it. Further, BL data is strictly local,
-                    // we don't need to preserve tombstones for repair. So if both operation are in this
-                    // memtable (which will almost always be the case if there is no ongoing failure), we can
-                    // just skip the entry (CASSANDRA-4667).
-                    if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
-                        continue;
-
-                    if (trackContention && partition.usePessimisticLocking())
-                        heavilyContendedRowCount++;
-
-                    if (!partition.isEmpty())
+                    try (UnfilteredRowIterator iter = partition.unfilteredIterator())
                     {
-                        try (UnfilteredRowIterator iter = partition.unfilteredIterator())
-                        {
-                            writer.append(iter);
-                        }
+                        writer.append(iter);
                     }
                 }
-
-                if (writer.getFilePointer() > 0)
-                {
-                    logger.info(String.format("Completed flushing %s (%s) for commitlog position %s",
-                                              writer.getFilename(),
-                                              FBUtilities.prettyPrintMemory(writer.getFilePointer()),
-                                              context));
-
-                    // sstables should contain non-repaired data.
-                    ssTable = writer.finish(true);
-                }
-                else
-                {
-                    logger.info("Completed flushing {}; nothing needed to be retained.  Commitlog position was {}",
-                                writer.getFilename(), context);
-                    writer.abort();
-                    ssTable = null;
-                }
-
-                if (heavilyContendedRowCount > 0)
-                    logger.debug(String.format("High update contention in %d/%d partitions of %s ", heavilyContendedRowCount, partitions.size(), Memtable.this.toString()));
-
-                return ssTable;
             }
+
+            logger.debug(String.format("Completed flushing %s (%s) for commitlog position %s",
+                                                                              writer.getFilename(),
+                                                                              FBUtilities.prettyPrintMemory(writer.getFilePointer()),
+                                                                              context));
+
+            if (heavilyContendedRowCount > 0)
+                logger.trace(String.format("High update contention in %d/%d partitions of %s ", heavilyContendedRowCount, toFlush.size(), Memtable.this.toString()));
         }
 
-        public SSTableTxnWriter createFlushWriter(String filename,
-                                               PartitionColumns columns,
-                                               EncodingStats stats)
+        public SSTableMultiWriter createFlushWriter(LifecycleTransaction txn,
+                                                  String filename,
+                                                  PartitionColumns columns,
+                                                  EncodingStats stats)
         {
-            // we operate "offline" here, as we expose the resulting reader consciously when done
-            // (although we may want to modify this behaviour in future, to encapsulate full flush behaviour in LifecycleTransaction)
-            LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.FLUSH, cfs.metadata);
             MetadataCollector sstableMetadataCollector = new MetadataCollector(cfs.metadata.comparator).replayPosition(context);
-            return new SSTableTxnWriter(txn,
-                                        SSTableWriter.create(Descriptor.fromFilename(filename),
-                                                             (long)partitions.size(),
-                                                             ActiveRepairService.UNREPAIRED_SSTABLE,
-                                                             cfs.metadata,
-                                                             sstableMetadataCollector,
-                                                             new SerializationHeader(cfs.metadata, columns, stats),
-                                                             txn));
+            return cfs.createSSTableMultiWriter(Descriptor.fromFilename(filename),
+                                                (long)toFlush.size(),
+                                                ActiveRepairService.UNREPAIRED_SSTABLE,
+                                                sstableMetadataCollector,
+                                                new SerializationHeader(true, cfs.metadata, columns, stats), txn);
+
+        }
+
+        @Override
+        public SSTableMultiWriter call()
+        {
+            writeSortedContents(context);
+            return writer;
         }
     }
 
@@ -460,6 +479,57 @@ public class Memtable implements Comparable<Memtable>
             allocator.setDiscarding();
             allocator.setDiscarded();
             return rowOverhead;
+        }
+    }
+
+    public static class MemtableUnfilteredPartitionIterator extends AbstractUnfilteredPartitionIterator
+    {
+        private final ColumnFamilyStore cfs;
+        private final Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iter;
+        private final boolean isForThrift;
+        private final int minLocalDeletionTime;
+        private final ColumnFilter columnFilter;
+        private final DataRange dataRange;
+
+        public MemtableUnfilteredPartitionIterator(ColumnFamilyStore cfs, Iterator<Map.Entry<PartitionPosition, AtomicBTreePartition>> iter, boolean isForThrift, int minLocalDeletionTime, ColumnFilter columnFilter, DataRange dataRange)
+        {
+            this.cfs = cfs;
+            this.iter = iter;
+            this.isForThrift = isForThrift;
+            this.minLocalDeletionTime = minLocalDeletionTime;
+            this.columnFilter = columnFilter;
+            this.dataRange = dataRange;
+        }
+
+        public boolean isForThrift()
+        {
+            return isForThrift;
+        }
+
+        public int getMinLocalDeletionTime()
+        {
+            return minLocalDeletionTime;
+        }
+
+        public CFMetaData metadata()
+        {
+            return cfs.metadata;
+        }
+
+        public boolean hasNext()
+        {
+            return iter.hasNext();
+        }
+
+        public UnfilteredRowIterator next()
+        {
+            Map.Entry<PartitionPosition, AtomicBTreePartition> entry = iter.next();
+            // Actual stored key should be true DecoratedKey
+            assert entry.getKey() instanceof DecoratedKey;
+            DecoratedKey key = (DecoratedKey)entry.getKey();
+            ClusteringIndexFilter filter = dataRange.clusteringIndexFilter(key);
+
+            return filter.getUnfilteredRowIterator(columnFilter, entry.getValue());
         }
     }
 

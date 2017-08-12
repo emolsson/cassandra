@@ -67,14 +67,17 @@ public class StartupChecks
     // The default set of pre-flight checks to run. Order is somewhat significant in that we probably
     // always want the system keyspace check run last, as this actually loads the schema for that
     // keyspace. All other checks should not require any schema initialization.
-    private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkValidLaunchDate,
+    private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkJemalloc,
+                                                                      checkValidLaunchDate,
                                                                       checkJMXPorts,
                                                                       inspectJvmOptions,
                                                                       checkJnaInitialization,
                                                                       initSigarLibrary,
                                                                       checkDataDirs,
                                                                       checkSSTablesFormat,
-                                                                      checkSystemKeyspaceState);
+                                                                      checkSystemKeyspaceState,
+                                                                      checkDatacenter,
+                                                                      checkRack);
 
     public StartupChecks withDefaultTests()
     {
@@ -102,6 +105,22 @@ public class StartupChecks
         for (StartupCheck test : preFlightChecks)
             test.execute();
     }
+
+    public static final StartupCheck checkJemalloc = new StartupCheck()
+    {
+        public void execute() throws StartupException
+        {
+            if (FBUtilities.isWindows())
+                return;
+            String jemalloc = System.getProperty("cassandra.libjemalloc");
+            if (jemalloc == null)
+                logger.warn("jemalloc shared library could not be preloaded to speed up memory allocations");
+            else if ("-".equals(jemalloc))
+                logger.info("jemalloc preload explicitly disabled");
+            else
+                logger.info("jemalloc seems to be preloaded from {}", jemalloc);
+        }
+    };
 
     public static final StartupCheck checkValidLaunchDate = new StartupCheck()
     {
@@ -175,37 +194,34 @@ public class StartupChecks
     {
         public void execute()
         {
-            new SigarLibrary().warnIfRunningInDegradedMode();
+            SigarLibrary.instance.warnIfRunningInDegradedMode();
         }
     };
 
-    public static final StartupCheck checkDataDirs = new StartupCheck()
+    public static final StartupCheck checkDataDirs = () ->
     {
-        public void execute() throws StartupException
+        // check all directories(data, commitlog, saved cache) for existence and permission
+        Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+                                                 Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+                                                               DatabaseDescriptor.getSavedCachesLocation(),
+                                                               DatabaseDescriptor.getHintsDirectory().getAbsolutePath()));
+        for (String dataDir : dirs)
         {
-            // check all directories(data, commitlog, saved cache) for existence and permission
-            Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
-                                                     Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
-                                                                   DatabaseDescriptor.getSavedCachesLocation()));
-            for (String dataDir : dirs)
+            logger.debug("Checking directory {}", dataDir);
+            File dir = new File(dataDir);
+
+            // check that directories exist.
+            if (!dir.exists())
             {
-                logger.debug("Checking directory {}", dataDir);
-                File dir = new File(dataDir);
-
-                // check that directories exist.
-                if (!dir.exists())
-                {
-                    logger.error("Directory {} doesn't exist", dataDir);
-                    // if they don't, failing their creation, stop cassandra.
-                    if (!dir.mkdirs())
-                        throw new StartupException(3, "Has no permission to create directory "+ dataDir);
-                }
-
-                // if directories exist verify their permissions
-                if (!Directories.verifyFullPermissions(dir, dataDir))
-                    throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
-
+                logger.warn("Directory {} doesn't exist", dataDir);
+                // if they don't, failing their creation, stop cassandra.
+                if (!dir.mkdirs())
+                    throw new StartupException(3, "Has no permission to create directory "+ dataDir);
             }
+
+            // if directories exist verify their permissions
+            if (!Directories.verifyFullPermissions(dir, dataDir))
+                throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
         }
     };
 
@@ -237,8 +253,7 @@ public class StartupChecks
                 {
                     String name = dir.getFileName().toString();
                     return (name.equals(Directories.SNAPSHOT_SUBDIR)
-                            || name.equals(Directories.BACKUPS_SUBDIR)
-                            || name.equals(Directories.TRANSACTIONS_SUBDIR))
+                            || name.equals(Directories.BACKUPS_SUBDIR))
                            ? FileVisitResult.SKIP_SUBTREE
                            : FileVisitResult.CONTINUE;
                 }
@@ -274,7 +289,7 @@ public class StartupChecks
             // we do a one-off scrub of the system keyspace first; we can't load the list of the rest of the keyspaces,
             // until system keyspace is opened.
 
-            for (CFMetaData cfm : Schema.instance.getTables(SystemKeyspace.NAME))
+            for (CFMetaData cfm : Schema.instance.getTablesAndViews(SystemKeyspace.NAME))
                 ColumnFamilyStore.scrubDataDirectories(cfm);
 
             try
@@ -284,6 +299,50 @@ public class StartupChecks
             catch (ConfigurationException e)
             {
                 throw new StartupException(100, "Fatal exception during initialization", e);
+            }
+        }
+    };
+
+    public static final StartupCheck checkDatacenter = new StartupCheck()
+    {
+        public void execute() throws StartupException
+        {
+            if (!Boolean.getBoolean("cassandra.ignore_dc"))
+            {
+                String storedDc = SystemKeyspace.getDatacenter();
+                if (storedDc != null)
+                {
+                    String currentDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+                    if (!storedDc.equals(currentDc))
+                    {
+                        String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
+                                               "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_dc=true.";
+
+                        throw new StartupException(100, String.format(formatMessage, currentDc, storedDc));
+                    }
+                }
+            }
+        }
+    };
+
+    public static final StartupCheck checkRack = new StartupCheck()
+    {
+        public void execute() throws StartupException
+        {
+            if (!Boolean.getBoolean("cassandra.ignore_rack"))
+            {
+                String storedRack = SystemKeyspace.getRack();
+                if (storedRack != null)
+                {
+                    String currentRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());
+                    if (!storedRack.equals(currentRack))
+                    {
+                        String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
+                                               "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_rack=true.";
+
+                        throw new StartupException(100, String.format(formatMessage, currentRack, storedRack));
+                    }
+                }
             }
         }
     };

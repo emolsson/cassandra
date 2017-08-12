@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
@@ -51,13 +52,14 @@ import org.apache.cassandra.service.*;
 import org.apache.cassandra.service.pager.QueryPager;
 import org.apache.cassandra.thrift.ThriftClientState;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.*;
 import org.github.jamm.MemoryMeter;
 
 public class QueryProcessor implements QueryHandler
 {
-    public static final CassandraVersion CQL_VERSION = new CassandraVersion("3.3.0");
+    public static final CassandraVersion CQL_VERSION = new CassandraVersion("3.4.0");
 
     public static final QueryProcessor instance = new QueryProcessor();
 
@@ -322,7 +324,7 @@ public class QueryProcessor implements QueryHandler
             throw new IllegalArgumentException("Only SELECTs can be paged");
 
         SelectStatement select = (SelectStatement)prepared.statement;
-        QueryPager pager = select.getQuery(makeInternalOptions(prepared, values), FBUtilities.nowInSeconds()).getPager(null);
+        QueryPager pager = select.getQuery(makeInternalOptions(prepared, values), FBUtilities.nowInSeconds()).getPager(null, Server.CURRENT_VERSION);
         return UntypedResultSet.create(select, pager, pageSize);
     }
 
@@ -507,24 +509,7 @@ public class QueryProcessor implements QueryHandler
     {
         try
         {
-            // Lexer and parser
-            ErrorCollector errorCollector = new ErrorCollector(queryStr);
-            CharStream stream = new ANTLRStringStream(queryStr);
-            CqlLexer lexer = new CqlLexer(stream);
-            lexer.addErrorListener(errorCollector);
-
-            TokenStream tokenStream = new CommonTokenStream(lexer);
-            CqlParser parser = new CqlParser(tokenStream);
-            parser.addErrorListener(errorCollector);
-
-            // Parse the query string to a statement instance
-            ParsedStatement statement = parser.query();
-
-            // The errorCollector has queue up any errors that the lexer and parser may have encountered
-            // along the way, if necessary, we turn the last error into exceptions here.
-            errorCollector.throwFirstSyntaxError();
-
-            return statement;
+            return CQLFragmentParser.parseAnyUnhandled(CqlParser::query, queryStr);
         }
         catch (CassandraException ce)
         {
@@ -547,6 +532,15 @@ public class QueryProcessor implements QueryHandler
     private static long measure(Object key)
     {
         return meter.measureDeep(key);
+    }
+
+    /**
+     * Clear our internal statmeent cache for test purposes.
+     */
+    @VisibleForTesting
+    public static void clearInternalStatementsCache()
+    {
+        internalStatements.clear();
     }
 
     private static class MigrationSubscriber extends MigrationListener
@@ -617,43 +611,59 @@ public class QueryProcessor implements QueryHandler
             // in case there are other overloads, we have to remove all overloads since argument type
             // matching may change (due to type casting)
             if (Schema.instance.getKSMetaData(ksName).functions.get(new FunctionName(ksName, functionName)).size() > 1)
-            {
-                removeInvalidPreparedStatementsForFunction(preparedStatements.values().iterator(), ksName, functionName);
-                removeInvalidPreparedStatementsForFunction(thriftPreparedStatements.values().iterator(), ksName, functionName);
-            }
+                removeAllInvalidPreparedStatementsForFunction(ksName, functionName);
         }
 
-        public void onUpdateColumnFamily(String ksName, String cfName, boolean columnsDidChange)
+        public void onUpdateColumnFamily(String ksName, String cfName, boolean affectsStatements)
         {
-            logger.info("Column definitions for {}.{} changed, invalidating related prepared statements", ksName, cfName);
-            if (columnsDidChange)
+            logger.trace("Column definitions for {}.{} changed, invalidating related prepared statements", ksName, cfName);
+            if (affectsStatements)
                 removeInvalidPreparedStatements(ksName, cfName);
+        }
+
+        public void onUpdateFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+            removeAllInvalidPreparedStatementsForFunction(ksName, functionName);
+        }
+
+        public void onUpdateAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+            removeAllInvalidPreparedStatementsForFunction(ksName, aggregateName);
         }
 
         public void onDropKeyspace(String ksName)
         {
-            logger.info("Keyspace {} was dropped, invalidating related prepared statements", ksName);
+            logger.trace("Keyspace {} was dropped, invalidating related prepared statements", ksName);
             removeInvalidPreparedStatements(ksName, null);
         }
 
         public void onDropColumnFamily(String ksName, String cfName)
         {
-            logger.info("Table {}.{} was dropped, invalidating related prepared statements", ksName, cfName);
+            logger.trace("Table {}.{} was dropped, invalidating related prepared statements", ksName, cfName);
             removeInvalidPreparedStatements(ksName, cfName);
         }
 
         public void onDropFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
         {
-            onDropFunctionInternal(ksName, functionName, argTypes);
+            removeAllInvalidPreparedStatementsForFunction(ksName, functionName);
         }
 
         public void onDropAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
         {
-            onDropFunctionInternal(ksName, aggregateName, argTypes);
+            removeAllInvalidPreparedStatementsForFunction(ksName, aggregateName);
         }
 
-        private static void onDropFunctionInternal(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        private static void removeAllInvalidPreparedStatementsForFunction(String ksName, String functionName)
         {
+            removeInvalidPreparedStatementsForFunction(internalStatements.values().iterator(), ksName, functionName);
             removeInvalidPreparedStatementsForFunction(preparedStatements.values().iterator(), ksName, functionName);
             removeInvalidPreparedStatementsForFunction(thriftPreparedStatements.values().iterator(), ksName, functionName);
         }

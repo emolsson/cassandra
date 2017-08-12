@@ -18,6 +18,7 @@
 package org.apache.cassandra.cql3.validation.entities;
 
 import java.nio.ByteBuffer;
+import java.security.AccessControlException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
@@ -27,20 +28,22 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
-import java.security.AccessControlException;
 
+import com.google.common.reflect.TypeToken;
 import org.junit.Assert;
 import org.junit.Test;
 
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.config.Config;
 import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.functions.JavaBasedUDFunction;
 import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.cql3.functions.UDHelper;
 import org.apache.cassandra.db.marshal.CollectionType;
@@ -57,6 +60,29 @@ import org.apache.cassandra.utils.UUIDGen;
 
 public class UFTest extends CQLTester
 {
+    @Test
+    public void testJavaSourceName()
+    {
+        Assert.assertEquals("String", JavaBasedUDFunction.javaSourceName(TypeToken.of(String.class)));
+        Assert.assertEquals("java.util.Map<Integer, String>", JavaBasedUDFunction.javaSourceName(TypeTokens.mapOf(Integer.class, String.class)));
+        Assert.assertEquals("com.datastax.driver.core.UDTValue", JavaBasedUDFunction.javaSourceName(TypeToken.of(UDTValue.class)));
+        Assert.assertEquals("java.util.Set<com.datastax.driver.core.UDTValue>", JavaBasedUDFunction.javaSourceName(TypeTokens.setOf(UDTValue.class)));
+    }
+
+    @Test
+    public void testNonExistingOnes() throws Throwable
+    {
+        assertInvalidThrowMessage("Cannot drop non existing function", InvalidRequestException.class, "DROP FUNCTION " + KEYSPACE + ".func_does_not_exist");
+        assertInvalidThrowMessage("Cannot drop non existing function", InvalidRequestException.class, "DROP FUNCTION " + KEYSPACE + ".func_does_not_exist(int,text)");
+        assertInvalidThrowMessage("Cannot drop non existing function", InvalidRequestException.class, "DROP FUNCTION keyspace_does_not_exist.func_does_not_exist");
+        assertInvalidThrowMessage("Cannot drop non existing function", InvalidRequestException.class, "DROP FUNCTION keyspace_does_not_exist.func_does_not_exist(int,text)");
+
+        execute("DROP FUNCTION IF EXISTS " + KEYSPACE + ".func_does_not_exist");
+        execute("DROP FUNCTION IF EXISTS " + KEYSPACE + ".func_does_not_exist(int,text)");
+        execute("DROP FUNCTION IF EXISTS keyspace_does_not_exist.func_does_not_exist");
+        execute("DROP FUNCTION IF EXISTS keyspace_does_not_exist.func_does_not_exist(int,text)");
+    }
+
     @Test
     public void testSchemaChange() throws Throwable
     {
@@ -424,6 +450,21 @@ public class UFTest extends CQLTester
     }
 
     @Test
+    public void testFunctionExecutionWithReversedTypeAsOutput() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, v text, PRIMARY KEY(k, v)) WITH CLUSTERING ORDER BY (v DESC)");
+
+        String fRepeat = createFunction(KEYSPACE_PER_TEST, "text",
+                                        "CREATE FUNCTION %s(v text) " +
+                                        "RETURNS NULL ON NULL INPUT " +
+                                        "RETURNS text " +
+                                        "LANGUAGE java " +
+                                        "AS 'return v + v;'");
+
+        execute("INSERT INTO %s(k, v) VALUES (?, " + fRepeat + "(?))", 1, "a");
+    }
+
+    @Test
     public void testFunctionOverloading() throws Throwable
     {
         createTable("CREATE TABLE %s (k text PRIMARY KEY, v int)");
@@ -677,6 +718,32 @@ public class UFTest extends CQLTester
     }
 
     @Test
+    public void testJavaFunctionCounter() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, val counter)");
+
+        String fName = createFunction(KEYSPACE, "counter",
+                                      "CREATE OR REPLACE FUNCTION %s(val counter) " +
+                                      "CALLED ON NULL INPUT " +
+                                      "RETURNS bigint " +
+                                      "LANGUAGE JAVA " +
+                                      "AS 'return val + 1;';");
+
+        execute("UPDATE %s SET val = val + 1 WHERE key = 1");
+        assertRows(execute("SELECT key, val, " + fName + "(val) FROM %s"),
+                   row(1, 1L, 2L));
+        execute("UPDATE %s SET val = val + 1 WHERE key = 1");
+        assertRows(execute("SELECT key, val, " + fName + "(val) FROM %s"),
+                   row(1, 2L, 3L));
+        execute("UPDATE %s SET val = val + 2 WHERE key = 1");
+        assertRows(execute("SELECT key, val, " + fName + "(val) FROM %s"),
+                   row(1, 4L, 5L));
+        execute("UPDATE %s SET val = val - 2 WHERE key = 1");
+        assertRows(execute("SELECT key, val, " + fName + "(val) FROM %s"),
+                   row(1, 2L, 3L));
+    }
+
+    @Test
     public void testFunctionInTargetKeyspace() throws Throwable
     {
         createTable("CREATE TABLE %s (key int primary key, val double)");
@@ -782,7 +849,7 @@ public class UFTest extends CQLTester
     @Test
     public void testFunctionNonExistingKeyspace() throws Throwable
     {
-        assertInvalidMessage("to non existing keyspace",
+        assertInvalidMessage("Keyspace this_ks_does_not_exist doesn't exist",
                              "CREATE OR REPLACE FUNCTION this_ks_does_not_exist.jnft(val double) " +
                              "RETURNS NULL ON NULL INPUT " +
                              "RETURNS double " +
@@ -795,7 +862,7 @@ public class UFTest extends CQLTester
     {
         dropPerTestKeyspace();
 
-        assertInvalidMessage("to non existing keyspace",
+        assertInvalidMessage("Keyspace " + KEYSPACE_PER_TEST + " doesn't exist",
                              "CREATE OR REPLACE FUNCTION " + KEYSPACE_PER_TEST + ".jnft(val double) " +
                              "RETURNS NULL ON NULL INPUT " +
                              "RETURNS double " +
@@ -931,7 +998,7 @@ public class UFTest extends CQLTester
                    row(list, set, map));
 
         // same test - but via native protocol
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
             assertRowsNet(version,
                           executeNet(version, "SELECT " + fList + "(lst), " + fSet + "(st), " + fMap + "(mp) FROM %s WHERE key = 1"),
                           row(list, set, map));
@@ -1040,7 +1107,7 @@ public class UFTest extends CQLTester
         Assert.assertNull(row.getBytes("t"));
         Assert.assertNull(row.getBytes("u"));
 
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
         {
             Row r = executeNet(version, "SELECT " +
                                         fList + "(lst) as l, " +
@@ -1157,12 +1224,17 @@ public class UFTest extends CQLTester
         assertRows(execute("SELECT " + fTup4 + "(tup) FROM %s WHERE key = 1"),
                    row(map));
 
-        TupleType tType = TupleType.of(DataType.cdouble(),
-                                       DataType.list(DataType.cdouble()),
-                                       DataType.set(DataType.text()),
-                                       DataType.map(DataType.cint(), DataType.cboolean()));
+        // same test - but via native protocol
+        // we use protocol V3 here to encode the expected version because the server
+        // always serializes Collections using V3 - see CollectionSerializer's
+        // serialize and deserialize methods.
+        TupleType tType = tupleTypeOf(Server.VERSION_3,
+                                      DataType.cdouble(),
+                                      DataType.list(DataType.cdouble()),
+                                      DataType.set(DataType.text()),
+                                      DataType.map(DataType.cint(), DataType.cboolean()));
         TupleValue tup = tType.newValue(1d, list, set, map);
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
         {
             assertRowsNet(version,
                           executeNet(version, "SELECT " + fTup0 + "(tup) FROM %s WHERE key = 1"),
@@ -1189,7 +1261,7 @@ public class UFTest extends CQLTester
         createTable("CREATE TABLE %s (key int primary key, udt frozen<" + KEYSPACE + '.' + type + ">)");
         execute("INSERT INTO %s (key, udt) VALUES (1, {txt: 'one', i:1})");
 
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
         {
             executeNet(version, "USE " + KEYSPACE);
 
@@ -1253,7 +1325,7 @@ public class UFTest extends CQLTester
         assertRows(execute("SELECT " + fUdt2 + "(udt) FROM %s WHERE key = 1"),
                    row(1));
 
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
         {
             List<Row> rowsNet = executeNet(version, "SELECT " + fUdt0 + "(udt) FROM %s WHERE key = 1").all();
             Assert.assertEquals(1, rowsNet.size());
@@ -1515,7 +1587,7 @@ public class UFTest extends CQLTester
         assertRows(execute("SELECT " + fName1 + "(lst), " + fName2 + "(st), " + fName3 + "(mp) FROM %s WHERE key = 1"),
                    row("three", "one", "two"));
 
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
             assertRowsNet(version,
                           executeNet(version, "SELECT " + fName1 + "(lst), " + fName2 + "(st), " + fName3 + "(mp) FROM %s WHERE key = 1"),
                           row("three", "one", "two"));
@@ -1771,7 +1843,7 @@ public class UFTest extends CQLTester
                                       "LANGUAGE JAVA\n" +
                                       "AS 'throw new RuntimeException();'");
 
-        for (int version = Server.VERSION_2; version <= maxProtocolVersion; version++)
+        for (int version : PROTOCOL_VERSIONS)
         {
             try
             {
@@ -1982,10 +2054,10 @@ public class UFTest extends CQLTester
                                              "LANGUAGE java\n" +
                                              "AS 'return values.toString();';");
 
-        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 0"), row(0, "(null, null)"));
-        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 1"), row(1, "(1, 2)"));
-        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 2"), row(2, "(4, 5)"));
-        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 3"), row(3, "(7, 8)"));
+        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 0"), row(0, "(NULL,NULL)"));
+        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 1"), row(1, "(1,2)"));
+        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 2"), row(2, "(4,5)"));
+        assertRows(execute("SELECT a, " + functionName + "(b) FROM %s WHERE a = 3"), row(3, "(7,8)"));
 
         functionName = createFunction(KEYSPACE,
                                       "tuple<int, int>",
@@ -2139,7 +2211,7 @@ public class UFTest extends CQLTester
                                          "LANGUAGE JAVA\n" +
                                          "AS 'return val;'");
 
-        String fNameICN = createFunction(KEYSPACE_PER_TEST, "blob",
+        String fNameICN = createFunction(KEYSPACE_PER_TEST, "int",
                                          "CREATE OR REPLACE FUNCTION %s(val int) " +
                                          "RETURNS NULL ON NULL INPUT " +
                                          "RETURNS int " +
@@ -2162,6 +2234,45 @@ public class UFTest extends CQLTester
         assertRows(execute("SELECT " + fNameIRN + "(empty_int) FROM %s"), row(new Object[]{ null }));
         assertRows(execute("SELECT " + fNameICC + "(empty_int) FROM %s"), row(0));
         assertRows(execute("SELECT " + fNameICN + "(empty_int) FROM %s"), row(new Object[]{ null }));
+    }
+
+    @Test
+    public void testAllNativeTypes() throws Throwable
+    {
+        StringBuilder sig = new StringBuilder();
+        StringBuilder args = new StringBuilder();
+        for (CQL3Type.Native type : CQL3Type.Native.values())
+        {
+            if (type == CQL3Type.Native.EMPTY)
+                continue;
+
+            if (sig.length() > 0)
+                sig.append(',');
+            sig.append(type.toString());
+
+            if (args.length() > 0)
+                args.append(',');
+            args.append("arg").append(type.toString()).append(' ').append(type.toString());
+        }
+        createFunction(KEYSPACE, sig.toString(),
+                       "CREATE OR REPLACE FUNCTION %s(" + args + ") " +
+                       "RETURNS NULL ON NULL INPUT " +
+                       "RETURNS int " +
+                       "LANGUAGE JAVA\n" +
+                       "AS 'return 0;'");
+
+        for (CQL3Type.Native type : CQL3Type.Native.values())
+        {
+            if (type == CQL3Type.Native.EMPTY)
+                continue;
+
+            createFunction(KEYSPACE_PER_TEST, type.toString(),
+                           "CREATE OR REPLACE FUNCTION %s(val " + type.toString() + ") " +
+                           "RETURNS NULL ON NULL INPUT " +
+                           "RETURNS int " +
+                           "LANGUAGE JAVA\n" +
+                           "AS 'return 0;'");
+        }
     }
 
     @Test
@@ -2326,52 +2437,96 @@ public class UFTest extends CQLTester
 
         long udfWarnTimeout = DatabaseDescriptor.getUserDefinedFunctionWarnTimeout();
         long udfFailTimeout = DatabaseDescriptor.getUserDefinedFunctionFailTimeout();
-        try
+        int maxTries = 5;
+        for (int i = 1; i <= maxTries; i++)
         {
-            // short timeout
-            DatabaseDescriptor.setUserDefinedFunctionWarnTimeout(1);
-            DatabaseDescriptor.setUserDefinedFunctionFailTimeout(100);
-            // don't kill the unit test... - default policy is "die"
-            DatabaseDescriptor.setUserFunctionTimeoutPolicy(Config.UserFunctionTimeoutPolicy.ignore);
+            try
+            {
+                // short timeout
+                DatabaseDescriptor.setUserDefinedFunctionWarnTimeout(10);
+                DatabaseDescriptor.setUserDefinedFunctionFailTimeout(250);
+                // don't kill the unit test... - default policy is "die"
+                DatabaseDescriptor.setUserFunctionTimeoutPolicy(Config.UserFunctionTimeoutPolicy.ignore);
 
-            ClientWarn.captureWarnings();
-            String fName = createFunction(KEYSPACE_PER_TEST, "double",
-                                          "CREATE OR REPLACE FUNCTION %s(val double) " +
-                                          "RETURNS NULL ON NULL INPUT " +
-                                          "RETURNS double " +
-                                          "LANGUAGE JAVA\n" +
-                                          "AS 'long t=System.currentTimeMillis()+20; while (t>System.currentTimeMillis()) { }; return 0d;'");
-            execute("SELECT " + fName + "(dval) FROM %s WHERE key=1");
-            List<String> warnings = ClientWarn.getWarnings();
-            Assert.assertNotNull(warnings);
-            Assert.assertFalse(warnings.isEmpty());
-            ClientWarn.resetWarnings();
+                ClientWarn.instance.captureWarnings();
+                String fName = createFunction(KEYSPACE_PER_TEST, "double",
+                                              "CREATE OR REPLACE FUNCTION %s(val double) " +
+                                              "RETURNS NULL ON NULL INPUT " +
+                                              "RETURNS double " +
+                                              "LANGUAGE JAVA\n" +
+                                              "AS 'long t=System.currentTimeMillis()+110; while (t>System.currentTimeMillis()) { }; return 0d;'");
+                execute("SELECT " + fName + "(dval) FROM %s WHERE key=1");
+                List<String> warnings = ClientWarn.instance.getWarnings();
+                Assert.assertNotNull(warnings);
+                Assert.assertFalse(warnings.isEmpty());
+                ClientWarn.instance.resetWarnings();
 
-            // Java UDF
+                // Java UDF
 
-            fName = createFunction(KEYSPACE_PER_TEST, "double",
-                                   "CREATE OR REPLACE FUNCTION %s(val double) " +
-                                   "RETURNS NULL ON NULL INPUT " +
-                                   "RETURNS double " +
-                                   "LANGUAGE JAVA\n" +
-                                   "AS 'long t=System.currentTimeMillis()+300; while (t>System.currentTimeMillis()) { }; return 0d;';");
-            assertInvalidMessage("ran longer than 100ms", "SELECT " + fName + "(dval) FROM %s WHERE key=1");
+                fName = createFunction(KEYSPACE_PER_TEST, "double",
+                                       "CREATE OR REPLACE FUNCTION %s(val double) " +
+                                       "RETURNS NULL ON NULL INPUT " +
+                                       "RETURNS double " +
+                                       "LANGUAGE JAVA\n" +
+                                       "AS 'long t=System.currentTimeMillis()+500; while (t>System.currentTimeMillis()) { }; return 0d;';");
+                assertInvalidMessage("ran longer than 250ms", "SELECT " + fName + "(dval) FROM %s WHERE key=1");
 
-            // Javascript UDF
+                // Javascript UDF
 
-            fName = createFunction(KEYSPACE_PER_TEST, "double",
-                                   "CREATE OR REPLACE FUNCTION %s(val double) " +
-                                   "RETURNS NULL ON NULL INPUT " +
-                                   "RETURNS double " +
-                                   "LANGUAGE JAVASCRIPT\n" +
-                                   "AS 'var t=java.lang.System.currentTimeMillis()+300; while (t>java.lang.System.currentTimeMillis()) { }; 0;';");
-            assertInvalidMessage("ran longer than 100ms", "SELECT " + fName + "(dval) FROM %s WHERE key=1");
+                fName = createFunction(KEYSPACE_PER_TEST, "double",
+                                       "CREATE OR REPLACE FUNCTION %s(val double) " +
+                                       "RETURNS NULL ON NULL INPUT " +
+                                       "RETURNS double " +
+                                       "LANGUAGE JAVASCRIPT\n" +
+                                       "AS 'var t=java.lang.System.currentTimeMillis()+500; while (t>java.lang.System.currentTimeMillis()) { }; 0;';");
+                assertInvalidMessage("ran longer than 250ms", "SELECT " + fName + "(dval) FROM %s WHERE key=1");
+
+                return;
+            }
+            catch (Error | RuntimeException e)
+            {
+                if (i == maxTries)
+                    throw e;
+            }
+            finally
+            {
+                // reset to defaults
+                DatabaseDescriptor.setUserDefinedFunctionWarnTimeout(udfWarnTimeout);
+                DatabaseDescriptor.setUserDefinedFunctionFailTimeout(udfFailTimeout);
+            }
         }
-        finally
-        {
-            // reset to defaults
-            DatabaseDescriptor.setUserDefinedFunctionWarnTimeout(udfWarnTimeout);
-            DatabaseDescriptor.setUserDefinedFunctionFailTimeout(udfFailTimeout);
-        }
+    }
+
+    @Test
+    public void testArgumentGenerics() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, sval text, aval ascii, bval blob, empty_int int)");
+
+        String typeName = createType("CREATE TYPE %s (txt text, i int)");
+
+        String f = createFunction(KEYSPACE, "text",
+                                  "CREATE OR REPLACE FUNCTION %s("                 +
+                                  "  listText list<text>,"                         +
+                                  "  setText set<text>,"                           +
+                                  "  mapTextInt map<text, int>,"                   +
+                                  "  mapListTextSetInt map<frozen<list<text>>, frozen<set<int>>>," +
+                                  "  mapTextTuple map<text, frozen<tuple<int, text>>>," +
+                                  "  mapTextType map<text, frozen<" + typeName + ">>" +
+                                  ") "                                             +
+                                  "CALLED ON NULL INPUT "                          +
+                                  "RETURNS map<frozen<list<text>>, frozen<set<int>>> " +
+                                  "LANGUAGE JAVA\n"                                +
+                                  "AS $$" +
+                                  "     for (String s : listtext) {};" +
+                                  "     for (String s : settext) {};" +
+                                  "     for (String s : maptextint.keySet()) {};" +
+                                  "     for (Integer s : maptextint.values()) {};" +
+                                  "     for (java.util.List<String> l : maplisttextsetint.keySet()) {};" +
+                                  "     for (java.util.Set<Integer> s : maplisttextsetint.values()) {};" +
+                                  "     for (com.datastax.driver.core.TupleValue t : maptexttuple.values()) {};" +
+                                  "     for (com.datastax.driver.core.UDTValue u : maptexttype.values()) {};" +
+                                  "     return maplisttextsetint;" +
+                                  "$$");
+
     }
 }

@@ -44,14 +44,13 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.rows.EncodingStats;
-import org.apache.cassandra.db.lifecycle.TransactionLogs;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.compaction.CompactionController;
 import org.apache.cassandra.db.compaction.CompactionIterator;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.SSTableSplitter;
-import org.apache.cassandra.db.partitions.ArrayBackedPartition;
+import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
@@ -70,48 +69,8 @@ import org.apache.cassandra.utils.UUIDGen;
 
 import static org.junit.Assert.*;
 
-public class SSTableRewriterTest extends SchemaLoader
+public class SSTableRewriterTest extends SSTableWriterTestBase
 {
-    private static final String KEYSPACE = "SSTableRewriterTest";
-    private static final String CF = "Standard1";
-
-    private static Config.DiskAccessMode standardMode;
-    private static Config.DiskAccessMode indexMode;
-
-    @BeforeClass
-    public static void defineSchema() throws ConfigurationException
-    {
-        if (FBUtilities.isWindows())
-        {
-            standardMode = DatabaseDescriptor.getDiskAccessMode();
-            indexMode = DatabaseDescriptor.getIndexAccessMode();
-
-            DatabaseDescriptor.setDiskAccessMode(Config.DiskAccessMode.standard);
-            DatabaseDescriptor.setIndexAccessMode(Config.DiskAccessMode.standard);
-        }
-
-        SchemaLoader.prepareServer();
-        SchemaLoader.createKeyspace(KEYSPACE,
-                                    KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KEYSPACE, CF));
-    }
-
-    @AfterClass
-    public static void revertDiskAccess()
-    {
-        DatabaseDescriptor.setDiskAccessMode(standardMode);
-        DatabaseDescriptor.setIndexAccessMode(indexMode);
-    }
-
-    @After
-    public void truncateCF()
-    {
-        Keyspace keyspace = Keyspace.open(KEYSPACE);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF);
-        store.truncateBlocking();
-        TransactionLogs.waitForDeletions();
-    }
-
     @Test
     public void basicTest() throws InterruptedException
     {
@@ -134,7 +93,7 @@ public class SSTableRewriterTest extends SchemaLoader
         int nowInSec = FBUtilities.nowInSeconds();
         try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables);
              LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN);
-             SSTableRewriter writer = new SSTableRewriter(cfs, txn, 1000, false);
+             SSTableRewriter writer = SSTableRewriter.constructKeepingOriginals(txn, false, 1000);
              CompactionController controller = new CompactionController(cfs, sstables, cfs.gcBefore(nowInSec));
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
         {
@@ -145,7 +104,7 @@ public class SSTableRewriterTest extends SchemaLoader
             }
             writer.finish();
         }
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         validateCFS(cfs);
         int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
         assertEquals(1, filecounts);
@@ -166,7 +125,7 @@ public class SSTableRewriterTest extends SchemaLoader
         int nowInSec = FBUtilities.nowInSeconds();
         try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables);
              LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN);
-             SSTableRewriter writer = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter writer = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionController controller = new CompactionController(cfs, sstables, cfs.gcBefore(nowInSec));
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
         {
@@ -177,7 +136,7 @@ public class SSTableRewriterTest extends SchemaLoader
             }
             writer.finish();
         }
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         validateCFS(cfs);
         int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
         assertEquals(1, filecounts);
@@ -199,7 +158,7 @@ public class SSTableRewriterTest extends SchemaLoader
         boolean checked = false;
         try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables);
              LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN);
-             SSTableRewriter writer = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter writer = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionController controller = new CompactionController(cfs, sstables, cfs.gcBefore(nowInSec));
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
         {
@@ -232,61 +191,11 @@ public class SSTableRewriterTest extends SchemaLoader
             assertTrue(checked);
             writer.finish();
         }
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         validateCFS(cfs);
         int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
         assertEquals(1, filecounts);
         truncate(cfs);
-    }
-
-    @Test
-    public void testFileRemoval() throws InterruptedException
-    {
-        Keyspace keyspace = Keyspace.open(KEYSPACE);
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF);
-        truncate(cfs);
-
-        File dir = cfs.directories.getDirectoryForNewSSTables();
-        LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.WRITE, cfs.metadata);
-        try (SSTableWriter writer = getWriter(cfs, dir, txn))
-        {
-            for (int i = 0; i < 10000; i++)
-            {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
-                for (int j = 0; j < 100; j++)
-                    builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
-                writer.append(builder.build().unfilteredIterator());
-            }
-
-            SSTableReader s = writer.setMaxDataAge(1000).openEarly();
-            assert s != null;
-            assertFileCounts(dir.list());
-            for (int i = 10000; i < 20000; i++)
-            {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
-                for (int j = 0; j < 100; j++)
-                    builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
-                writer.append(builder.build().unfilteredIterator());
-            }
-            SSTableReader s2 = writer.setMaxDataAge(1000).openEarly();
-            assertTrue(s.last.compareTo(s2.last) < 0);
-            assertFileCounts(dir.list());
-            s.selfRef().release();
-            s2.selfRef().release();
-            // These checks don't work on Windows because the writer has the channel still
-            // open till .abort() is called (via the builder)
-            if (!FBUtilities.isWindows())
-            {
-                TransactionLogs.waitForDeletions();
-                assertFileCounts(dir.list());
-            }
-            writer.abort();
-            txn.abort();
-            TransactionLogs.waitForDeletions();
-            int datafiles = assertFileCounts(dir.list());
-            assertEquals(datafiles, 0);
-            validateCFS(cfs);
-        }
     }
 
     @Test
@@ -307,7 +216,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID()))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
@@ -328,7 +237,7 @@ public class SSTableRewriterTest extends SchemaLoader
             sstables = rewriter.finish();
         }
 
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         long sum = 0;
         for (SSTableReader x : cfs.getLiveSSTables())
@@ -337,7 +246,7 @@ public class SSTableRewriterTest extends SchemaLoader
         assertEquals(startStorageMetricsLoad - sBytesOnDisk + sum, StorageMetrics.load.getCount());
         assertEquals(files, sstables.size());
         assertEquals(files, cfs.getLiveSSTables().size());
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         // tmplink and tmp files should be gone:
         assertEquals(sum, cfs.metric.totalDiskSpaceUsed.getCount());
@@ -362,7 +271,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID()))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
@@ -382,7 +291,7 @@ public class SSTableRewriterTest extends SchemaLoader
 
         assertEquals(files, sstables.size());
         assertEquals(files, cfs.getLiveSSTables().size());
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         assertFileCounts(s.descriptor.directory.list());
         validateCFS(cfs);
@@ -513,13 +422,13 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 10000000))
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 10000000, false))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
             test.run(scanner, controller, s, cfs, rewriter, txn);
         }
 
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         assertEquals(startSize, cfs.metric.liveDiskSpaceUsed.getCount());
         assertEquals(1, cfs.getLiveSSTables().size());
@@ -545,7 +454,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID()))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
@@ -567,7 +476,7 @@ public class SSTableRewriterTest extends SchemaLoader
             }
         }
 
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         assertEquals(files - 1, cfs.getLiveSSTables().size()); // we never wrote anything to the last file
         assertFileCounts(s.descriptor.directory.list());
@@ -591,7 +500,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID()))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
@@ -609,7 +518,7 @@ public class SSTableRewriterTest extends SchemaLoader
             sstables = rewriter.finish();
         }
 
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         assertFileCounts(s.descriptor.directory.list());
         validateCFS(cfs);
     }
@@ -631,7 +540,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = s.getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 1000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 1000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID()))
         {
             rewriter.switchWriter(getWriter(cfs, s.descriptor.directory, txn));
@@ -650,7 +559,7 @@ public class SSTableRewriterTest extends SchemaLoader
         }
         assertEquals(files, sstables.size());
         assertEquals(files, cfs.getLiveSSTables().size());
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         assertFileCounts(s.descriptor.directory.list());
 
         validateCFS(cfs);
@@ -670,9 +579,7 @@ public class SSTableRewriterTest extends SchemaLoader
             splitter.split();
 
             assertFileCounts(s.descriptor.directory.list());
-
-            s.selfRef().release();
-            TransactionLogs.waitForDeletions();
+            LifecycleTransaction.waitForDeletions();
 
             for (File f : s.descriptor.directory.listFiles())
             {
@@ -719,7 +626,7 @@ public class SSTableRewriterTest extends SchemaLoader
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = offline ? LifecycleTransaction.offline(OperationType.UNKNOWN, compacting)
                                        : cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, offline, 10000000);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 100, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID())
         )
         {
@@ -748,7 +655,7 @@ public class SSTableRewriterTest extends SchemaLoader
                 s.selfRef().release();
         }
 
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
 
         int filecount = assertFileCounts(s.descriptor.directory.list());
         assertEquals(filecount, 1);
@@ -809,7 +716,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = compacting.iterator().next().getScanner();
              CompactionController controller = new CompactionController(cfs, compacting, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(compacting, OperationType.UNKNOWN);
-             SSTableRewriter rewriter = new SSTableRewriter(cfs, txn, 1000, false, 1);
+             SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, 1, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID())
         )
         {
@@ -827,7 +734,7 @@ public class SSTableRewriterTest extends SchemaLoader
             rewriter.finish();
         }
         validateKeys(keyspace);
-        TransactionLogs.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
         validateCFS(cfs);
         truncate(cfs);
     }
@@ -847,7 +754,7 @@ public class SSTableRewriterTest extends SchemaLoader
         try (ISSTableScanner scanner = sstables.iterator().next().getScanner();
              CompactionController controller = new CompactionController(cfs, sstables, 0);
              LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN);
-             SSTableRewriter writer = new SSTableRewriter(cfs, txn, 1000, false, 10000000);
+             SSTableRewriter writer = new SSTableRewriter(txn, 1000, 10000000, false);
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, Collections.singletonList(scanner), controller, FBUtilities.nowInSeconds(), UUIDGen.getTimeUUID())
         )
         {
@@ -890,8 +797,8 @@ public class SSTableRewriterTest extends SchemaLoader
         int nowInSec = FBUtilities.nowInSeconds();
         try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables);
              LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN);
-             SSTableRewriter writer = new SSTableRewriter(cfs, txn, 1000, false, false);
-             SSTableRewriter writer2 = new SSTableRewriter(cfs, txn, 1000, false, false);
+             SSTableRewriter writer = SSTableRewriter.constructWithoutEarlyOpening(txn, false, 1000);
+             SSTableRewriter writer2 = SSTableRewriter.constructWithoutEarlyOpening(txn, false, 1000);
              CompactionController controller = new CompactionController(cfs, sstables, cfs.gcBefore(nowInSec));
              CompactionIterator ci = new CompactionIterator(OperationType.COMPACTION, scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID())
              )
@@ -917,19 +824,9 @@ public class SSTableRewriterTest extends SchemaLoader
         for (int i = 0; i < 100; i++)
         {
             DecoratedKey key = Util.dk(Integer.toString(i));
-            ArrayBackedPartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(ks.getColumnFamilyStore(CF), key).build());
+            ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(ks.getColumnFamilyStore(CF), key).build());
             assertTrue(partition != null && partition.rowCount() > 0);
         }
-    }
-
-    public static void truncate(ColumnFamilyStore cfs)
-    {
-        cfs.truncateBlocking();
-        TransactionLogs.waitForDeletions();
-        Uninterruptibles.sleepUninterruptibly(10L, TimeUnit.MILLISECONDS);
-        assertEquals(0, cfs.metric.liveDiskSpaceUsed.getCount());
-        assertEquals(0, cfs.metric.totalDiskSpaceUsed.getCount());
-        validateCFS(cfs);
     }
 
     public static SSTableReader writeFile(ColumnFamilyStore cfs, int count)
@@ -943,10 +840,10 @@ public class SSTableRewriterTest extends SchemaLoader
         Set<SSTableReader> result = new LinkedHashSet<>();
         for (int f = 0 ; f < fileCount ; f++)
         {
-            File dir = cfs.directories.getDirectoryForNewSSTables();
+            File dir = cfs.getDirectories().getDirectoryForNewSSTables();
             String filename = cfs.getSSTablePath(dir);
 
-            try (SSTableTxnWriter writer = SSTableTxnWriter.create(filename, 0, 0, new SerializationHeader(cfs.metadata, cfs.metadata.partitionColumns(), EncodingStats.NO_STATS)))
+            try (SSTableTxnWriter writer = SSTableTxnWriter.create(cfs, filename, 0, 0, new SerializationHeader(true, cfs.metadata, cfs.metadata.partitionColumns(), EncodingStats.NO_STATS)))
             {
                 int end = f == fileCount - 1 ? partitionCount : ((f + 1) * partitionCount) / fileCount;
                 for ( ; i < end ; i++)
@@ -957,72 +854,9 @@ public class SSTableRewriterTest extends SchemaLoader
 
                     writer.append(builder.build().unfilteredIterator());
                 }
-                result.add(writer.finish(true));
+                result.addAll(writer.finish(true));
             }
         }
         return result;
-    }
-
-    public static void validateCFS(ColumnFamilyStore cfs)
-    {
-        Set<Integer> liveDescriptors = new HashSet<>();
-        long spaceUsed = 0;
-        for (SSTableReader sstable : cfs.getLiveSSTables())
-        {
-            assertFalse(sstable.isMarkedCompacted());
-            assertEquals(1, sstable.selfRef().globalCount());
-            liveDescriptors.add(sstable.descriptor.generation);
-            spaceUsed += sstable.bytesOnDisk();
-        }
-        for (File dir : cfs.directories.getCFDirectories())
-        {
-            for (File f : dir.listFiles())
-            {
-                if (f.getName().contains("Data"))
-                {
-                    Descriptor d = Descriptor.fromFilename(f.getAbsolutePath());
-                    assertTrue(d.toString(), liveDescriptors.contains(d.generation));
-                }
-            }
-        }
-        assertEquals(spaceUsed, cfs.metric.liveDiskSpaceUsed.getCount());
-        assertEquals(spaceUsed, cfs.metric.totalDiskSpaceUsed.getCount());
-        assertTrue(cfs.getTracker().getCompacting().isEmpty());
-    }
-
-    public static int assertFileCounts(String [] files)
-    {
-        int tmplinkcount = 0;
-        int tmpcount = 0;
-        int datacount = 0;
-        for (String f : files)
-        {
-            if (f.endsWith("-CRC.db"))
-                continue;
-            if (f.contains("tmplink-"))
-                tmplinkcount++;
-            else if (f.contains("tmp-"))
-                tmpcount++;
-            else if (f.contains("Data"))
-                datacount++;
-        }
-        assertEquals(0, tmplinkcount);
-        assertEquals(0, tmpcount);
-        return datacount;
-    }
-
-    public static SSTableWriter getWriter(ColumnFamilyStore cfs, File directory, LifecycleTransaction txn)
-    {
-        String filename = cfs.getSSTablePath(directory);
-        return SSTableWriter.create(filename, 0, 0, new SerializationHeader(cfs.metadata, cfs.metadata.partitionColumns(), EncodingStats.NO_STATS), txn);
-    }
-
-    public static ByteBuffer random(int i, int size)
-    {
-        byte[] bytes = new byte[size + 4];
-        ThreadLocalRandom.current().nextBytes(bytes);
-        ByteBuffer r = ByteBuffer.wrap(bytes);
-        r.putInt(0, i);
-        return r;
     }
 }

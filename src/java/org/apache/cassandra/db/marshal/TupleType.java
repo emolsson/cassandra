@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.regex.Pattern;
 
 import com.google.common.base.Objects;
 
@@ -37,10 +38,20 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  */
 public class TupleType extends AbstractType<ByteBuffer>
 {
+    private static final String COLON = ":";
+    private static final Pattern COLON_PAT = Pattern.compile(COLON);
+    private static final String ESCAPED_COLON = "\\\\:";
+    private static final Pattern ESCAPED_COLON_PAT = Pattern.compile(ESCAPED_COLON);
+    private static final String AT = "@";
+    private static final Pattern AT_PAT = Pattern.compile(AT);
+    private static final String ESCAPED_AT = "\\\\@";
+    private static final Pattern ESCAPED_AT_PAT = Pattern.compile(ESCAPED_AT);
+    
     protected final List<AbstractType<?>> types;
 
     public TupleType(List<AbstractType<?>> types)
     {
+        super(ComparisonType.CUSTOM);
         for (int i = 0; i < types.size(); i++)
             types.set(i, types.get(i).freeze());
         this.types = types;
@@ -52,6 +63,12 @@ public class TupleType extends AbstractType<ByteBuffer>
         for (int i = 0; i < types.size(); i++)
             types.set(i, types.get(i).freeze());
         return new TupleType(types);
+    }
+
+    @Override
+    public boolean referencesUserType(String name)
+    {
+        return allTypes().stream().anyMatch(f -> f.referencesUserType(name));
     }
 
     public AbstractType<?> type(int i)
@@ -69,7 +86,7 @@ public class TupleType extends AbstractType<ByteBuffer>
         return types;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         if (!o1.hasRemaining() || !o2.hasRemaining())
             return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
@@ -203,7 +220,9 @@ public class TupleType extends AbstractType<ByteBuffer>
 
             ByteBuffer field = ByteBufferUtil.readBytes(input, size);
             // We use ':' as delimiter, and @ to represent null, so escape them in the generated string
-            sb.append(type.getString(field).replaceAll(":", "\\\\:").replaceAll("@", "\\\\@"));
+            String fld = COLON_PAT.matcher(type.getString(field)).replaceAll(ESCAPED_COLON);
+            fld = AT_PAT.matcher(fld).replaceAll(ESCAPED_AT);
+            sb.append(fld);
         }
         return sb.toString();
     }
@@ -226,7 +245,9 @@ public class TupleType extends AbstractType<ByteBuffer>
                 continue;
 
             AbstractType<?> type = type(i);
-            fields[i] = type.fromString(fieldString.replaceAll("\\\\:", ":").replaceAll("\\\\@", "@"));
+            fieldString = ESCAPED_COLON_PAT.matcher(fieldString).replaceAll(COLON);
+            fieldString = ESCAPED_AT_PAT.matcher(fieldString).replaceAll(AT);
+            fields[i] = type.fromString(fieldString);
         }
         return buildValue(fields);
     }

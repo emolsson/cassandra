@@ -17,12 +17,11 @@
  */
 package org.apache.cassandra.streaming.messages;
 
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.io.util.DataOutputStreamPlus;
@@ -43,7 +42,7 @@ public class IncomingFileMessage extends StreamMessage
         {
             DataInputPlus input = new DataInputStreamPlus(Channels.newInputStream(in));
             FileMessageHeader header = FileMessageHeader.serializer.deserialize(input, version);
-            StreamReader reader = header.compressionInfo == null ? new StreamReader(header, session)
+            StreamReader reader = !header.isCompressed() ? new StreamReader(header, session)
                     : new CompressedStreamReader(header, session);
 
             try
@@ -80,9 +79,9 @@ public class IncomingFileMessage extends StreamMessage
     };
 
     public FileMessageHeader header;
-    public SSTableWriter sstable;
+    public SSTableMultiWriter sstable;
 
-    public IncomingFileMessage(SSTableWriter sstable, FileMessageHeader header)
+    public IncomingFileMessage(SSTableMultiWriter sstable, FileMessageHeader header)
     {
         super(Type.FILE);
         this.header = header;

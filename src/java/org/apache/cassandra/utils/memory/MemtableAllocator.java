@@ -20,7 +20,6 @@ package org.apache.cassandra.utils.memory;
 
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -32,7 +31,7 @@ public abstract class MemtableAllocator
     private final SubAllocator offHeap;
     volatile LifeCycle state = LifeCycle.LIVE;
 
-    static enum LifeCycle
+    enum LifeCycle
     {
         LIVE, DISCARDING, DISCARDED;
         LifeCycle transition(LifeCycle targetState)
@@ -59,9 +58,10 @@ public abstract class MemtableAllocator
         this.offHeap = offHeap;
     }
 
-    public abstract Row.Builder rowBuilder(CFMetaData metadata, OpOrder.Group opGroup, boolean isStatic);
+    public abstract Row.Builder rowBuilder(OpOrder.Group opGroup);
     public abstract DecoratedKey clone(DecoratedKey key, OpOrder.Group opGroup);
     public abstract DataReclaimer reclaimer();
+    public abstract EnsureOnHeap ensureOnHeap();
 
     public SubAllocator onHeap()
     {
@@ -250,5 +250,6 @@ public abstract class MemtableAllocator
         private static final AtomicLongFieldUpdater<SubAllocator> ownsUpdater = AtomicLongFieldUpdater.newUpdater(SubAllocator.class, "owns");
         private static final AtomicLongFieldUpdater<SubAllocator> reclaimingUpdater = AtomicLongFieldUpdater.newUpdater(SubAllocator.class, "reclaiming");
     }
+
 
 }

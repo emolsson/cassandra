@@ -22,6 +22,7 @@ import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.Closeable;
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -60,11 +61,13 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
 
     protected SSTableTxnWriter createWriter()
     {
-        return SSTableTxnWriter.create(createDescriptor(directory, metadata.ksName, metadata.cfName, formatType),
-                                    0,
-                                    ActiveRepairService.UNREPAIRED_SSTABLE,
-                                    0,
-                                    new SerializationHeader(metadata, columns, EncodingStats.NO_STATS));
+        return SSTableTxnWriter.create(metadata,
+                                       createDescriptor(directory, metadata.ksName, metadata.cfName, formatType),
+                                       0,
+                                       ActiveRepairService.UNREPAIRED_SSTABLE,
+                                       0,
+                                       new SerializationHeader(true, metadata, columns, EncodingStats.NO_STATS),
+                                       Collections.emptySet());
     }
 
     private static Descriptor createDescriptor(File directory, final String keyspace, final String columnFamily, final SSTableFormat.Type fmt)

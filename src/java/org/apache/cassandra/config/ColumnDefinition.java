@@ -23,17 +23,24 @@ import java.util.*;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Objects;
-import com.google.common.collect.Lists;
+import com.google.common.collect.Collections2;
 
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.exceptions.*;
 
 public class ColumnDefinition extends ColumnSpecification implements Comparable<ColumnDefinition>
 {
-    public static final Comparator<Object> asymmetricColumnDataComparator = (a, b) -> ((ColumnData) a).column().compareTo((ColumnDefinition) b);
+    public static final Comparator<Object> asymmetricColumnDataComparator =
+        (a, b) -> ((ColumnData) a).column().compareTo((ColumnDefinition) b);
+
+    public static final int NO_POSITION = -1;
+
+    public enum ClusteringOrder
+    {
+        ASC, DESC, NONE
+    }
 
     /*
      * The type of CQL3 column this definition represents.
@@ -42,10 +49,11 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
      * static ones.
      *
      * Note that thrift only knows about definitions of type REGULAR (and
-     * the ones whose componentIndex == null).
+     * the ones whose position == NO_POSITION (-1)).
      */
     public enum Kind
     {
+        // NOTE: if adding a new type, must modify comparisonOrder
         PARTITION_KEY,
         CLUSTERING,
         REGULAR,
@@ -60,16 +68,14 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
 
     public final Kind kind;
 
-    private String indexName;
-    private IndexType indexType;
-    private Map<String,String> indexOptions;
-
     /*
-     * If the column comparator is a composite type, indicates to which
-     * component this definition refers to. If null, the definition refers to
-     * the full column name.
+     * If the column is a partition key or clustering column, its position relative to
+     * other columns of the same kind. Otherwise,  NO_POSITION (-1).
+     *
+     * Note that partition key and clustering columns are numbered separately so
+     * the first clustering column is 0.
      */
-    private final Integer componentIndex;
+    private final int position;
 
     private final Comparator<CellPath> cellPathComparator;
     private final Comparator<Object> asymmetricCellPathComparator;
@@ -77,100 +83,92 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
 
     /**
      * These objects are compared frequently, so we encode several of their comparison components
-     * into a single int value so that this can be done efficiently
+     * into a single long value so that this can be done efficiently
      */
-    private final int comparisonOrder;
+    private final long comparisonOrder;
 
-    private static int comparisonOrder(Kind kind, boolean isComplex, int position)
+    private static long comparisonOrder(Kind kind, boolean isComplex, long position, ColumnIdentifier name)
     {
-        return (kind.ordinal() << 28) | (isComplex ? 1 << 27 : 0) | position;
+        assert position >= 0 && position < 1 << 12;
+        return   (((long) kind.ordinal()) << 61)
+               | (isComplex ? 1L << 60 : 0)
+               | (position << 48)
+               | (name.prefixComparison >>> 16);
     }
 
-    public static ColumnDefinition partitionKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition partitionKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> type, int position)
     {
-        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.PARTITION_KEY);
+        return new ColumnDefinition(cfm, name, type, position, Kind.PARTITION_KEY);
     }
 
-    public static ColumnDefinition partitionKeyDef(String ksName, String cfName, String name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition partitionKeyDef(String ksName, String cfName, String name, AbstractType<?> type, int position)
     {
-        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), validator, null, null, null, componentIndex, Kind.PARTITION_KEY);
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, position, Kind.PARTITION_KEY);
     }
 
-    public static ColumnDefinition clusteringKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition clusteringDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> type, int position)
     {
-        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.CLUSTERING);
+        return new ColumnDefinition(cfm, name, type, position, Kind.CLUSTERING);
     }
 
-    public static ColumnDefinition clusteringKeyDef(String ksName, String cfName, String name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition clusteringDef(String ksName, String cfName, String name, AbstractType<?> type, int position)
     {
-        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true),  validator, null, null, null, componentIndex, Kind.CLUSTERING);
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true),  type, position, Kind.CLUSTERING);
     }
 
-    public static ColumnDefinition regularDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator)
+    public static ColumnDefinition regularDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> type)
     {
-        return new ColumnDefinition(cfm, name, validator, null, Kind.REGULAR);
+        return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.REGULAR);
     }
 
-    public static ColumnDefinition regularDef(String ksName, String cfName, String name, AbstractType<?> validator)
+    public static ColumnDefinition regularDef(String ksName, String cfName, String name, AbstractType<?> type)
     {
-        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), validator, null, null, null, null, Kind.REGULAR);
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, NO_POSITION, Kind.REGULAR);
     }
 
-    public static ColumnDefinition staticDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator)
+    public static ColumnDefinition staticDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> type)
     {
-        return new ColumnDefinition(cfm, name, validator, null, Kind.STATIC);
+        return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.STATIC);
     }
 
-    public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex, Kind kind)
+    public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> type, int position, Kind kind)
     {
         this(cfm.ksName,
              cfm.cfName,
              ColumnIdentifier.getInterned(name, cfm.getColumnDefinitionNameComparator(kind)),
-             validator,
-             null,
-             null,
-             null,
-             componentIndex,
+             type,
+             position,
              kind);
-    }
-
-    public ColumnDefinition(String ksName, String cfName, ColumnIdentifier name, AbstractType<?> type, Integer componentIndex, Kind kind)
-    {
-        this(ksName, cfName, name, type, null, null, null, componentIndex, kind);
     }
 
     @VisibleForTesting
     public ColumnDefinition(String ksName,
                             String cfName,
                             ColumnIdentifier name,
-                            AbstractType<?> validator,
-                            IndexType indexType,
-                            Map<String, String> indexOptions,
-                            String indexName,
-                            Integer componentIndex,
+                            AbstractType<?> type,
+                            int position,
                             Kind kind)
     {
-        super(ksName, cfName, name, validator);
-        assert name != null && validator != null && kind != null;
+        super(ksName, cfName, name, type);
+        assert name != null && type != null && kind != null;
         assert name.isInterned();
-        assert componentIndex == null || kind.isPrimaryKeyKind(); // The componentIndex really only make sense for partition and clustering columns,
-                                                                  // so make sure we don't sneak it for something else since it'd breaks equals()
+        assert (position == NO_POSITION) == !kind.isPrimaryKeyKind(); // The position really only make sense for partition and clustering columns (and those must have one),
+                                                                      // so make sure we don't sneak it for something else since it'd breaks equals()
         this.kind = kind;
-        this.indexName = indexName;
-        this.componentIndex = componentIndex;
-        this.setIndexType(indexType, indexOptions);
-        this.cellPathComparator = makeCellPathComparator(kind, validator);
+        this.position = position;
+        this.cellPathComparator = makeCellPathComparator(kind, type);
         this.cellComparator = cellPathComparator == null ? ColumnData.comparator : (a, b) -> cellPathComparator.compare(a.path(), b.path());
         this.asymmetricCellPathComparator = cellPathComparator == null ? null : (a, b) -> cellPathComparator.compare(((Cell)a).path(), (CellPath) b);
-        this.comparisonOrder = comparisonOrder(kind, isComplex(), position());
+        this.comparisonOrder = comparisonOrder(kind, isComplex(), Math.max(0, position), name);
     }
 
-    private static Comparator<CellPath> makeCellPathComparator(Kind kind, AbstractType<?> validator)
+    private static Comparator<CellPath> makeCellPathComparator(Kind kind, AbstractType<?> type)
     {
-        if (kind.isPrimaryKeyKind() || !validator.isCollection() || !validator.isMultiCell())
+        if (kind.isPrimaryKeyKind() || !type.isCollection() || !type.isMultiCell())
             return null;
 
-        final CollectionType type = (CollectionType)validator;
+        CollectionType collection = (CollectionType) type;
+
         return new Comparator<CellPath>()
         {
             public int compare(CellPath path1, CellPath path2)
@@ -186,29 +184,24 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
 
                 // This will get more complicated once we have non-frozen UDT and nested collections
                 assert path1.size() == 1 && path2.size() == 1;
-                return type.nameComparator().compare(path1.get(0), path2.get(0));
+                return collection.nameComparator().compare(path1.get(0), path2.get(0));
             }
         };
     }
 
     public ColumnDefinition copy()
     {
-        return new ColumnDefinition(ksName, cfName, name, type, indexType, indexOptions, indexName, componentIndex, kind);
+        return new ColumnDefinition(ksName, cfName, name, type, position, kind);
     }
 
     public ColumnDefinition withNewName(ColumnIdentifier newName)
     {
-        return new ColumnDefinition(ksName, cfName, newName, type, indexType, indexOptions, indexName, componentIndex, kind);
+        return new ColumnDefinition(ksName, cfName, newName, type, position, kind);
     }
 
     public ColumnDefinition withNewType(AbstractType<?> newType)
     {
-        return new ColumnDefinition(ksName, cfName, name, newType, indexType, indexOptions, indexName, componentIndex, kind);
-    }
-
-    public boolean isOnAllComponents()
-    {
-        return componentIndex == null;
+        return new ColumnDefinition(ksName, cfName, name, newType, position, kind);
     }
 
     public boolean isPartitionKey()
@@ -231,12 +224,17 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
         return kind == Kind.REGULAR;
     }
 
-    // The componentIndex. This never return null however for convenience sake:
-    // if componentIndex == null, this return 0. So caller should first check
-    // isOnAllComponents() to distinguish if that's a possibility.
+    public ClusteringOrder clusteringOrder()
+    {
+        if (!isClusteringColumn())
+            return ClusteringOrder.NONE;
+
+        return type.isReversed() ? ClusteringOrder.DESC : ClusteringOrder.ASC;
+    }
+
     public int position()
     {
-        return componentIndex == null ? 0 : componentIndex;
+        return position;
     }
 
     @Override
@@ -255,16 +253,13 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
             && Objects.equal(name, cd.name)
             && Objects.equal(type, cd.type)
             && Objects.equal(kind, cd.kind)
-            && Objects.equal(componentIndex, cd.componentIndex)
-            && Objects.equal(indexName, cd.indexName)
-            && Objects.equal(indexType, cd.indexType)
-            && Objects.equal(indexOptions, cd.indexOptions);
+            && Objects.equal(position, cd.position);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(ksName, cfName, name, type, kind, componentIndex, indexName, indexType, indexOptions);
+        return Objects.hashCode(ksName, cfName, name, type, kind, position);
     }
 
     @Override
@@ -274,9 +269,7 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
                       .add("name", name)
                       .add("type", type)
                       .add("kind", kind)
-                      .add("componentIndex", componentIndex)
-                      .add("indexName", indexName)
-                      .add("indexType", indexType)
+                      .add("position", position)
                       .toString();
     }
 
@@ -302,92 +295,15 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
             return kind == Kind.STATIC;
     }
 
-    public ColumnDefinition apply(ColumnDefinition def)  throws ConfigurationException
-    {
-        assert kind == def.kind && Objects.equal(componentIndex, def.componentIndex);
-
-        if (getIndexType() != null && def.getIndexType() != null)
-        {
-            // If an index is set (and not drop by this update), the validator shouldn't be change to a non-compatible one
-            // (and we want true comparator compatibility, not just value one, since the validator is used by LocalPartitioner to order index rows)
-            if (!def.type.isCompatibleWith(type))
-                throw new ConfigurationException(String.format("Cannot modify validator to a non-order-compatible one for column %s since an index is set", name));
-
-            assert getIndexName() != null;
-            if (!getIndexName().equals(def.getIndexName()))
-                throw new ConfigurationException("Cannot modify index name: " + def.getIndexName());
-        }
-
-        return new ColumnDefinition(ksName,
-                                    cfName,
-                                    name,
-                                    def.type,
-                                    def.getIndexType(),
-                                    def.getIndexOptions(),
-                                    def.getIndexName(),
-                                    componentIndex,
-                                    kind);
-    }
-
-    public String getIndexName()
-    {
-        return indexName;
-    }
-
-    public ColumnDefinition setIndexName(String indexName)
-    {
-        this.indexName = indexName;
-        return this;
-    }
-
-    public ColumnDefinition setIndexType(IndexType indexType, Map<String,String> indexOptions)
-    {
-        this.indexType = indexType;
-        this.indexOptions = indexOptions;
-        return this;
-    }
-
-    public ColumnDefinition setIndex(String indexName, IndexType indexType, Map<String,String> indexOptions)
-    {
-        return setIndexName(indexName).setIndexType(indexType, indexOptions);
-    }
-
-    public boolean isIndexed()
-    {
-        return indexType != null;
-    }
-
-    public IndexType getIndexType()
-    {
-        return indexType;
-    }
-
-    public Map<String,String> getIndexOptions()
-    {
-        return indexOptions;
-    }
-
-    /**
-     * Checks if the index option with the specified name has been specified.
-     *
-     * @param name index option name
-     * @return <code>true</code> if the index option with the specified name has been specified, <code>false</code>
-     * otherwise.
-     */
-    public boolean hasIndexOption(String name)
-    {
-        return indexOptions != null && indexOptions.containsKey(name);
-    }
-
     /**
      * Converts the specified column definitions into column identifiers.
      *
      * @param definitions the column definitions to convert.
      * @return the column identifiers corresponding to the specified definitions
      */
-    public static List<ColumnIdentifier> toIdentifiers(List<ColumnDefinition> definitions)
+    public static Collection<ColumnIdentifier> toIdentifiers(Collection<ColumnDefinition> definitions)
     {
-        return Lists.transform(definitions, new Function<ColumnDefinition, ColumnIdentifier>()
+        return Collections2.transform(definitions, new Function<ColumnDefinition, ColumnIdentifier>()
         {
             @Override
             public ColumnIdentifier apply(ColumnDefinition columnDef)
@@ -403,7 +319,7 @@ public class ColumnDefinition extends ColumnSpecification implements Comparable<
             return 0;
 
         if (comparisonOrder != other.comparisonOrder)
-            return comparisonOrder - other.comparisonOrder;
+            return Long.compare(comparisonOrder, other.comparisonOrder);
 
         return this.name.compareTo(other.name);
     }
