@@ -1,4 +1,5 @@
 3.11.5
+ * Local reads potentially blocking remote reads (CASSANDRA-14983)
  * Add flag to disable SASI indexes, and warnings on creation (CASSANDRA-14866)
 Merged from 3.0:
  * Improve `nodetool status -r` speed (CASSANDRA-14847)
