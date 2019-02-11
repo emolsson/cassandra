@@ -75,6 +75,8 @@ public abstract class AbstractReadExecutor
     private   final int initialDataRequestCount;
     protected volatile PartitionIterator result = null;
 
+    private boolean hasLocalEndpoint = false;
+
     AbstractReadExecutor(ColumnFamilyStore cfs, ReadCommand command, ReplicaPlan.ForTokenRead replicaPlan, int initialDataRequestCount, long queryStartNanoTime)
     {
         this.command = command;
@@ -131,8 +133,6 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<Replica> replicas)
     {
-        boolean hasLocalEndpoint = false;
-
         for (Replica replica: replicas)
         {
             assert replica.isFull() || readCommand.acceptsTransient();
@@ -149,11 +149,14 @@ public abstract class AbstractReadExecutor
             MessageOut<ReadCommand> message = readCommand.createMessage();
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
         }
+    }
 
+    private void maybeMakeLocalDataRequest()
+    {
         // We delay the local (potentially blocking) read till the end to avoid stalling remote requests.
         if (hasLocalEndpoint)
         {
-            logger.trace("reading {} locally", readCommand.isDigestQuery() ? "digest" : "data");
+            logger.trace("reading data locally");
             StageManager.getStage(Stage.READ).maybeExecuteImmediately(new LocalReadRunnable(command, handler));
         }
     }
@@ -174,6 +177,7 @@ public abstract class AbstractReadExecutor
         makeFullDataRequests(fullDataRequests);
         makeTransientDataRequests(selected.filterLazily(Replica::isTransient));
         makeDigestRequests(selected.filterLazily(r -> r.isFull() && !fullDataRequests.contains(r)));
+        maybeMakeLocalDataRequest();
     }
 
     /**
