@@ -63,6 +63,8 @@ public abstract class AbstractReadExecutor
     protected final ReadCallback handler;
     protected final TraceState traceState;
 
+    private boolean hasLocalEndpoint = false;
+
     AbstractReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas)
     {
         this.command = command;
@@ -93,8 +95,6 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
-        boolean hasLocalEndpoint = false;
-
         for (InetAddress endpoint : endpoints)
         {
             if (StorageProxy.canDoLocalRequest(endpoint))
@@ -109,11 +109,14 @@ public abstract class AbstractReadExecutor
             MessageOut<ReadCommand> message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
         }
+    }
 
+    protected void maybeMakeLocalDataRequest()
+    {
         // We delay the local (potentially blocking) read till the end to avoid stalling remote requests.
         if (hasLocalEndpoint)
         {
-            logger.trace("reading {} locally", readCommand.isDigestQuery() ? "digest" : "data");
+            logger.trace("reading data locally");
             StageManager.getStage(Stage.READ).maybeExecuteImmediately(new LocalReadRunnable(command, handler));
         }
     }
@@ -220,6 +223,8 @@ public abstract class AbstractReadExecutor
             makeDataRequests(targetReplicas.subList(0, 1));
             if (targetReplicas.size() > 1)
                 makeDigestRequests(targetReplicas.subList(1, targetReplicas.size()));
+
+            maybeMakeLocalDataRequest();
         }
 
         public void maybeTryAdditionalReplicas()
@@ -271,6 +276,8 @@ public abstract class AbstractReadExecutor
                 if (initialReplicas.size() > 1)
                     makeDigestRequests(initialReplicas.subList(1, initialReplicas.size()));
             }
+
+            maybeMakeLocalDataRequest();
         }
 
         public void maybeTryAdditionalReplicas()
@@ -337,6 +344,8 @@ public abstract class AbstractReadExecutor
             if (targetReplicas.size() > 2)
                 makeDigestRequests(targetReplicas.subList(2, targetReplicas.size()));
             cfs.metric.speculativeRetries.inc();
+
+            maybeMakeLocalDataRequest();
         }
     }
 }
