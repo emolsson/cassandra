@@ -808,7 +808,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return !unsafeStatuses.contains(status);
     }
 
-    private void doStatusCheck()
+    @VisibleForTesting
+    void doStatusCheck()
     {
         if (logger.isTraceEnabled())
             logger.trace("Performing status check ...");
