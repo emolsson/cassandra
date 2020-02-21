@@ -22,8 +22,10 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.UUID;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.service.StorageService;
 
 import static org.junit.Assert.assertFalse;
@@ -32,6 +34,12 @@ import static org.junit.Assert.assertTrue;
 
 public class ExpireEndpointTest
 {
+    @BeforeClass
+    public static void setup()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testExpireEndpoint() throws UnknownHostException
     {
